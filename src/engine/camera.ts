@@ -118,6 +118,14 @@ export class Camera {
     }
   }
 
+  /** Glides the orbit onto a point from a given distance, looking down on it (orbit mode only). */
+  flyTo(point: Vec3, distance: number) {
+    if (this.mode !== 'orbit') return
+    this.goalTarget = this.clampTarget(point)
+    this.goalDistance = clamp(distance, 0.03, 2)
+    this.goalPitch = clamp(this.goalPitch, 0.35, 0.9)
+  }
+
   /** Cinematic orbit: turns the view around its target (orbit mode only). */
   spin(angle: number) {
     if (this.mode === 'orbit') this.goalYaw -= angle

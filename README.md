@@ -18,6 +18,21 @@ npm run build    # gera dist/ (site estático)
 Precisa de um navegador com WebGPU. No **Chrome para Linux** ele vem desligado: ative
 `chrome://flags/#enable-unsafe-webgpu` e `chrome://flags/#enable-vulkan` e reinicie o navegador.
 
+### Craftscape 2D (sem GPU)
+
+Em `/2d.html` há uma segunda versão do jogo: um mundo de tiles visto de cima, simulado na CPU
+com regras simples (vento, chuva, rios por acúmulo de fluxo, vegetação, neve, lava, fogo) e os
+mesmos povos da versão 3D (`src/engine/life.ts`) vivendo em cima. Roda em qualquer navegador,
+sem WebGPU. O código fica em `src/tiles/`: `world.ts` (simulação), `render.ts` (canvas 2D e
+sprites procedurais), `game.ts` (laço, entrada, poderes) e `App.tsx` (interface).
+
+A aba **Mapa** traz os mesmos modos de mapa do 3D: biomas, temperatura, chuva, ar (umidade),
+pressão (as secas decretadas em laranja, as tempestades em roxo), relevo com curvas de nível,
+rios pela vazão, mudança do terreno desde a referência e o atlas dos povos (terra cor de papel,
+fronteiras e frentes de guerra), com legenda para cada um, além das setas de vento que giram em
+volta das tempestades e das altas. Teclas: **O** troca o mapa (Shift+O volta), **W** liga as
+setas de vento, setas do teclado movem o mapa, **R** enquadra o mundo.
+
 ## Controles
 
 | Ação | Mouse / teclado | Toque |

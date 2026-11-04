@@ -14,7 +14,7 @@ import { clamp } from './math'
 import { Renderer } from './renderer'
 import {
   BASE_TEMPERATURE,
-  BRUSH_MAX,
+  brushMax,
   BRUSH_MIN,
   DAYS_PER_YEAR,
   seasonOf,
@@ -31,16 +31,83 @@ import {
   type Probe,
   type Settings,
   type Stats,
+  type Timeline,
   type Tool,
 } from './settings'
 import { scenarioById, type ScenarioId } from './scenarios'
-import { FAR_GRID, FAR_TEXELS_PER_WINDOW } from './shaders/sim'
-import { Simulation, type Brush, type Climate, type SimState } from './simulation'
+import { challengeById, type ChallengeId, type ChallengeState } from './challenges'
+import { CIV_COLORS, Life, TERRITORY_N, placeName, type LifeLabel } from './life'
+import { FAR_GRID, FAR_TEXELS_PER_WINDOW, MAX_DUSTS, MAX_HIGHS, MAX_STORMS } from './shaders/sim'
+import {
+  boundaryAt,
+  plateDrift,
+  platePair,
+  platesIn,
+  plateVelocity,
+  sameCell,
+  type Boundary,
+  type BoundaryKind,
+  type PlateField,
+} from './plates'
+import type { PlateArrow } from './renderer'
+import {
+  STATE_KEYS,
+  Simulation,
+  type Brush,
+  type Climate,
+  type Impact,
+  type PlateOverride,
+  type Quake,
+  type SimState,
+  type Vent,
+} from './simulation'
 import { skyAt } from './sky'
 import { TILES, WorldStore } from './world'
 
 const STEP = 1 / 60 // the original simulated one step per frame at 60 fps
+/** Frames per second while the window is not focused: the world keeps going, the GPU rests. */
+const BACKGROUND_FPS = 10
+/** Frame time the adaptive quality was tuned for (ms); a lower frame limit is not slowness. */
+const BASE_FRAME_MS = 1000 / 60
+/** Steps between earthquakes on average (half a minute at 1×), faster in geological time. */
+const QUAKE_STEPS = 1800
+/** Steps between eruptions on average (five minutes at 1×), faster in geological time. */
+const VOLCANO_STEPS = 18000
+const MAX_VOLCANOES = 6
+/** How high the tide rises over the mean sea level (height units: about a cell of beach). */
+const TIDE_AMPLITUDE = 0.0012
+/** Sea-level rise per °C of the peoples' warming (height units). */
+const SEA_RISE_PER_DEGREE = 0.004
+
+/** A volcano on a plate boundary: it erupts for a while (its vent open), then lies dormant and may wake again. */
+interface Volcano {
+  name: string
+  uv: [number, number]
+  /** Vent radius in window uv. */
+  radius: number
+  /** Vent strength while erupting (0–1). */
+  strength: number
+  /** Simulated seconds of eruption left. */
+  left: number
+  erupting: boolean
+  eruptions: number
+}
+/** Plate drift per step at unit speed and drift setting 1 (world units): 0.1 of the world in ~20 s at 30×. */
+const PLATE_DRIFT = 3e-6
+const BOUNDARY_NAMES: Record<BoundaryKind, string> = {
+  convergent: 'placas colidindo',
+  divergent: 'placas se afastando',
+  transform: 'placas deslizando lado a lado',
+}
 const UNDO_BUDGET_BYTES = 256 * 1024 * 1024
+/** GPU memory for the rewind snapshots, and the simulated seconds they try to cover. */
+const REWIND_BUDGET_BYTES = 128 * 1024 * 1024
+const REWIND_SPAN = 120
+const MAX_REWIND = 24
+/** A storm lives this many simulated seconds: it deepens, holds, then fills in. */
+const STORM_LIFE = 100
+/** How deep a storm's low is held at this age (0–1). */
+const stormStrength = (age: number) => (age < 5 ? age / 5 : age < 70 ? 1 : Math.max((STORM_LIFE - age) / 30, 0))
 const MAX_UNDO = 30
 
 export type WebGPUFailure = 'no-api' | 'no-adapter' | 'timeout'
@@ -127,6 +194,8 @@ export class Engine {
   private probing = false
   private lastProbe = 0
   private wasPainting = false
+  /** Frames left for a quick click to find the terrain under it (see tick). */
+  private pressFrames = 0
   /** Height the leveling tool flattens towards, taken where the stroke started. */
   private levelHeight = 0
   private needsGenerate = true
@@ -148,10 +217,69 @@ export class Engine {
   /** Mean weather pressure over the window, from the last climate analysis. */
   private pressureMean = 0
 
+  // plate tectonics
+  /** Plates whose drift was changed with the plates tool (cleared with a new terrain). */
+  private plateOverrides: PlateOverride[] = []
+  /** Plate time: how far a plate of unit speed has drifted since the terrain was made (world units). */
+  private plateTime = 0
+  /** The plate being dragged: its cell, where the drag started (world units), whether it turned. */
+  private plateDrag: {
+    cell: [number, number]
+    from: [number, number]
+    turned: boolean
+  } | null = null
+  /** The earthquake to run in the next frame, and the steps left until another may strike. */
+  private pendingQuake: Quake | null = null
+  /** The next frame clears every fixed air-mass source (see clearAirSources). */
+  private pendingClear = false
+  /** Storms the storm tool set off: centre (window uv), age in simulated seconds, radius (uv). */
+  private storms: { uv: [number, number]; age: number; radius: number }[] = []
+  /** Dust clouds from strikes: centre (window uv), °C of shade at the centre, radius (uv). */
+  private dusts: { uv: [number, number]; cooling: number; radius: number }[] = []
+  /** The meteor strike to run in the next frame. */
+  private pendingImpact: Impact | null = null
+  private readonly labelCanvas: HTMLCanvasElement
+  /** The town picked with the inspect tool (its id in the life), shown in the Life tab. */
+  private selectedTown: number | null = null
+  /** Life time of the last chronicle event the camera flew to (see followEvents). */
+  private lastFollowed = -1
+  /** Warming from the peoples' industry, in °C; it builds while chimneys smoke and fades slowly after. */
+  private civWarming = 0
+  /** °C the player added to (or took from) the whole planet with the sun power. */
+  private godWarming = 0
+  /** Fixed highs the drought power set: centre (window uv) and radius (uv). */
+  private highs: { uv: [number, number]; radius: number }[] = []
+  /** Dust from meteor strikes, in °C of cooling; it settles over a couple of simulated days. */
+  private dust = 0
+  /** The challenge being played (see challenges.ts). */
+  private challenge: ChallengeState | null = null
+  /** The state as last read back for the analysis: climate, water, extra and lava per cell. */
+  private field: Field | null = null
+  private readonly life = new Life()
+  /** Snapshots taken every few simulated seconds, oldest first, for rewinding (see rewind). */
+  private rewindRing: { snap: GPUBuffer; simTime: number; timeOfDay: number }[] = []
+  private lastRewindSnap = -Infinity
+  /** While the rewind button is held: the simulation stands still, each call steps one snapshot back. */
+  private rewinding = false
+  private lastRewind = 0
+  private quakeClock = QUAKE_STEPS
+  private toastTimer = 0
+  /** The volcanoes of this terrain, the steps until another may wake, and the vent to open or plug next frame. */
+  private volcanoes: Volcano[] = []
+  private volcanoClock = VOLCANO_STEPS * 0.5
+  private pendingVent: Vent | null = null
+
   // stats accumulation
   private statFrames = 0
   private statSteps = 0
   private statStart = 0
+  /** Frame limiter: when the next frame is due and when the screen last refreshed (ms). */
+  private nextFrame = 0
+  private lastRaf = 0
+  /** The window has the focus; without it the loop idles at BACKGROUND_FPS. */
+  private focused = true
+  private onFocus: (() => void) | null = null
+  private onBlur: (() => void) | null = null
   private slowWindows = 0
   /** Engine time of the last quality change; automatic quality waits for frames to settle. */
   private qualitySince = 0
@@ -171,7 +299,17 @@ export class Engine {
     // No usable GPU: fall back to the browser's software adapter (slow, but it runs).
     adapter ??= await withTimeout(navigator.gpu.requestAdapter({ forceFallbackAdapter: true }), 8000).catch(() => null)
     if (!adapter) throw new WebGPUUnavailableError(hardwareFailure)
-    const device = await withTimeout(adapter.requestDevice(), 10000)
+    // 2048² needs bigger buffers than the defaults (undo snapshots and read-backs hold all
+    // the state in one buffer, ~470 MB); ask for what the adapter allows, up to 1 GiB
+    const device = await withTimeout(
+      adapter.requestDevice({
+        requiredLimits: {
+          maxBufferSize: Math.min(adapter.limits.maxBufferSize, 2 ** 30),
+          maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, 2 ** 28),
+        },
+      }),
+      10000,
+    )
     if (signal.aborted) {
       device.destroy()
       throw new DOMException('aborted', 'AbortError')
@@ -207,6 +345,10 @@ export class Engine {
   ) {
     this.canvas = canvas
     this.device = device
+    // names over the map are drawn on a 2D canvas laid over the WebGPU one
+    this.labelCanvas = document.createElement('canvas')
+    this.labelCanvas.className = 'labels'
+    canvas.parentElement?.insertBefore(this.labelCanvas, canvas.nextSibling)
     const context = canvas.getContext('webgpu')
     if (!context) throw new Error('Não foi possível criar o contexto WebGPU do canvas.')
     this.context = context
@@ -236,7 +378,7 @@ export class Engine {
       pan: (dx, dy) => this.camera.pan(dx, dy, canvas.clientHeight || 1),
       zoom: (f) => this.camera.zoom(f, this.hitWorld()),
       resizeBrush: (steps) =>
-        this.set({ brushSize: clamp(this.settings.brushSize * 1.15 ** steps, BRUSH_MIN, BRUSH_MAX) }),
+        this.set({ brushSize: clamp(this.settings.brushSize * 1.15 ** steps, BRUSH_MIN, brushMax(this.settings.area)) }),
       undo: () => this.undo(),
       togglePause: () => this.set({ paused: !this.settings.paused }),
       toggleCamera: () => this.set({ cameraMode: this.settings.cameraMode === 'orbit' ? 'fly' : 'orbit' }),
@@ -246,6 +388,8 @@ export class Engine {
         if (point) this.camera.focus(point)
       },
       selectTool: (tool: Tool) => this.set({ tool }),
+      rewind: () => this.rewind(),
+      rewindEnd: () => this.rewindEnd(),
       toggleMode: () => this.set({ mode: this.settings.mode === 'add' ? 'remove' : 'add' }),
       toggleHelp: () => this.set({ showHelp: !this.settings.showHelp }),
       closeHelp: () => {
@@ -255,7 +399,8 @@ export class Engine {
         else if (this.settings.tool !== 'inspect') this.set({ tool: 'inspect' })
       },
       togglePhoto: () => this.set({ photoMode: !this.settings.photoMode }),
-      paintOnClick: () => this.settings.paintOnClick,
+      // the plates tool always grabs with a click: dragging is how it is used
+      paintOnClick: () => this.settings.paintOnClick || this.settings.tool === 'plates',
     })
   }
 
@@ -277,10 +422,20 @@ export class Engine {
     return [this.origin[0] / this.sim.size, this.origin[1] / this.sim.size]
   }
 
+  /**
+   * Whether this GPU can run 2048²: real hardware whose buffers hold the whole state at
+   * once (undo snapshots, read-backs).
+   */
+  get supportsHugeWorld() {
+    return !this.softwareGPU && this.device.limits.maxBufferSize >= 2048 * 2048 * 16 * STATE_KEYS.length
+  }
+
   private get resolution(): number {
-    if (this.settings.resolution !== 'auto') return this.settings.resolution
-    // a bigger area gets more cells, keeping the detail per world unit (up to 1024²)
-    return Math.min(1024, Math.round((QUALITY[this.level].autoResolution * this.settings.area) / 64) * 64)
+    const most = this.supportsHugeWorld ? 2048 : 1024
+    if (this.settings.resolution !== 'auto') return Math.min(this.settings.resolution, most)
+    // a bigger area gets more cells, keeping the detail per world unit (2048² only at high quality)
+    const cap = this.level === 'high' ? most : 1024
+    return Math.min(cap, Math.round((QUALITY[this.level].autoResolution * this.settings.area) / 64) * 64)
   }
 
   private get profile() {
@@ -318,12 +473,37 @@ export class Engine {
   private start() {
     this.lastTime = performance.now()
     this.statStart = this.lastTime
+    this.nextFrame = this.lastTime
+    this.lastRaf = this.lastTime
+    // focused until told otherwise: hasFocus() is false in headless and test windows
+    this.focused = true
     const loop = (now: number) => {
       if (this.disposed) return
       this.raf = requestAnimationFrame(loop)
+      const period = now - this.lastRaf
+      this.lastRaf = now
+      const interval = this.frameInterval()
+      if (interval > 0) {
+        // the screen refresh nearest the deadline wins (half a refresh of tolerance), so a
+        // 60 fps limit on a 60 Hz screen draws every frame and on 144 Hz averages 60
+        if (now + Math.min(period, interval) * 0.5 < this.nextFrame) return
+        // the schedule only restarts when the loop fell a whole frame behind (hidden tab, slow GPU)
+        this.nextFrame = (now - this.nextFrame > interval ? now : this.nextFrame) + interval
+      }
       this.tick(now)
     }
     this.raf = requestAnimationFrame(loop)
+    this.onFocus = () => (this.focused = true)
+    this.onBlur = () => (this.focused = false)
+    window.addEventListener('focus', this.onFocus)
+    window.addEventListener('blur', this.onBlur)
+  }
+
+  /** Milliseconds between frames: the chosen limit, or a slow idle rate while the window is not focused. */
+  private frameInterval() {
+    const limit = this.settings.fpsLimit
+    const target = this.focused ? limit : limit > 0 ? Math.min(limit, BACKGROUND_FPS) : BACKGROUND_FPS
+    return target > 0 ? 1000 / target : 0
   }
 
   // ---- public API for the UI ---------------------------------------------------
@@ -381,6 +561,23 @@ export class Engine {
 
   resetCamera() {
     this.camera.reset()
+  }
+
+  /** Flies the camera over a place in the world (world units, as the life keeps them). */
+  flyTo(pos: [number, number], distance = 0.16) {
+    if (this.settings.cameraMode !== 'orbit') this.set({ cameraMode: 'orbit' })
+    const e = this.extent
+    const h = this.life.surfaceAt(pos, e)
+    this.camera.flyTo([pos[0] - e * 0.5, h, e * 0.5 - pos[1]], distance)
+  }
+
+  /** The watching god: the camera flies to the newest event that happened somewhere. */
+  private followEvents() {
+    const events = this.life.chronicleEvents
+    const last = events[events.length - 1]
+    if (!last || last.time <= this.lastFollowed) return
+    this.lastFollowed = last.time
+    if (last.pos) this.flyTo(last.pos)
   }
 
   /** The Change map starts counting again from the terrain as it is now. */
@@ -457,6 +654,7 @@ export class Engine {
         regions,
         area: this.extent,
         shape: this.settings.terrainShape,
+        plateTime: this.plateTime,
       })
       downloadBlob(blob, `terreno-${stamp()}.craftscape`)
     } catch (err) {
@@ -470,12 +668,15 @@ export class Engine {
     if (this.busy) return
     this.busy = true
     try {
-      const { state, seed, origin, regions, area, shape } = await decodeTerrain(file)
+      const { state, seed, origin, regions, area, shape, plateTime } = await decodeTerrain(file)
       if (area !== this.extent) this.clearUndo()
+      this.plateTime = plateTime
+      this.plateOverrides = []
+      this.sim.platesDirty = true
       // the area and shape the file was made with, without regenerating
       this.settings = {
         ...this.settings,
-        area: [1, 1.5, 2].includes(area) ? (area as AreaSetting) : 1,
+        area: [1, 1.5, 2, 3, 4].includes(area) ? (area as AreaSetting) : 1,
         terrainShape: shape,
       }
       await this.replaceState(state)
@@ -484,7 +685,7 @@ export class Engine {
       this.moveOrigin(origin)
       this.settings = { ...this.settings, seed: Math.round(seed) || this.settings.seed }
       if (state.size !== this.resolution)
-        this.settings = { ...this.settings, resolution: state.size as 256 | 512 | 1024 }
+        this.settings = { ...this.settings, resolution: state.size as 256 | 512 | 1024 | 2048 }
       this.emit()
     } catch (err) {
       this.notice(`Não foi possível carregar: ${(err as Error).message}`)
@@ -566,10 +767,14 @@ export class Engine {
   }
 
   dispose() {
+    this.labelCanvas.remove()
     this.disposed = true
     cancelAnimationFrame(this.raf)
+    if (this.onFocus) window.removeEventListener('focus', this.onFocus)
+    if (this.onBlur) window.removeEventListener('blur', this.onBlur)
     this.input?.dispose()
     this.clearUndo()
+    this.clearRewind()
     this.context.unconfigure()
     this.device.destroy()
     this.listeners.clear()
@@ -588,6 +793,333 @@ export class Engine {
     for (const snap of this.undoStack) snap.destroy()
     this.undoStack.length = 0
     this.updateUndoStat()
+  }
+
+  // ---- rewinding ------------------------------------------------------------------
+
+  private clearRewind() {
+    for (const entry of this.rewindRing) entry.snap.destroy()
+    this.rewindRing.length = 0
+    this.lastRewindSnap = -Infinity
+  }
+
+  /** Every few simulated seconds a snapshot joins the ring; the ring covers about REWIND_SPAN seconds. */
+  private recordRewind(enc: GPUCommandEncoder) {
+    if (this.busy || this.needsGenerate || this.rewinding) return
+    const max = clamp(Math.floor(REWIND_BUDGET_BYTES / this.sim.snapshotBytes), 1, MAX_REWIND)
+    if (this.simTime - this.lastRewindSnap < Math.max(5, REWIND_SPAN / max)) return
+    this.lastRewindSnap = this.simTime
+    while (this.rewindRing.length >= max) this.rewindRing.shift()?.snap.destroy()
+    this.rewindRing.push({ snap: this.sim.encodeSnapshot(enc), simTime: this.simTime, timeOfDay: this.settings.timeOfDay })
+  }
+
+  /** Steps the world one snapshot back in time; hold the button (or B) to keep going. The first step is undoable. */
+  rewind() {
+    const now = performance.now()
+    if (now - this.lastRewind < 250 || this.busy) return
+    const entry = this.rewindRing.pop()
+    if (!entry) return
+    this.lastRewind = now
+    const enc = this.device.createCommandEncoder({ label: 'rewind' })
+    if (!this.rewinding) {
+      this.pushUndo(enc)
+      this.rewinding = true
+    }
+    this.sim.encodeRestore(enc, entry.snap)
+    this.device.queue.submit([enc.finish()])
+    void this.device.queue.onSubmittedWorkDone().then(() => entry.snap.destroy())
+    this.simTime = entry.simTime
+    this.lastRewindSnap = entry.simTime
+    this.storms = []
+    this.settings = { ...this.settings, timeOfDay: entry.timeOfDay }
+    this.stats = { ...this.stats, rewindSeconds: this.rewindReach() }
+    this.emit()
+  }
+
+  rewindEnd() {
+    this.rewinding = false
+  }
+
+  /** Goes back to the snapshot nearest to this many simulated seconds ago (the timeline strip). */
+  rewindTo(secondsAgo: number) {
+    if (this.busy || !this.rewindRing.length) return
+    const target = this.simTime - secondsAgo
+    // the last snapshot at or before the target (the oldest if none is)
+    let k = 0
+    for (let j = 0; j < this.rewindRing.length; j++) if (this.rewindRing[j].simTime <= target) k = j
+    // the later snapshots are dropped: time goes back past them
+    while (this.rewindRing.length > k + 1) this.rewindRing.pop()?.snap.destroy()
+    this.lastRewind = 0
+    this.rewind()
+    this.rewinding = false
+  }
+
+  /** The rewind strip: the snapshots and the chronicle's events, in seconds before now. */
+  private timeline(): Timeline {
+    const reach = this.rewindReach()
+    const snapshots = this.rewindRing.map((r) => this.simTime - r.simTime)
+    const marks: Timeline['marks'] = []
+    if (this.settings.life && reach > 0) {
+      const now = this.life.now
+      for (const ev of this.life.chronicleEvents) {
+        const ago = now - ev.time
+        if (ago >= 0 && ago <= reach) marks.push({ ago, text: ev.text, color: ev.color, major: ev.major })
+      }
+    }
+    return { reach, snapshots, marks }
+  }
+
+  // ---- exports ---------------------------------------------------------------------
+
+  /**
+   * Saves the political map as a PNG: the window's terrain (water, ice, land shaded by
+   * height and plants), each people's land over it, the towns and the peoples' names, with
+   * a legend and the year.
+   */
+  exportPoliticalMap(): Promise<Blob | null> {
+    const f = this.field
+    if (!f) {
+      this.notice('A análise ainda não leu o mundo; tente de novo em alguns segundos.')
+      return Promise.resolve(null)
+    }
+    const N = 1024
+    const legendH = 60 + 28 * Math.max(1, this.lifeStats()?.civs.length ?? 0)
+    const canvas = document.createElement('canvas')
+    canvas.width = N
+    canvas.height = N + legendH
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return Promise.resolve(null)
+    // the terrain, cell by cell
+    const img = ctx.createImageData(N, N)
+    const n = f.size
+    const seaLevel = this.settings.ocean ? this.seaLevel : -Infinity
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const cx = Math.floor((x / N) * n)
+        const cy = Math.floor((y / N) * n)
+        const i = cy * n + cx
+        const h = f.ground[i * 4]
+        const w = f.water[i * 4]
+        const veg = f.extra[i * 4]
+        const ice = f.extra[i * 4 + 3]
+        const lava = f.lava[i * 4]
+        const hx = f.ground[(cy * n + Math.min(cx + 1, n - 1)) * 4] - h
+        const hy = f.ground[(Math.min(cy + 1, n - 1) * n + cx) * 4] - h
+        const shade = clamp(1 - (hx + hy) * n * 0.5, 0.65, 1.3)
+        let r: number
+        let g: number
+        let b: number
+        if (w > 0.002) {
+          const deep = clamp((w - 0.002) / 0.05, 0, 1) * (h + w < seaLevel + 0.01 ? 1 : 0.5)
+          r = 70 - 30 * deep
+          g = 130 - 50 * deep
+          b = 190 - 40 * deep
+        } else if (ice > 0.0005 || f.extra[i * 4 + 2] > 0.0004) {
+          r = g = 235 * shade
+          b = 245 * shade
+        } else if (lava > 0.0002) {
+          r = 200
+          g = 60
+          b = 20
+        } else {
+          const t = clamp(h * 1.6, 0, 1)
+          const bare = [150 + 60 * t, 125 + 45 * t, 90 + 40 * t]
+          const green = [90, 140 - 30 * t, 60]
+          r = (bare[0] * (1 - veg) + green[0] * veg) * shade
+          g = (bare[1] * (1 - veg) + green[1] * veg) * shade
+          b = (bare[2] * (1 - veg) + green[2] * veg) * shade
+        }
+        const k = (y * N + x) * 4
+        img.data[k] = r
+        img.data[k + 1] = g
+        img.data[k + 2] = b
+        img.data[k + 3] = 255
+      }
+    }
+    ctx.putImageData(img, 0, 0)
+    const e = this.extent
+    const size = this.sim.size
+    const stats = this.lifeStats()
+    if (this.settings.life && stats) {
+      // the peoples' land
+      const map = this.life.territory(this.origin, size, e)
+      if (map) {
+        const T = TERRITORY_N
+        const cell = N / T
+        for (let y = 0; y < T; y++) {
+          for (let x = 0; x < T; x++) {
+            const v = map[y * T + x]
+            const owner = v & 15
+            if (!owner) continue
+            const c = CIV_COLORS[owner - 1]
+            ctx.fillStyle = `rgba(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)}, 0.42)`
+            ctx.fillRect(x * cell, y * cell, cell + 0.5, cell + 0.5)
+            // the border where the neighbour belongs to someone else
+            const left = x > 0 ? map[y * T + x - 1] & 15 : 0
+            const up = y > 0 ? map[(y - 1) * T + x] & 15 : 0
+            ctx.fillStyle = 'rgba(20, 20, 20, 0.55)'
+            if (left !== owner) ctx.fillRect(x * cell, y * cell, 1.5, cell)
+            if (up !== owner) ctx.fillRect(x * cell, y * cell, cell, 1.5)
+          }
+        }
+      }
+      // towns and names
+      const towns = this.life.townsIn(this.origin, size, e)
+      ctx.textAlign = 'center'
+      ctx.lineJoin = 'round'
+      for (const t of towns) {
+        const c = CIV_COLORS[t.color]
+        const px = t.uv[0] * N
+        const py = t.uv[1] * N
+        ctx.beginPath()
+        ctx.arc(px, py, t.capital ? 7 : 3.5 + 3 * t.pop, 0, Math.PI * 2)
+        ctx.fillStyle = `rgb(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)})`
+        ctx.fill()
+        ctx.lineWidth = t.capital ? 2.5 : 1.2
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.7)'
+        ctx.stroke()
+        if (t.monument) {
+          ctx.fillStyle = '#fff'
+          ctx.font = 'bold 11px sans-serif'
+          ctx.fillText('▲', px, py - 9)
+        }
+      }
+      ctx.font = 'bold 20px sans-serif'
+      for (const t of towns) {
+        if (!t.capital) continue
+        ctx.lineWidth = 4
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)'
+        ctx.strokeText(t.civ, t.uv[0] * N, t.uv[1] * N - 12)
+        ctx.fillStyle = '#fff'
+        ctx.fillText(t.civ, t.uv[0] * N, t.uv[1] * N - 12)
+      }
+      // the legend
+      ctx.fillStyle = '#1b1b1f'
+      ctx.fillRect(0, N, N, legendH)
+      ctx.textAlign = 'left'
+      ctx.fillStyle = '#f2f2f2'
+      ctx.font = 'bold 22px sans-serif'
+      ctx.fillText(`Mapa político · ano ${stats.year} · ${stats.people} pessoas em ${stats.villages} cidades`, 20, N + 34)
+      ctx.font = '16px sans-serif'
+      stats.civs.forEach((civ, k) => {
+        const c = CIV_COLORS[civ.color]
+        const y = N + 60 + k * 28
+        ctx.fillStyle = `rgb(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)})`
+        ctx.fillRect(20, y - 2, 18, 18)
+        ctx.fillStyle = '#f2f2f2'
+        ctx.fillText(
+          `${civ.name} · ${civ.era} · ${civ.towns} ${civ.towns === 1 ? 'cidade' : 'cidades'} · ${civ.people} pessoas · ${civ.faith}${civ.atWar ? ' · em guerra' : ''}`,
+          48,
+          y + 13,
+        )
+      })
+    } else {
+      ctx.fillStyle = '#1b1b1f'
+      ctx.fillRect(0, N, N, legendH)
+      ctx.fillStyle = '#f2f2f2'
+      ctx.font = 'bold 22px sans-serif'
+      ctx.fillText('Mapa do mundo', 20, N + 34)
+    }
+    return this.saveCanvas(canvas, `craftscape-mapa-${stamp()}.png`)
+  }
+
+  /** Downloads a canvas as a PNG; the blob comes back for whoever wants it (tests). */
+  private saveCanvas(canvas: HTMLCanvasElement, name: string): Promise<Blob | null> {
+    return new Promise((resolve) =>
+      canvas.toBlob((blob) => {
+        if (blob) downloadBlob(blob, name)
+        resolve(blob)
+      }, 'image/png'),
+    )
+  }
+
+  /** Saves the chronicle (the peoples' history as the Life tab tells it) as a PNG page. */
+  exportChronicle(): Promise<Blob | null> {
+    const events = this.life.chronicleEvents
+    const stats = this.lifeStats()
+    if (!this.settings.life || !stats) {
+      this.notice('A crônica só existe com a vida ligada.')
+      return Promise.resolve(null)
+    }
+    const W = 960
+    const canvas = document.createElement('canvas')
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return Promise.resolve(null)
+    // measure first: lines wrap
+    const wrap = (text: string, font: string, width: number) => {
+      ctx.font = font
+      const words = text.split(' ')
+      const lines: string[] = []
+      let line = ''
+      for (const w of words) {
+        const next = line ? `${line} ${w}` : w
+        if (ctx.measureText(next).width > width && line) {
+          lines.push(line)
+          line = w
+        } else line = next
+      }
+      if (line) lines.push(line)
+      return lines
+    }
+    const entries = events.map((ev) => ({ ev, lines: wrap(ev.text, `${ev.major ? 'bold ' : ''}17px Georgia, serif`, W - 160) }))
+    const civLines = stats.civs.map(
+      (c) => `${c.name}: ${c.era}, ${c.towns} ${c.towns === 1 ? 'cidade' : 'cidades'}, ${c.people} pessoas, ${c.faith}`,
+    )
+    const H = 150 + entries.reduce((s, x) => s + 10 + x.lines.length * 22, 0) + 40 + civLines.length * 22 + 40
+    canvas.width = W
+    canvas.height = H
+    // parchment
+    ctx.fillStyle = '#efe6cf'
+    ctx.fillRect(0, 0, W, H)
+    ctx.fillStyle = 'rgba(120, 90, 40, 0.08)'
+    for (let k = 0; k < 400; k++) ctx.fillRect(Math.random() * W, Math.random() * H, 2 + Math.random() * 40, 1)
+    ctx.fillStyle = '#3a2a16'
+    ctx.font = 'bold 30px Georgia, serif'
+    ctx.fillText(`Crônica do mundo`, 60, 60)
+    ctx.font = '18px Georgia, serif'
+    ctx.fillText(
+      `Ano ${stats.year} · ${stats.people} pessoas em ${stats.villages} cidades · ${stats.civs.length} ${stats.civs.length === 1 ? 'povo' : 'povos'}${stats.ending ? ` · ${stats.ending}` : ''}`,
+      60,
+      92,
+    )
+    ctx.strokeStyle = 'rgba(58, 42, 22, 0.5)'
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    ctx.moveTo(60, 108)
+    ctx.lineTo(W - 60, 108)
+    ctx.stroke()
+    let y = 140
+    for (const { ev, lines } of entries) {
+      const c = CIV_COLORS[ev.color] ?? [0.3, 0.3, 0.3]
+      ctx.fillStyle = ev.color ? `rgb(${Math.round(c[0] * 255)}, ${Math.round(c[1] * 255)}, ${Math.round(c[2] * 255)})` : '#6a5a3a'
+      ctx.fillRect(60, y - 12, 10, 10)
+      ctx.fillStyle = '#5a4a2a'
+      ctx.font = '15px Georgia, serif'
+      ctx.textAlign = 'right'
+      ctx.fillText(`ano ${ev.year}`, 140, y)
+      ctx.textAlign = 'left'
+      ctx.fillStyle = '#2e2212'
+      ctx.font = `${ev.major ? 'bold ' : ''}17px Georgia, serif`
+      for (const line of lines) {
+        ctx.fillText(line, 156, y)
+        y += 22
+      }
+      y += 10
+    }
+    y += 20
+    ctx.font = 'bold 20px Georgia, serif'
+    ctx.fillText('Os povos de hoje', 60, y)
+    y += 30
+    ctx.font = '16px Georgia, serif'
+    for (const line of civLines) {
+      ctx.fillText(line, 60, y)
+      y += 22
+    }
+    return this.saveCanvas(canvas, `craftscape-cronica-${stamp()}.png`)
+  }
+
+  private rewindReach() {
+    return this.rewindRing.length ? this.simTime - this.rewindRing[0].simTime : 0
   }
 
   private updateUndoStat() {
@@ -611,6 +1143,7 @@ export class Engine {
   private swapSimulation(size: number) {
     const old = this.sim
     this.clearUndo()
+    this.clearRewind()
     this.sim = new Simulation(this.device, size)
     this.sim.derivedSlices = this.profile.derivedSlices
     this.sim.climateEvery = this.profile.climateEvery
@@ -683,6 +1216,10 @@ export class Engine {
    */
   private changeArea() {
     this.clearUndo()
+    this.settings = {
+      ...this.settings,
+      brushSize: Math.min(this.settings.brushSize, brushMax(this.extent)),
+    }
     this.needsGenerate = true
     this.moveOrigin([0, 0])
     this.camera.setWorld([0, 0, 0], this.settings.infiniteWorld, this.extent)
@@ -732,11 +1269,14 @@ export class Engine {
         temperature: d[15],
         lava: d[20],
         vent: d[22],
+        airSource: Math.round(d[19] / 4) * 0.002,
         tectonic: d[23],
+        plate: this.plateAt(hit),
         windDirection: ((Math.atan2(vy, vx) * 180) / Math.PI + 360) % 360,
         windSpeed: (Math.hypot(vx, vy) / sim.flowSize) * 512 * this.extent,
         pressure: d[27],
         biome: biomeIndex(d[15], d[14]),
+        town: this.settings.life ? this.life.townAt(this.worldAt(hit)) : null,
       }
       this.emit()
     } catch {
@@ -747,11 +1287,232 @@ export class Engine {
     }
   }
 
+  // ---- plate tectonics ------------------------------------------------------------------
+
+  /** Window uv → world units (where the plates live). */
+  private worldAt(uv: [number, number] | [number, number, number]): [number, number] {
+    const n = this.sim.size
+    return [(uv[0] + this.origin[0] / n) * this.extent, (uv[1] + this.origin[1] / n) * this.extent]
+  }
+
+  private uvAt(p: [number, number]): [number, number] {
+    const n = this.sim.size
+    return [p[0] / this.extent - this.origin[0] / n, p[1] / this.extent - this.origin[1] / n]
+  }
+
+  /** What the plates depend on right now (see plates.ts). */
+  private plates(): PlateField {
+    return { seed: this.settings.seed, time: this.plateTime, overrides: this.plateOverrides }
+  }
+
+  private plateAt(hit: [number, number, number]): Probe['plate'] {
+    const b = boundaryAt(this.worldAt(hit), this.plates())
+    const [vx, vy] = plateVelocity(b.pair.own, this.plates())
+    return {
+      direction: ((Math.atan2(vy, vx) * 180) / Math.PI + 360) % 360,
+      speed: Math.hypot(vx, vy),
+      boundary: b.pair.dist < 0.12 ? b.kind : null,
+      closing: b.closing,
+    }
+  }
+
+  /**
+   * Plates tool: pressing grabs the plate under the cursor, dragging points it the way the
+   * drag goes (longer drags move it faster), letting go shakes its boundary with an
+   * earthquake. The uplift follows on the next frame.
+   */
+  private dragPlate(active: boolean) {
+    if (!active || !this.hit) {
+      const drag = this.plateDrag
+      this.plateDrag = null
+      if (drag?.turned) this.strike(boundaryAt(drag.from, this.plates()), 5.5 + Math.random())
+      return
+    }
+    const p = this.worldAt(this.hit)
+    if (!this.plateDrag) {
+      this.plateDrag = { cell: platePair(p, this.plates()).own, from: p, turned: false }
+      return
+    }
+    const { cell, from } = this.plateDrag
+    const dx = p[0] - from[0]
+    const dy = p[1] - from[1]
+    const len = Math.hypot(dx, dy)
+    if (len < 0.02) return
+    const speed = clamp(len / 0.3, 0.2, 1)
+    const velocity: [number, number] = [(dx / len) * speed, (dy / len) * speed]
+    // the plate goes on from where it is now, in the new direction
+    const override: PlateOverride = { cell, velocity, from: plateDrift(cell, this.plates()), at: this.plateTime }
+    this.plateOverrides = [...this.plateOverrides.filter((o) => !sameCell(o.cell, cell)), override].slice(-16)
+    this.plateDrag.turned = true
+    this.sim.platesDirty = true
+  }
+
+  /** Every so often (more often in geological time) a fault slips somewhere along a boundary in view. */
+  private scheduleQuake(steps: number) {
+    const s = this.settings
+    if (!s.earthquakes || steps <= 0) return
+    this.quakeClock -= steps * Math.min(s.geologicTime, 5)
+    if (this.quakeClock > 0) return
+    this.quakeClock = QUAKE_STEPS * (0.5 + Math.random())
+    // a few random spots; the busiest boundary close to one of them
+    let best: Boundary | null = null
+    let bestScore = 0
+    for (let k = 0; k < 16; k++) {
+      const b = boundaryAt(this.worldAt([0.1 + 0.8 * Math.random(), 0.1 + 0.8 * Math.random()]), this.plates())
+      const score = (Math.abs(b.closing) + Math.abs(b.shear)) * Math.random()
+      if (b.pair.dist < 0.15 && score > bestScore) [best, bestScore] = [b, score]
+    }
+    // magnitude 5 – 7.5, the big ones rare
+    if (best) this.strike(best, 5 + 2.5 * Math.random() ** 2)
+  }
+
+  /** Queues an earthquake of this magnitude on a boundary, for the next frame. */
+  private strike(b: Boundary, magnitude: number) {
+    const uv = this.uvAt(b.point)
+    if (uv[0] < 0 || uv[1] < 0 || uv[0] > 1 || uv[1] > 1) return
+    // each step of magnitude: about 3× the slip and the size of the shaken area
+    const scale = 10 ** ((magnitude - 6) / 2)
+    const slip = b.kind === 'convergent' ? 0.0006 : b.kind === 'divergent' ? -0.0006 : 0
+    this.pendingQuake = {
+      uv,
+      normal: Math.atan2(b.normal[1], b.normal[0]),
+      radius: 0.06 * scale,
+      slip: slip * scale,
+      rubble: 0.0008 * scale,
+    }
+    this.toast(`Terremoto de magnitude ${magnitude.toFixed(1).replace('.', ',')}: ${BOUNDARY_NAMES[b.kind]}`)
+    if (magnitude >= 6.5) this.life.chronicle(`Um terremoto de magnitude ${magnitude.toFixed(1).replace('.', ',')} sacode a terra.`, magnitude >= 7, b.point)
+  }
+
+  /**
+   * Volcanoes: now and then one wakes up on a plate boundary (where plates collide most of
+   * all, or pull apart), its vent opens and erupts for a few simulated minutes, building a
+   * cone of lava, while its ash shades and cools the region and a little the whole planet;
+   * then it goes quiet. A dormant volcano wakes again half the time, so the cone keeps growing.
+   */
+  private scheduleVolcanoes(steps: number) {
+    const s = this.settings
+    if (steps <= 0) return
+    const simSeconds = steps * STEP
+    for (const v of this.volcanoes) {
+      if (!v.erupting) continue
+      v.left -= simSeconds
+      if (v.left <= 0) this.quietVolcano(v)
+    }
+    if (!s.volcanoes) return
+    this.volcanoClock -= steps * Math.min(s.geologicTime, 5)
+    if (this.volcanoClock > 0) return
+    this.volcanoClock = VOLCANO_STEPS * (0.5 + Math.random())
+    const dormant = this.volcanoes.filter((v) => !v.erupting)
+    if (dormant.length && Math.random() < 0.5) {
+      this.erupt(dormant[Math.floor(Math.random() * dormant.length)])
+      return
+    }
+    // a few random spots; the boundary nearest one of them, colliding plates preferred
+    let best: Boundary | null = null
+    let bestScore = 0
+    for (let k = 0; k < 16; k++) {
+      const b = boundaryAt(this.worldAt([0.1 + 0.8 * Math.random(), 0.1 + 0.8 * Math.random()]), this.plates())
+      const score = (b.kind === 'convergent' ? b.closing * 2 : b.kind === 'divergent' ? -b.closing : 0) * Math.random()
+      if (b.pair.dist < 0.12 && score > bestScore) [best, bestScore] = [b, score]
+    }
+    if (!best) return
+    const uv = this.uvAt(best.point)
+    if (uv[0] < 0.05 || uv[1] < 0.05 || uv[0] > 0.95 || uv[1] > 0.95) return
+    // not under the deep sea (the field is a few seconds old, which is fine here)
+    const f = this.field
+    if (f) {
+      const i = Math.floor(uv[1] * f.size) * f.size + Math.floor(uv[0] * f.size)
+      if (f.water[i * 4] > 0.01) return
+    }
+    if (this.volcanoes.some((v) => Math.hypot(v.uv[0] - uv[0], v.uv[1] - uv[1]) < 0.04)) return
+    while (this.volcanoes.length >= MAX_VOLCANOES) {
+      const k = this.volcanoes.findIndex((v) => !v.erupting)
+      if (k < 0) return
+      this.volcanoes.splice(k, 1)
+    }
+    const volcano: Volcano = {
+      name: `Monte ${placeName()}`,
+      uv,
+      radius: 0.01 / this.extent,
+      strength: 0,
+      left: 0,
+      erupting: false,
+      eruptions: 0,
+    }
+    this.volcanoes.push(volcano)
+    this.erupt(volcano)
+  }
+
+  private erupt(v: Volcano) {
+    v.erupting = true
+    v.eruptions++
+    v.strength = 0.4 + 0.6 * Math.random()
+    v.left = 60 + 180 * Math.random()
+    this.pendingVent = { uv: v.uv, radius: v.radius, delta: v.strength }
+    // the ash: a cloud that shades and cools the region for days, and a little the whole planet
+    const cooling = 2 + 6 * v.strength
+    this.dusts = [...this.dusts, { uv: v.uv, cooling, radius: (0.15 + 0.2 * v.strength) / this.extent }].slice(-MAX_DUSTS)
+    this.dust = Math.min(this.dust + 0.3 + v.strength, 6)
+    const again = v.eruptions > 1 ? ' de novo' : ''
+    this.toast(`O ${v.name} entrou em erupção${again}: lava por uns minutos, e cinzas que esfriam a região ${cooling.toFixed(0)} °C`)
+    this.life.chronicle(`O ${v.name} entra em erupção${again}; a cinza escurece o céu.`, true, this.worldAt(v.uv))
+    this.stats = { ...this.stats, volcanoes: this.volcanoReports() }
+  }
+
+  private quietVolcano(v: Volcano) {
+    v.erupting = false
+    v.left = 0
+    this.pendingVent = { uv: v.uv, radius: v.radius, delta: -v.strength }
+    this.life.chronicle(`O ${v.name} se aquieta.`, false, this.worldAt(v.uv))
+    this.stats = { ...this.stats, volcanoes: this.volcanoReports() }
+  }
+
+  private volcanoReports() {
+    return this.volcanoes.map((v) => ({ name: v.name, erupting: v.erupting }))
+  }
+
+  /** The tide right now: the sea rises and falls twice a simulated day. */
+  private get tide() {
+    const s = this.settings
+    if (!s.tides || !s.ocean) return 0
+    return TIDE_AMPLITUDE * Math.sin((this.simTime * 2 * Math.PI) / ((s.dayLength * 60) / 2))
+  }
+
+  /** Mean sea level in effect: the slider, warming (the slider's in manual climate, the peoples' always), and the tide. */
+  private get seaLevel() {
+    const s = this.settings
+    const warming = (s.autoClimate ? 0 : s.temperature) + this.civWarming + this.godWarming
+    return climateOf({ temperature: 0, seaLevel: s.seaLevel }).seaLevel + warming * SEA_RISE_PER_DEGREE + this.tide
+  }
+
+  /** A notice that goes away by itself. */
+  private toast(message: string) {
+    this.notice(message)
+    clearTimeout(this.toastTimer)
+    this.toastTimer = window.setTimeout(() => {
+      if (this.message === message) this.notice(null)
+    }, 5000)
+  }
+
+  /** One arrow per plate centred in the window, pointing where it drifts. */
+  private plateArrows(): PlateArrow[] {
+    const [x0, y0] = this.worldAt([0, 0])
+    const e = this.extent
+    const field = this.plates()
+    return platesIn(x0, y0, x0 + e, y0 + e, field).map(({ cell, site }) => ({
+      uv: this.uvAt(site),
+      velocity: plateVelocity(cell, field),
+      selected: this.plateDrag !== null && sameCell(this.plateDrag.cell, cell),
+    }))
+  }
+
   // ---- infinite world ----------------------------------------------------------------
 
   private moveOrigin(origin: [number, number]) {
     this.origin = origin
     this.needsFar = true
+    this.sim.platesDirty = true
     const cells = this.sim.size / TILES
     this.stats = {
       ...this.stats,
@@ -865,7 +1626,7 @@ export class Engine {
 
   // ---- frame loop ------------------------------------------------------------------
 
-  private brushFor(painting: boolean): Brush {
+  private brushFor(painting: boolean, clearing = false): Brush {
     const s = this.settings
     const amount = (s.mode === 'add' ? 1 : -1) * s.brushStrength
     return {
@@ -883,8 +1644,96 @@ export class Engine {
       humidity: s.tool === 'humidity' && !s.autoClimate ? amount : 0,
       volcano: s.tool === 'volcano' ? amount : 0,
       pressure: s.tool === 'pressure' ? amount : 0,
-      uplift: s.tool === 'uplift' ? amount : 0,
+      airMass: s.tool === 'airmass' && !s.airMassFixed ? amount : 0,
+      airSource: s.tool === 'airmass' && s.airMassFixed ? amount : 0,
+      clearAirSources: clearing,
+      current: s.tool === 'current' ? amount : 0,
     }
+  }
+
+  /** A stroke's first press: the one-shot tools (storm, meteor) act here. */
+  private strokeStart(hit: [number, number, number]) {
+    const s = this.settings
+    const uv: [number, number] = [hit[0], hit[1]]
+    if (s.tool === 'sun') {
+      // the sun power: the whole planet a degree warmer (or cooler) per click, whatever the climate mode
+      const delta = s.mode === 'add' ? 1 : -1
+      this.godWarming = clamp(this.godWarming + delta, -10, 10)
+      const shown = `${this.godWarming > 0 ? '+' : ''}${this.godWarming.toFixed(0)} °C`
+      this.toast(delta > 0 ? `O sol se fortalece: o planeta esquenta 1 °C (${shown})` : `O sol enfraquece: o planeta esfria 1 °C (${shown})`)
+      this.life.chronicle(delta > 0 ? 'O sol se fortalece: o mundo esquenta.' : 'O sol enfraquece: o mundo esfria.', true)
+      this.stats = { ...this.stats, godWarming: this.godWarming }
+      this.emit()
+    } else if (s.tool === 'drought') {
+      // the drought power: a fixed high that keeps the rain off a region until it is lifted
+      if (s.mode === 'add') {
+        const radius = clamp(s.brushSize * 2, 0.06, 0.4) / this.extent
+        this.highs = [...this.highs, { uv, radius }].slice(-MAX_HIGHS)
+        this.toast('Seca: uma alta pressão fixa; não chove aqui até você apagá-la (modo −)')
+        this.life.chronicle('O céu se fecha para a chuva sobre uma região: uma seca decretada.', true, this.worldAt(uv))
+      } else {
+        const near = this.highs.findIndex((h) => Math.hypot(h.uv[0] - uv[0], h.uv[1] - uv[1]) < h.radius)
+        if (near >= 0) {
+          this.highs = this.highs.filter((_, k) => k !== near)
+          this.toast('A seca acabou: a chuva volta à região')
+          this.life.chronicle('A seca acaba: as chuvas voltam.', false, this.worldAt(uv))
+        }
+      }
+      this.stats = { ...this.stats, droughts: this.highs.length }
+      this.emit()
+    } else if (s.tool === 'storm') {
+      const radius = clamp(s.brushSize * 2, 0.06, 0.35) / this.extent
+      this.storms = [...this.storms, { uv, age: 0, radius }].slice(-MAX_STORMS)
+      this.toast('Tempestade a caminho: uma baixa profunda que o vento vai levar embora')
+    } else if (s.tool === 'meteor') {
+      const radius = clamp(s.brushSize, 0.015, 0.2)
+      const depth = radius * 0.3
+      this.pendingImpact = { uv, radius, depth }
+      this.pendingQuake = { uv, normal: Math.random() * Math.PI, radius: radius * 4, slip: 0, rubble: depth * 0.08 }
+      this.dust = Math.min(this.dust + Math.min(depth * 300, 6), 8)
+      // the firestorm: the hot plume over the crater becomes a deep low the wind carries off
+      const stormRadius = clamp(radius * 5, 0.06, 0.35) / this.extent
+      this.storms = [...this.storms, { uv, age: 0, radius: stormRadius }].slice(-MAX_STORMS)
+      // the dust cloud: shade and cold over the region for days, spreading as it settles
+      const cooling = Math.min(4 + depth * 250, 14)
+      this.dusts = [...this.dusts, { uv, cooling, radius: clamp(radius * 6, 0.1, 0.45) / this.extent }].slice(-MAX_DUSTS)
+      this.toast(
+        `Impacto! Bola de fogo, onda de choque e tempestade; a poeira esfria a região ${cooling.toFixed(0)} °C e o planeta ${this.dust.toFixed(1).replace('.', ',')} °C até baixar`,
+      )
+      this.life.chronicle('Uma estrela cai do céu: bola de fogo, terremoto e dias de poeira.', true, this.worldAt(uv))
+    }
+  }
+
+  /** Storms age and drift with the prevailing wind (at half its speed, like the weather systems). */
+  private driftStorms(simSeconds: number) {
+    if ((!this.storms.length && !this.dusts.length) || simSeconds <= 0) return
+    const s = this.settings
+    const speed = (s.autoClimate ? 0.8 : s.windSpeed) / (512 * this.extent)
+    const angle = this.windAngle
+    const move = (speed * 0.5 * simSeconds) / STEP
+    this.storms = this.storms
+      .map((st) => ({
+        ...st,
+        age: st.age + simSeconds,
+        uv: [st.uv[0] + Math.cos(angle) * move, st.uv[1] + Math.sin(angle) * move] as [number, number],
+      }))
+      .filter((st) => st.age < STORM_LIFE && st.uv[0] > -0.3 && st.uv[0] < 1.3 && st.uv[1] > -0.3 && st.uv[1] < 1.3)
+    // dust clouds hang over the region (the heavy column barely drifts: a tenth of the wind),
+    // spread out and thin, and settle in a couple of days
+    const settle = Math.exp(-simSeconds / (s.dayLength * 60 * 2))
+    const drift = move * 0.1
+    this.dusts = this.dusts
+      .map((d) => ({
+        uv: [d.uv[0] + Math.cos(angle) * drift, d.uv[1] + Math.sin(angle) * drift] as [number, number],
+        cooling: d.cooling * settle,
+        radius: d.radius * (1 + simSeconds / (s.dayLength * 60 * 4)),
+      }))
+      .filter((d) => d.cooling > 0.3 && d.uv[0] > -0.6 && d.uv[0] < 1.6 && d.uv[1] > -0.6 && d.uv[1] < 1.6)
+  }
+
+  /** Removes every fixed air mass painted in the window (undoable). */
+  clearAirSources() {
+    this.pendingClear = true
   }
 
   /**
@@ -907,7 +1756,8 @@ export class Engine {
   /** Temperature anomaly in effect: the slider, or the season in automatic climate. */
   private get anomaly() {
     const s = this.settings
-    return s.autoClimate ? seasonOf(this.simTime / (s.dayLength * 60 * DAYS_PER_YEAR)).anomaly : s.temperature
+    const base = s.autoClimate ? seasonOf(this.simTime / (s.dayLength * 60 * DAYS_PER_YEAR)).anomaly : s.temperature
+    return base - this.dust + this.civWarming + this.godWarming
   }
 
   private climate(): Climate {
@@ -921,7 +1771,7 @@ export class Engine {
     return {
       baseTemperature: BASE_TEMPERATURE + temperature,
       temperature,
-      seaLevel: climateOf({ temperature: auto ? 0 : s.temperature, seaLevel: s.seaLevel }).seaLevel,
+      seaLevel: this.seaLevel,
       ocean: s.ocean,
       latitude: auto ? 16 : s.latitude,
       lapseRate: LAPSE_RATE,
@@ -945,23 +1795,41 @@ export class Engine {
       const climateBytes = sim.cells * 16
       const windBytes = sim.flowSize * sim.flowSize * 16
       const staging = this.device.createBuffer({
-        size: climateBytes + windBytes,
+        size: climateBytes * 5 + windBytes,
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
       })
       const enc = this.device.createCommandEncoder({ label: 'climate analysis' })
       enc.copyBufferToBuffer(sim.climate, 0, staging, 0, climateBytes)
       enc.copyBufferToBuffer(sim.wind, 0, staging, climateBytes, windBytes)
+      enc.copyBufferToBuffer(sim.water, 0, staging, climateBytes + windBytes, climateBytes)
+      enc.copyBufferToBuffer(sim.extra, 0, staging, climateBytes * 2 + windBytes, climateBytes)
+      enc.copyBufferToBuffer(sim.lava, 0, staging, climateBytes * 3 + windBytes, climateBytes)
+      enc.copyBufferToBuffer(sim.ground, 0, staging, climateBytes * 4 + windBytes, climateBytes)
+      const origin: [number, number] = [this.origin[0], this.origin[1]]
       this.device.queue.submit([enc.finish()])
       await staging.mapAsync(GPUMapMode.READ)
       const data = new Float32Array(staging.getMappedRange().slice(0))
       staging.unmap()
       staging.destroy()
       if (sim !== this.sim) return
-      const wind = data.subarray(sim.cells * 4)
+      const n4 = sim.cells * 4
+      const w4 = sim.flowSize * sim.flowSize * 4
+      const wind = data.subarray(n4, n4 + w4)
       let sum = 0
       for (let i = 3; i < wind.length; i += 4) sum += wind[i]
       this.pressureMean = sum / (wind.length / 4)
-      this.stats = { ...this.stats, climate: summarizeClimate(data, sim.cells, sim.flowSize, this.extent) }
+      this.field = {
+        size: sim.size,
+        origin,
+        climate: data.subarray(0, n4),
+        water: data.subarray(n4 + w4, n4 * 2 + w4),
+        extra: data.subarray(n4 * 2 + w4, n4 * 3 + w4),
+        lava: data.subarray(n4 * 3 + w4, n4 * 4 + w4),
+        ground: data.subarray(n4 * 4 + w4, n4 * 5 + w4),
+      }
+      const report = summarizeClimate(this.field, wind, sim.flowSize, this.extent)
+      this.updateChallenge(report)
+      this.stats = { ...this.stats, climate: report, challenge: this.challenge }
       this.emit()
     } catch {
       // device lost or simulation replaced mid-read: try again next time
@@ -970,11 +1838,37 @@ export class Engine {
     }
   }
 
+  /** Starts playing a challenge: its baseline is the next climate report (or the last one). */
+  startChallenge(id: ChallengeId) {
+    this.challenge = { id, start: this.stats.climate, progress: 0, done: false }
+    this.stats = { ...this.stats, challenge: this.challenge }
+    this.emit()
+  }
+
+  stopChallenge() {
+    this.challenge = null
+    this.stats = { ...this.stats, challenge: null }
+    this.emit()
+  }
+
+  private updateChallenge(report: ClimateReport) {
+    const c = this.challenge
+    if (!c) return
+    const start = c.start ?? report
+    const progress = clamp(challengeById(c.id).progress(report, start), 0, 1)
+    const done = c.done || progress >= 1
+    if (done && !c.done) this.toast(`Desafio concluído: ${challengeById(c.id).name}!`)
+    this.challenge = { ...c, start, progress, done }
+  }
+
   /** The overlay to draw: the chosen one, or the matching map while using the climate brush. */
   private overlay() {
     const s = this.settings
     if (s.overlay !== 'none') return s.overlay
-    if (s.tool === 'pressure') return 'pressure'
+    if (s.tool === 'pressure' || s.tool === 'storm' || s.tool === 'drought') return 'pressure'
+    if (s.tool === 'plates') return 'plates'
+    if (s.tool === 'airmass') return 'airmass'
+    if (s.tool === 'current') return 'current'
     return s.tool === 'heat' ? 'temperature' : s.tool === 'humidity' ? 'humidity' : 'none'
   }
 
@@ -1025,14 +1919,42 @@ export class Engine {
     if (!cursor) this.hit = null
 
     const inspecting = s.tool === 'inspect'
-    const painting = this.input.painting && this.hit !== null && !this.busy && !inspecting
+    // the plates tool drags plates instead of painting
+    // (a press that began and ended between two frames still counts, as one frame of painting;
+    // it waits a few frames for the pick under the cursor to come back)
+    if (this.input.takePress()) this.pressFrames = 5
+    const pressed = this.pressFrames > 0 && this.hit !== null
+    this.pressFrames = pressed ? 0 : Math.max(this.pressFrames - 1, 0)
+    // a click while inspecting picks the town under the cursor for the Life tab
+    if (inspecting && pressed && this.hit && s.life) {
+      const town = this.life.townAt(this.worldAt(this.hit))
+      this.selectedTown = town ? town.id : null
+      this.stats = { ...this.stats, life: this.lifeStats() }
+      this.emit()
+    }
+    const pressing = (this.input.painting || pressed) && this.hit !== null && !this.busy && !inspecting
+    const painting = pressing && s.tool !== 'plates'
+    this.dragPlate(pressing && s.tool === 'plates')
+    const quake = this.pendingQuake
+    this.pendingQuake = null
+    const vent = this.pendingVent
+    this.pendingVent = null
+    const clearing = this.pendingClear && !this.busy
+    if (!this.busy) this.pendingClear = false
     const enc = this.device.createCommandEncoder({ label: 'simulation' })
+    this.recordRewind(enc)
 
     if (painting && !this.wasPainting) {
       this.pushUndo(enc)
-      if (this.hit) this.levelHeight = this.hit[2]
+      if (this.hit) {
+        this.levelHeight = this.hit[2]
+        this.strokeStart(this.hit)
+      }
     }
     this.wasPainting = painting
+    if (clearing && !painting) this.pushUndo(enc)
+    const impact = this.pendingImpact
+    this.pendingImpact = null
 
     const sky = skyAt(s.timeOfDay)
     this.sim.writeParams(
@@ -1049,8 +1971,16 @@ export class Engine {
         shape: s.terrainShape,
         extent: e,
         geologicTime: s.geologicTime,
+        plateTime: this.plateTime,
+        plates: this.plateOverrides,
+        impact,
+        storms: this.storms.map((st) => ({ uv: st.uv, strength: stormStrength(st.age), radius: st.radius })),
+        dusts: this.dusts,
+        highs: this.highs.map((h) => ({ uv: h.uv, strength: 1, radius: h.radius })),
+        quake,
+        vent,
         climate: this.climate(),
-        brush: this.brushFor(painting),
+        brush: this.brushFor(painting, clearing),
         ray,
       },
       this.frame,
@@ -1062,7 +1992,23 @@ export class Engine {
       this.lastGenerate = now
       this.needsGenerate = false
       this.sim.encodeGenerate(enc)
+      this.plateOverrides = []
+      this.plateTime = 0
       full = true
+      this.clearRewind()
+      this.life.reset()
+      this.selectedTown = null
+      this.lastFollowed = -1
+      this.storms = []
+      this.dusts = []
+      this.dust = 0
+      this.civWarming = 0
+      this.godWarming = 0
+      this.highs = []
+      this.stats = { ...this.stats, godWarming: 0, droughts: 0 }
+      this.volcanoes = []
+      this.volcanoClock = VOLCANO_STEPS * 0.5
+      this.stats = { ...this.stats, volcanoes: [] }
       // a new terrain: the regions visited before belong to the old one
       this.world.clear()
       this.stats = { ...this.stats, storedRegions: 0 }
@@ -1073,12 +2019,14 @@ export class Engine {
     if (this.needsFar && s.infiniteWorld && !this.busy) this.refreshFar()
 
     let steps = 0
-    if (!s.paused && !this.busy) {
+    if (!s.paused && !this.busy && !this.rewinding) {
       this.accumulator += dt * s.speed
       // when frames are already slow, run fewer steps (the simulation slows down)
       // instead of spiralling into ever longer frames
       const max = this.profile.maxStepsPerFrame
-      const cap = Math.min(dt > 1 / 30 ? 1 : dt > 1 / 50 ? 2 : max, max)
+      // only the time beyond the intended frame interval counts as lag
+      const lag = dt - this.frameInterval() / 1000
+      const cap = Math.min(lag > 1 / 30 ? 1 : lag > 1 / 50 ? 2 : max, max)
       steps = Math.min(Math.floor(this.accumulator / STEP), cap)
       this.accumulator = Math.min(this.accumulator - steps * STEP, STEP * 2)
       for (let k = 0; k < steps; k++) this.sim.encodeStep(enc, painting)
@@ -1088,6 +2036,21 @@ export class Engine {
       this.accumulator -= paints * STEP
       for (let k = 0; k < paints; k++) this.sim.encodePaint(enc)
     }
+    // the clearing flag is in this frame's params: one paint pass applies it even when
+    // the simulation is paused and nothing is being painted
+    if (clearing) this.sim.encodePaint(enc)
+    // the strike and the fault slip after the steps, so they run on the ground as it was this frame
+    if (impact) this.sim.encodeImpact(enc)
+    // the peoples work the land while the simulation runs
+    if (s.life && steps > 0) {
+      const works = this.life.works(this.origin, this.sim.size, this.extent)
+      if (works.length) {
+        this.sim.writeWorks(works)
+        this.sim.encodeWorks(enc)
+      }
+    }
+    if (quake) this.sim.encodeQuake(enc)
+    if (vent) this.sim.encodeVent(enc)
     this.sim.encodeDerived(enc, full)
 
     const readPick = ray ? this.sim.encodePick(enc) : null
@@ -1112,12 +2075,19 @@ export class Engine {
       {
         uv: this.hit ? [this.hit[0], this.hit[1]] : [0, 0],
         radius: s.brushSize / e,
-        visible: this.hit !== null && !clean && !inspecting,
+        visible: this.hit !== null && !clean && !inspecting && s.tool !== 'plates',
       },
       this.time,
       {
         overlay: this.overlay(),
         arrows: s.windArrows && !clean,
+        plateArrows: this.overlay() === 'plates' && !clean ? this.plateArrows() : [],
+        life: s.life ? this.life.markers(this.origin, this.sim.size, e) : [],
+        roads: s.life && !clean ? this.life.roads(this.origin, this.sim.size, e) : [],
+        territory:
+          s.life && (s.politicalMap || s.overlay === 'civilization') && !clean
+            ? this.life.territory(this.origin, this.sim.size, e)
+            : null,
         clouds: s.clouds,
         sky,
         cloudDrift: this.cloudDrift,
@@ -1126,16 +2096,18 @@ export class Engine {
         horizon: s.infiniteWorld,
         extent: e,
         seed: s.seed,
+        plates: this.plates(),
+        seasonPhase: s.autoClimate ? (this.simTime / (s.dayLength * 60 * DAYS_PER_YEAR)) % 1 : -1,
         farClimate: {
-          seaLevel: s.ocean
-            ? climateOf({ temperature: s.autoClimate ? 0 : s.temperature, seaLevel: s.seaLevel }).seaLevel
-            : null,
+          seaLevel: s.ocean ? this.seaLevel : null,
           baseTemperature: BASE_TEMPERATURE + this.anomaly,
           lapseRate: LAPSE_RATE,
           latitude: s.latitude,
         },
       },
     )
+    const atlas = this.overlay() === 'civilization'
+    this.drawLabels(view.viewProj, s.life && !clean ? this.life.labels(this.origin, this.sim.size, e, this.selectedTown, atlas) : [], atlas)
     if (this.shot) {
       // the canvas still holds this frame until the task ends; the next frame resizes it back
       const { done } = this.shot
@@ -1143,6 +2115,15 @@ export class Engine {
       this.canvas.toBlob(done, 'image/png')
     }
     this.advanceTime(steps * STEP)
+    this.driftStorms(steps * STEP)
+    if (s.life) {
+      this.life.update(steps * STEP, this.field, e)
+      this.industrialWarming(steps * STEP)
+      if (s.followEvents && !clean) this.followEvents()
+    }
+    this.plateTime += steps * s.geologicTime * s.plateDrift * PLATE_DRIFT
+    this.scheduleQuake(steps)
+    this.scheduleVolcanoes(steps)
     if (now - this.lastAnalysis > 3000 && !this.analysing && !this.busy) {
       this.lastAnalysis = now
       void this.analyzeClimate()
@@ -1155,10 +2136,116 @@ export class Engine {
     this.updateStats(now)
   }
 
+  /** Industry warms the planet (a degree per ten smoking towns per five simulated minutes, up to 4 °C) and the warmth lingers. */
+  private industrialWarming(simSeconds: number) {
+    if (simSeconds <= 0) return
+    const industries = this.life.stats().industries
+    const before = this.civWarming
+    if (industries > 0) this.civWarming = Math.min(4, this.civWarming + simSeconds * (industries / 3000))
+    else {
+      this.civWarming *= Math.exp(-simSeconds / (this.settings.dayLength * 60 * 6))
+      if (this.civWarming < 0.02) this.civWarming = 0
+    }
+    if (before < 1 && this.civWarming >= 1) this.toast('A indústria dos povos já aquece o planeta 1 °C')
+    if (Math.round(before * 10) !== Math.round(this.civWarming * 10)) this.stats = { ...this.stats, civWarming: this.civWarming }
+  }
+
+  /**
+   * Draws the peoples' names over their capitals (and the chosen town) on the label canvas;
+   * on the peoples' map (atlas) the names are set like a map's: dark on the parchment, the
+   * peoples' in capitals over their land, the towns' small beside a dot.
+   */
+  private drawLabels(viewProj: Float32Array | number[], labels: LifeLabel[], atlas = false) {
+    const c = this.labelCanvas
+    const dpr = Math.min(window.devicePixelRatio || 1, 2)
+    const width = Math.round(c.clientWidth * dpr)
+    const height = Math.round(c.clientHeight * dpr)
+    if (!width || !height) return
+    if (c.width !== width || c.height !== height) {
+      c.width = width
+      c.height = height
+    }
+    const ctx = c.getContext('2d')
+    if (!ctx) return
+    ctx.clearRect(0, 0, width, height)
+    if (!labels.length) return
+    const [ou, ov] = this.originUnits
+    const e = this.extent
+    const m = viewProj
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'bottom'
+    ctx.lineJoin = 'round'
+    for (const l of labels) {
+      const x = (l.uv[0] - 0.5 + ou) * e
+      const y = l.height + 0.012
+      const z = (0.5 - l.uv[1] - ov) * e
+      // column-major, as the shaders take it
+      const cx = m[0] * x + m[4] * y + m[8] * z + m[12]
+      const cy = m[1] * x + m[5] * y + m[9] * z + m[13]
+      const cw = m[3] * x + m[7] * y + m[11] * z + m[15]
+      if (cw <= 0.0001) continue
+      const sx = (cx / cw) * 0.5 + 0.5
+      const sy = 0.5 - (cy / cw) * 0.5
+      if (sx < -0.1 || sx > 1.1 || sy < -0.1 || sy > 1.1) continue
+      const px = sx * width
+      const py = sy * height
+      const [r, g, b] = CIV_COLORS[l.color].map((v) => Math.round(v * 255))
+      const civ = `rgb(${r}, ${g}, ${b})`
+      ctx.letterSpacing = '0px'
+      if (atlas && l.kind === 'people') {
+        // the people's name spread over its land, in a darkened shade of its colour
+        const size = (15 + 9 * l.size) * dpr
+        ctx.font = `700 ${size}px Georgia, 'Times New Roman', serif`
+        ctx.letterSpacing = `${0.18 * size}px`
+        // set below its point, so it clears the town names above their dots
+        const ty = py + size * 1.1
+        ctx.lineWidth = 4 * dpr
+        ctx.strokeStyle = 'rgba(248, 243, 228, 0.85)'
+        ctx.strokeText(l.text.toUpperCase(), px, ty)
+        ctx.fillStyle = `rgb(${Math.round(r * 0.45)}, ${Math.round(g * 0.45)}, ${Math.round(b * 0.45)})`
+        ctx.fillText(l.text.toUpperCase(), px, ty)
+      } else if (atlas && l.kind === 'town') {
+        // a dot for the town (ringed for a capital) with its name beside it
+        const radius = (l.major ? 4 : 2.2 + 1.5 * l.size) * dpr
+        ctx.beginPath()
+        ctx.arc(px, py, radius, 0, Math.PI * 2)
+        ctx.fillStyle = l.major ? '#fff' : civ
+        ctx.fill()
+        ctx.lineWidth = (l.major ? 2 : 1) * dpr
+        ctx.strokeStyle = l.major ? civ : 'rgba(30, 25, 20, 0.8)'
+        ctx.stroke()
+        ctx.font = `${l.major ? '700' : '500'} ${(l.major ? 11.5 : 10) * dpr}px system-ui, sans-serif`
+        ctx.lineWidth = 3 * dpr
+        ctx.strokeStyle = 'rgba(248, 243, 228, 0.9)'
+        ctx.strokeText(l.text, px, py - radius - 2 * dpr)
+        ctx.fillStyle = '#2a2622'
+        ctx.fillText(l.text, px, py - radius - 2 * dpr)
+      } else {
+        ctx.font = `${l.kind === 'note' ? 'italic 500' : l.major ? '600' : '500'} ${(l.major ? 13 : 11) * dpr}px system-ui, sans-serif`
+        ctx.lineWidth = 3 * dpr
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.75)'
+        ctx.strokeText(l.text, px, py)
+        ctx.fillStyle = l.major ? `rgb(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)})` : '#fff'
+        ctx.fillText(l.text, px, py)
+        if (l.major) {
+          ctx.beginPath()
+          ctx.arc(px, py + 4 * dpr, 2.5 * dpr, 0, Math.PI * 2)
+          ctx.fillStyle = civ
+          ctx.fill()
+        }
+      }
+    }
+  }
+
   /** Moves simulated time on: clouds drift with the wind, the day turns. */
   private advanceTime(simSeconds: number) {
     if (simSeconds <= 0) return
     this.simTime += simSeconds
+    // the dust from a strike settles with a half-life of about a simulated day and a half
+    if (this.dust > 0) {
+      this.dust *= Math.exp(-simSeconds / (this.settings.dayLength * 60 * 2))
+      if (this.dust < 0.05) this.dust = 0
+    }
     const angle = this.windAngle
     const drift = (this.settings.windSpeed / 512) * 60 * simSeconds * 0.5
     // wrapped: the cloud noise is sampled from it and must not lose precision
@@ -1200,6 +2287,11 @@ export class Engine {
     if (changed || !this.settings.warming) this.emit()
   }
 
+  private lifeStats() {
+    if (!this.settings.life) return null
+    return { ...this.life.stats(), selected: this.life.reportOf(this.selectedTown) }
+  }
+
   private updateStats(now: number) {
     const elapsed = now - this.statStart
     if (elapsed < 500) return
@@ -1211,13 +2303,22 @@ export class Engine {
       frameMs,
       simStepsPerSec: (this.statSteps * 1000) / elapsed,
       resolution: this.sim.size,
+      dust: this.dust,
+      life: this.lifeStats(),
+      rewindSeconds: this.rewindReach(),
+      tide: this.tide,
+      timeline: this.timeline(),
     }
     this.statFrames = 0
     this.statSteps = 0
     this.statStart = now
 
-    this.adaptResolution(frameMs)
-    this.adaptQuality(frameMs)
+    // frames the limiter spaced out on purpose are not slow frames
+    const load = frameMs - Math.max(0, this.frameInterval() - BASE_FRAME_MS)
+    if (this.focused) {
+      this.adaptResolution(load)
+      this.adaptQuality(load)
+    }
     // a resolution change refused while busy (sliding the window, saving) happens now
     if (!this.busy && this.sim.size !== this.resolution) void this.changeResolution(this.resolution)
     this.emit()
@@ -1263,12 +2364,31 @@ function biomeIndex(t: number, rain: number) {
 }
 
 /** climate: cells × (offset, humidity, rain, temperature); then the wind grid (vx, vy, pressure, weather). */
-function summarizeClimate(data: Float32Array, cells: number, flowSize: number, extent: number): ClimateReport {
+/** The state as read back for the analysis (and the life): per-cell climate, water, extra and lava. */
+export interface Field {
+  size: number
+  /** Window origin in the world (cells) when it was read. */
+  origin: [number, number]
+  climate: Float32Array
+  water: Float32Array
+  extra: Float32Array
+  lava: Float32Array
+  /** Per cell: surface height, rock, soil, sand. */
+  ground: Float32Array
+}
+
+function summarizeClimate(field: Field, w: Float32Array, flowSize: number, extent: number): ClimateReport {
+  const data = field.climate
+  const cells = field.size * field.size
   let t = 0
   let tMin = Infinity
   let tMax = -Infinity
   let rain = 0
   let humidity = 0
+  let wet = 0
+  let icy = 0
+  let molten = 0
+  let plants = 0
   const biomes = new Array(9).fill(0)
   for (let i = 0; i < cells; i++) {
     const temp = data[i * 4 + 3]
@@ -1278,8 +2398,11 @@ function summarizeClimate(data: Float32Array, cells: number, flowSize: number, e
     rain += data[i * 4 + 2]
     humidity += data[i * 4 + 1]
     biomes[biomeIndex(temp, data[i * 4 + 2])]++
+    if (field.water[i * 4] > 0.001) wet++
+    if (field.extra[i * 4 + 3] > 0.0005) icy++
+    if (field.lava[i * 4] > 0.0002) molten++
+    plants += field.extra[i * 4]
   }
-  const w = data.subarray(cells * 4)
   const n = flowSize
   let vx = 0
   let vy = 0
@@ -1324,6 +2447,10 @@ function summarizeClimate(data: Float32Array, cells: number, flowSize: number, e
     biomes: biomes.map((b) => b / cells),
     windDirection: ((Math.atan2(vy, vx) * 180) / Math.PI + 360) % 360,
     windSpeed: speed,
+    waterShare: wet / cells,
+    iceShare: icy / cells,
+    lavaShare: molten / cells,
+    vegetation: plants / cells,
     lows,
     highs,
   }

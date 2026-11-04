@@ -1,6 +1,6 @@
 import type { Settings, TerrainShape } from './settings'
 
-export type ScenarioId = 'classic' | 'archipelago' | 'glacial' | 'desert' | 'rivers' | 'warming' | 'living'
+export type ScenarioId = 'classic' | 'archipelago' | 'glacial' | 'desert' | 'rivers' | 'rainforest' | 'warming' | 'living'
 
 export interface Scenario {
   id: ScenarioId
@@ -64,6 +64,16 @@ export const SCENARIOS: Scenario[] = [
     colors: ['#4fb3d9', '#1d4d3a'],
     shape: { continents: 0, continentScale: 0.55, offset: 0, relief: 1.2 },
     settings: { rainAmount: 2.5, windHumidity: 0.9, speed: 2 },
+  },
+  {
+    id: 'rainforest',
+    name: 'Floresta tropical',
+    tagline: 'Rios voadores levam a chuva',
+    description:
+      'Quente e úmido, com vento vindo do mar. A floresta devolve ao ar a água da chuva e o vento leva esse vapor continente adentro.',
+    colors: ['#2f9e5b', '#123d2a'],
+    shape: { continents: 0, continentScale: 0.55, offset: 0, relief: 0.7 },
+    settings: { temperature: 6, latitude: 4, windDirection: 0, windHumidity: 0.85, overlay: 'none' },
   },
   {
     id: 'warming',

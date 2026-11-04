@@ -21,6 +21,10 @@ export function TopBar({ engine, onNewWorld }: { engine: Engine; onNewWorld: () 
           <Icon.sparkles size={18} />
           <span>Novo mundo</span>
         </button>
+        <a className="pill" href="2d.html" data-tip="A versão 2D, de tiles, que roda sem GPU">
+          <Icon.map size={18} />
+          <span>2D</span>
+        </a>
         <button type="button" className="pill" onClick={() => engine.set({ photoMode: true })} data-tip="Modo foto (K)">
           <Icon.camera size={18} />
           <span>Foto</span>
@@ -58,7 +62,9 @@ export function StatusChip({ engine }: { engine: Engine }) {
   const stats = useStats(engine)
   const s = useSettings(engine)
   const [open, setOpen] = useState(false)
-  const tone = stats.fps >= 45 ? 'good' : stats.fps >= 25 ? 'ok' : 'bad'
+  // judged against the frame limit: 30 fps under a 30 fps limit is as good as it gets
+  const goal = s.fpsLimit > 0 ? Math.min(s.fpsLimit, 60) : 60
+  const tone = stats.fps >= goal * 0.75 ? 'good' : stats.fps >= goal * 0.4 ? 'ok' : 'bad'
   return (
     <button type="button" className={`status-chip glass ${open ? 'open' : ''}`} onClick={() => setOpen(!open)}>
       <span className={`dot ${tone}`} />

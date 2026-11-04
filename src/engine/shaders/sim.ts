@@ -4,20 +4,29 @@
 // Buffers are array<vec4f> of size N×N, row-major (index = y*N + x):
 //   ground:  x = total height (rock + soil + sand + ice), y = rock, z = soil, w = sand
 //   water:   x = depth, yz = flux/velocity along +x/+y, w = coarse sediment (sand) carried, in height units; the fine buffer holds the silt and clay
-//   extra:   x = vegetation density, y = moisture, z = snowpack (water equivalent), w = ice thickness
+//   extra:   x = vegetation density, y = soil water (share of what the soil holds), z = snowpack (water equivalent), w = ice thickness
 //   air:     x = water vapour (1 = saturated at 15 °C), y = precipitation this step,
-//            z = air temperature (°C), w = local humidity offset painted by the brush
+//            z = air temperature (°C), w = local humidity offset painted by the brush and
+//            the fixed air-mass source painted by the brush, packed (see airSourceOf)
 //   climate: x = local temperature offset painted by the brush (°C), y = relative humidity,
 //            z = mean precipitation (1 = the original uniform rain), w = temperature (°C)
 //   wind:    (flowSize², a quarter of the resolution) xy = wind in low-res cells per step,
 //            z = solver pressure, w = weather pressure anomaly (lows < 0 < highs)
 //   lava:    x = molten lava thickness, y = lava temperature (1 = fresh, solidifies near 0),
 //            z = volcanic vent strength painted by the brush,
-//            w = tectonic uplift painted by the brush (−1 sinking … 1 rising)
+//            w = tectonic uplift from the plates (−1 sinking … 1 rising; see platesShader)
 // ground.x also counts molten lava, so water and lava run over each other.
 // Neighbours past the border are clamped, like CLAMP_TO_EDGE in the original.
 
-export const SIM_UNIFORM_SIZE = 272
+/** Plates whose motion the user has changed, at most this many at a time. */
+export const MAX_PLATE_OVERRIDES = 16
+/** Storms (moving lows) the storm tool keeps alive at a time. */
+
+export const MAX_STORMS = 4
+export const MAX_DUSTS = 4
+/** Fixed highs (the drought power) held at a time. */
+export const MAX_HIGHS = 6
+export const SIM_UNIFORM_SIZE = 272 + MAX_PLATE_OVERRIDES * 32 + 64 + MAX_STORMS * 16 + MAX_DUSTS * 16 + MAX_HIGHS * 16 + 16
 
 const header = /* wgsl */ `
 struct Sim {
@@ -55,9 +64,58 @@ struct Sim {
                     // w: simulated area, the window's width in world units
   rect: vec4f,      // generation rectangle in window cells: x0, y0, x1, y1 (exclusive)
   shape: vec4f,     // terrain shape: x continents, y height offset, z relief multiplier, w continents per window
-  geo: vec4f,       // x: geological time (multiplies erosion, weathering and uplift), y: tectonic brush rate
+  geo: vec4f,       // x: rate of the geological processes in each substep (1 normally, more in
+                    // geological time), y: plate time (how far a plate of unit speed has drifted,
+                    // world units), z: number of plate overrides, w: air-mass brush rate
+                    // (+ warm, − cold)
+  // plate overrides, two entries each: (plate cell xy, velocity zw), (drift when it was
+  // changed xy, plate time then, 0)
+  plates: array<vec4f, ${MAX_PLATE_OVERRIDES * 2}>,
+  quake: vec4f,     // earthquake this frame: epicentre uv, fault normal angle, radius (world units)
+  quake2: vec4f,    // x: fault throw (signed height), y: rubble shaken loose, z: 1 while a quake runs
+  source: vec4f,    // x: fixed air-mass brush rate (+ warm, − cold), y: 1 clears every fixed source,
+                    // z: ocean-current brush rate (+ warm, − cold)
+  impact: vec4f,    // meteor strike this frame: xy centre uv, z radius (world units, 0 none),
+                    // w crater depth (height units)
+  storms: array<vec4f, ${MAX_STORMS}>,  // storms (the storm tool): xy centre uv, z strength (0 none), w radius (uv)
+  dusts: array<vec4f, ${MAX_DUSTS}>,    // dust clouds from strikes: xy centre uv, z °C of shade at the centre (0 none), w radius (uv)
+  highs: array<vec4f, ${MAX_HIGHS}>,    // fixed highs (the drought power): xy centre uv, z strength (0 none), w radius (uv)
+  vent: vec4f,      // a volcano waking or going quiet this frame: xy centre uv, z radius (uv, 0 none),
+                    // w change of vent strength (+ opens, − plugs)
 }
 @group(0) @binding(0) var<uniform> S: Sim;
+
+// air.w packs two painted values: the humidity offset (−1 … 1) in the fraction and the
+// fixed air-mass source (−1 cold … 1 warm, in steps of 0.002) as a multiple of 4, so each
+// is read back exactly (±2001 needs no more precision than a float has).
+fn airSourceOf(w: f32) -> f32 { return round(w * 0.25) * 0.002; }
+fn airHumidityOf(w: f32) -> f32 { return w - round(w * 0.25) * 4.0; }
+fn packAirW(humidity: f32, source: f32) -> f32 {
+  return clamp(humidity, -1.0, 1.0) + round(clamp(source, -1.0, 1.0) * 500.0) * 4.0;
+}
+// Dust thrown up by meteor strikes hangs over the region for days: how many °C it keeps
+// off the ground here (the sun is dimmed under it too, see airShader).
+fn dustAt(uv: vec2f) -> f32 {
+  var d = 0.0;
+  for (var k = 0; k < ${MAX_DUSTS}; k++) {
+    let c = S.dusts[k];
+    if (c.z <= 0.0) { continue; }
+    d += c.z * (1.0 - smoothstep(0.4, 1.0, distance(uv, c.xy) / c.w));
+  }
+  return d;
+}
+
+// A fixed high (the drought power) over a place: 0–1 how much it covers it. The air
+// sinks and warms under it: the vapour is kept, nothing condenses, the sky stays clear.
+fn highAt(uv: vec2f) -> f32 {
+  var h = 0.0;
+  for (var k = 0; k < ${MAX_HIGHS}; k++) {
+    let c = S.highs[k];
+    if (c.z <= 0.0) { continue; }
+    h = max(h, c.z * (1.0 - smoothstep(0.5, 1.0, distance(uv, c.xy) / c.w)));
+  }
+  return h;
+}
 
 // The window spans extent() world units, so a cell is 1 / cellsPerUnit() of a unit.
 // Anything measured in the world (slopes, distances, latitude, the terrain noise) uses
@@ -86,6 +144,18 @@ fn ixn(x: i32, y: i32, n: i32) -> u32 {
 }
 fn ix(x: i32, y: i32) -> u32 { return ixn(x, y, i32(S.size)); }
 fn uvOf(x: i32, y: i32) -> vec2f { return (vec2f(f32(x), f32(y)) + 0.5) / f32(S.size); }
+// The air blowing in past the upwind border is not all alike: cold and warm air masses
+// take turns (polar outbreaks, warm surges), a few degrees either way, each about as
+// long as the map at the wind's pace and slanted along the border, so fronts come in
+// and cross the map. Only in the automatic climate (they come with the planetary
+// circulation; a world with the climate set by hand keeps its calibrated rain) and with
+// the pressure systems on (the controlled tests have none).
+const INFLOW_MASS = 3.0;
+fn inflowAnomaly(uv: vec2f) -> f32 {
+  // S.sky.x is simulated seconds, 60 steps each: one cycle every 1200 steps
+  let phase = S.sky.x / 20.0;
+  return INFLOW_MASS * S.sky.y * S.world.z * sin(6.2831853 * (phase + 0.5 * uv.y + 0.25 * uv.x));
+}
 
 // Original brush: smoothstep(1, 0, dist), dist normalised by the radius.
 fn brushFactor(uv: vec2f) -> f32 {
@@ -158,7 +228,11 @@ fn surfEnergy(deepest: f32, depth: f32) -> f32 {
 const SURF_RATE = 0.000002;
 // rock uplift per step in a fully painted tectonic zone (height units)
 const UPLIFT_RATE = 0.000002;
-
+// rock height where uplift starts to fade, where it stops (isostasy), and how fast rock
+// above it collapses back per step
+const CRUST_SOFT = 0.12;
+const CRUST_MAX = 0.25;
+const COLLAPSE_RATE = 0.0005;
 // Sediment transport (see sedimentShader): how much fast water on steep ground can carry,
 // and how quickly it picks up or drops the difference.
 const SED_CAPACITY = 0.0075;
@@ -168,6 +242,8 @@ const SED_DEPOSIT = 0.12;
 const SED_DEPOSIT_FINE = 0.012;
 // share of the capacity that is coarse
 const COARSE_SHARE = 0.5;
+// water depth at which the capacity is as given (deeper carries more, up to 3×)
+const CHANNEL_DEPTH = 0.004;
 // bank erosion per unit of current pushing on a unit of bank height
 const BANK_RATE = 0.002;
 fn streamCapacity(speed: f32, slope: f32) -> f32 {
@@ -178,6 +254,97 @@ fn waterVelocity(w: vec4f) -> vec2f {
   let v = w.yz / (w.x + 0.0005);
   let l = length(v);
   return select(v, v / l, l > 1.0);
+}
+`
+
+// Tectonic plates: the world is tiled into plates, the cells of a jittered Voronoi
+// diagram in world units, so they continue past the window like the strata. Each plate
+// drifts its own way; what happens at a boundary depends on how the two plates on either
+// side move against each other. The plates really move: each site drifts with its
+// velocity as the plate time goes by, so the boundaries migrate and plates grow and
+// shrink; a plate stops once it has drifted PLATE_RANGE. Shared with the render shader
+// (plate map) and mirrored on the CPU in plates.ts (integer hash, so both agree exactly).
+// The uniform fields holding the plate time, the number of overrides and the overrides
+// differ between the shaders, hence the parameters.
+export const platesModel = (time: string, count: string, overrides: string) => /* wgsl */ `
+const PLATE_CELL = 0.8;
+const PLATE_RANGE = 2.4;
+fn plateHash(c: vec2i, salt: u32) -> f32 {
+  var h = (u32(c.x + 100000) * 1597334677u) ^ (u32(c.y + 100000) * 3812015801u) ^ (salt * 2654435769u);
+  h = h * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  h = (h >> 22u) ^ h;
+  return f32(h) / 4294967295.0;
+}
+fn plateSalt(seed: f32) -> u32 { return u32(max(seed, 0.0)) * 8u; }
+// a plate's own drift, before any change by the user: up to one unit of speed
+fn naturalVelocity(c: vec2i, seed: f32) -> vec2f {
+  let s = plateSalt(seed);
+  let angle = plateHash(c, s + 2u) * 6.2831853;
+  return vec2f(cos(angle), sin(angle)) * (0.4 + 0.6 * plateHash(c, s + 3u));
+}
+// the override of this plate's motion, or -1
+fn plateOverride(c: vec2i) -> i32 {
+  for (var k = 0u; k < u32(${count}); k++) {
+    let o = ${overrides}[k * 2u];
+    if (i32(o.x) == c.x && i32(o.y) == c.y) { return i32(k); }
+  }
+  return -1;
+}
+fn plateVelocity(c: vec2i, seed: f32) -> vec2f {
+  let k = plateOverride(c);
+  if (k >= 0) { return ${overrides}[u32(k) * 2u].zw; }
+  return naturalVelocity(c, seed);
+}
+// how far the plate has drifted from where it started: its velocity times the plate
+// time; a plate whose motion was changed goes on from where it was then
+fn plateDrift(c: vec2i, seed: f32) -> vec2f {
+  let t = ${time};
+  let k = plateOverride(c);
+  var d = naturalVelocity(c, seed) * t;
+  if (k >= 0) {
+    let o = ${overrides}[u32(k) * 2u];
+    let o2 = ${overrides}[u32(k) * 2u + 1u];
+    d = o2.xy + o.zw * (t - o2.z);
+  }
+  let l = length(d);
+  return select(d, d * (PLATE_RANGE / l), l > PLATE_RANGE);
+}
+// a plate's centre: it started somewhere in the middle of its grid cell and drifted since
+fn plateSite(c: vec2i, seed: f32) -> vec2f {
+  let s = plateSalt(seed);
+  return (vec2f(c) + 0.15 + 0.7 * vec2f(plateHash(c, s), plateHash(c, s + 1u))) * PLATE_CELL + plateDrift(c, seed);
+}
+// how many grid cells away a site may have drifted to: the search radius
+fn plateReach() -> i32 { return 1 + i32(ceil(min(max(${time}, 0.0), PLATE_RANGE) / PLATE_CELL)); }
+struct PlatePair {
+  own: vec2i,    // the plate this point is on
+  other: vec2i,  // the nearest other plate
+  a: vec2f,      // their sites
+  b: vec2f,
+  dist: f32,     // distance to the boundary between them (world units)
+}
+fn platePair(p: vec2f, seed: f32) -> PlatePair {
+  let base = vec2i(floor(p / PLATE_CELL));
+  var r: PlatePair;
+  var d1 = 1e9;
+  var d2 = 1e9;
+  let reach = plateReach();
+  for (var dy = -reach; dy <= reach; dy++) {
+    for (var dx = -reach; dx <= reach; dx++) {
+      let c = base + vec2i(dx, dy);
+      let s = plateSite(c, seed);
+      let d = dot(p - s, p - s);
+      if (d < d1) {
+        d2 = d1; r.other = r.own; r.b = r.a;
+        d1 = d; r.own = c; r.a = s;
+      } else if (d < d2) {
+        d2 = d; r.other = c; r.b = s;
+      }
+    }
+  }
+  r.dist = (d2 - d1) / (2.0 * max(distance(r.a, r.b), 1e-6));
+  return r;
 }
 `
 
@@ -329,12 +496,18 @@ export const generateShader = header + simplex + terrainNoise + /* wgsl */ `
 
 // Atmosphere: vapour and air temperature are carried by the wind (semi-Lagrangian),
 // water surfaces and plants put vapour back, and air that cools below its capacity
-// (mostly by being pushed up a mountain) rains it out. Air coming down the far side
+// (mostly by being pushed up a mountain) rains it out; showers and storms come from the
+// upper layer (see upperShader). Air coming down the far side
 // warms up and holds its vapour, so the lee of a range stays dry (rain shadow).
 // Also computes each cell's temperature and its long-run precipitation (for biomes).
 // The atmosphere changes slowly, so it may run only every S.climateDt steps (multirate):
 // its rates are scaled to cover that many steps, and the precipitation it leaves in
 // air.y is per step, so the water cycle keeps applying it on the steps in between.
+// Water vapour makes air lighter (see airAnomaly): its buoyancy as a temperature.
+const virtualTemperature = /* wgsl */ `
+// °C of buoyancy per unit of vapour (1 = saturated at 15 °C, q ≈ 0.011)
+const VIRTUAL = 1.9;
+`
 export const airShader = header + /* wgsl */ `
 @group(0) @binding(1) var<storage, read> ground: array<vec4f>;
 @group(0) @binding(2) var<storage, read> water: array<vec4f>;
@@ -344,64 +517,179 @@ export const airShader = header + /* wgsl */ `
 @group(0) @binding(6) var<storage, read_write> climate: array<vec4f>;
 @group(0) @binding(7) var<storage, read> wind: array<vec4f>;
 @group(0) @binding(8) var<storage, read> shadow: array<vec4f>;
-` + bilinear('sampleAir', 'airIn') + bilinear('sampleWind', 'wind', 'S.flowSize') + gridMain(/* wgsl */ `
+
+// share of the rain from showers, storms and fronts that evaporates as it falls
+const RAIN_EVAPORATION = 0.3;
+// share of the vapour above capacity that rains out per step where the wind drives the
+// air straight up a slope (on top of the 1 % anywhere)
+// share of the vapour above capacity that condenses and rains out per step anywhere
+// (supersaturated air does not stay that way: at 1 % it crossed a ridge still above
+// capacity and rained on the lee)
+const CONDENSATION = 0.15;
+const OROGRAPHIC_RAIN = 0.2;
+// °C of latent heat per unit of vapour (as LATENT in upperModel)
+const LATENT_HEAT = 27.0;
+// Share of the difference to the ground's temperature the air takes on per step. At
+// night and over the sea the air hardly touches the ground: an air mass keeps its own
+// temperature for days (a day is dayLength minutes, 14 400 steps at the default), so cold
+// and warm air masses travel across the map and meet in fronts. By day the sun heats the
+// land and the warm ground stirs the air above it (convective mixing), which takes the
+// ground's temperature, plus the sun's warmth, within a few hundred steps.
+const AIR_COUPLING = 0.0005;
+const DAY_COUPLING = 0.006;
+// °C warmer than the climate's ground temperature the air over bare land gets at noon
+const SUN_WARMTH = 6.0;
+// °C per step a clear night cools the air over land
+const NIGHT_COOLING = 0.0006;
+// share each neighbour gets of the air carried in per step (on top of what the
+// interpolation smooths; applied per step covered, so the multirate changes nothing)
+const AIR_DIFFUSION = 0.05;
+// A fixed air-mass source (painted with the air-mass brush, fixed) keeps the air over it
+// this many °C off the ground's temperature at full strength, taking this share of the
+// difference per step: much more than the ground does, so the mass is there whatever the
+// sun does, and the wind carries it off downwind as a lasting cold or warm air mass.
+const AIR_SOURCE_TEMP = 15.0;
+const SOURCE_COUPLING = 0.04;
+// An ocean current (the current brush paints a temperature offset on the sea): the air
+// over it takes the sea's temperature this fast, a warm current warming and wetting it,
+// a cold one cooling and drying it.
+const CURRENT_COUPLING = 0.01;
+// The sea moves: the water under the wind drifts at this share of the wind's speed and
+// carries its warmth along, so the sea off a warm coast arrives warmer further on (a warm
+// current) and a cold sea cools the coast downwind; the current brush's anomaly travels
+// the same way. The anomaly fades as the air takes the heat.
+const CURRENT_SPEED = 0.03;
+const CURRENT_FADE = 0.0002;
+` + bilinear('sampleAir', 'airIn') + bilinear('sampleWind', 'wind', 'S.flowSize') + bilinear('sampleClimate', 'climate') + /* wgsl */ `
+// Air temperature brought to sea level (potential temperature): air is colder up a
+// mountain just for being higher, which is no front and no stability; comparing this
+// leaves only the differences between air masses.
+fn heightAt(uv: vec2f) -> f32 {
+  let p = clamp(vec2i(uv * f32(S.size)), vec2i(0), vec2i(i32(S.size) - 1));
+  let j = ix(p.x, p.y);
+  return ground[j].x + water[j].x;
+}
+` + gridMain(/* wgsl */ `
   let uv = uvOf(x, y);
   let D = S.climateDt;
   let depth = water[i].x;
   let local = sampleWind(uv);
   let surface = ground[i].x + depth;
   var c = climate[i];
-  let tGround = groundTemp(surface, uv.y, c.x);
+  // under a strike's dust cloud the ground sits in shade and cools
+  let dust = dustAt(uv);
+  let tGround = groundTemp(surface, uv.y, c.x) - dust;
 
   // advect from upwind, with a little diffusion so the field stays smooth
   let back = uv - local.xy * D / f32(S.flowSize);
   let d = 1.0 / f32(S.size);
   let backC = clamp(back, vec2f(0.0), vec2f(1.0));
-  var a = sampleAir(backC) * 0.8 + (
+  let spread = min(AIR_DIFFUSION * D, 0.2);
+  var a = sampleAir(backC) * (1.0 - 4.0 * spread) + (
     sampleAir(clamp(back + vec2f(d, 0.0), vec2f(0.0), vec2f(1.0))) +
     sampleAir(clamp(back - vec2f(d, 0.0), vec2f(0.0), vec2f(1.0))) +
     sampleAir(clamp(back + vec2f(0.0, d), vec2f(0.0), vec2f(1.0))) +
     sampleAir(clamp(back - vec2f(0.0, d), vec2f(0.0), vec2f(1.0)))
-  ) * 0.05;
-  // fresh air blows in across the upwind border
+  ) * spread;
+  // what the air keeps as it moves is its potential temperature: carried up a slope it
+  // cools, down one it warms
+  a.z += S.climate2.y * (heightAt(backC) - surface);
+  // fresh air blows in across the upwind border: the air mass of the moment
+  // (with the vapour the usual air brings, so the masses change the weather, not the
+  // rainfall: a cold mass is closer to saturation, a warm one drier)
   if (any(back != backC)) {
-    a.x = S.wind.z * capacity(tGround);
-    a.z = tGround;
+    let mass = tGround + inflowAnomaly(uv);
+    a.x = min(S.wind.z * capacity(tGround), capacity(mass));
+    a.z = mass;
   }
-  // the painted humidity is kept, but only acts in manual climate
-  let offset = airIn[i].w;
-  let painted = offset * (1.0 - S.world.z);
+  // the painted humidity is kept, but only acts in manual climate; the fixed source acts always
+  let rawW = airIn[i].w;
+  let painted = airHumidityOf(rawW) * (1.0 - S.world.z);
+  let source = airSourceOf(rawW);
 
-  // air slowly takes the temperature of the ground under it
-  a.z = mix(a.z, tGround, 1.0 - pow(0.97, D));
-  // the sun heats the ground and the air over it by day (land much more than water,
-  // snow hardly at all, slopes facing the sun most); clear nights cool it down
+  // the sun heats the ground by day (land much more than water, snow hardly at all,
+  // slopes facing the sun most); clear nights cool it down
   let n = normalize(vec3f(
     -(ground[ix(x + 1, y)].x - ground[ix(x - 1, y)].x) * cellsPerUnit() * 0.5, 1.0,
     (ground[ix(x, y + 1)].x - ground[ix(x, y - 1)].x) * cellsPerUnit() * 0.5));
   let sea = smoothstep(0.0002, 0.002, depth);
   let e = extra[i];
   let absorbs = (1.0 - 0.8 * sea) * (1.0 - 0.6 * smoothstep(0.0, 0.001, e.z + e.w));
-  let sun = S.sky.z * max(dot(n, S.lightDir.xyz), 0.0) * shadow[i].x;
-  a.z += 0.18 * sun * absorbs * D;
-  a.z -= 0.06 * (1.0 - S.sky.z) * (1.0 - 0.7 * clamp(c.y, 0.0, 1.0)) * (1.0 - 0.8 * sea) * D;
+  // clouds (air close to saturation, as drawn) keep most of the sunshine off the ground
+  let overcast = smoothstep(0.8, 1.05, c.y);
+  let sun = S.sky.z * max(dot(n, S.lightDir.xyz), 0.0) * shadow[i].x * (1.0 - 0.7 * overcast) * (1.0 - 0.9 * clamp(dust / 8.0, 0.0, 1.0));
+  // the air takes the ground's temperature (see AIR_COUPLING)
+  let heated = sun * absorbs;
+  a.z = mix(a.z, tGround + SUN_WARMTH * heated, 1.0 - pow(1.0 - AIR_COUPLING - DAY_COUPLING * heated, D));
+  a.z -= NIGHT_COOLING * (1.0 - S.sky.z) * (1.0 - 0.7 * clamp(c.y, 0.0, 1.0)) * (1.0 - 0.8 * sea) * D;
+  // a fixed air mass painted here: the air is held so many °C off the ground's temperature
+  if (source != 0.0) {
+    a.z = mix(a.z, tGround + AIR_SOURCE_TEMP * source, 1.0 - pow(1.0 - SOURCE_COUPLING, D));
+  }
+  // the sea surface drifts with the wind and carries its temperature anomaly along (c.x on
+  // the sea): what arrives from upwind, plus how much warmer the climate was where it came
+  // from, fading slowly
+  if (sea > 0.5) {
+    let src = clamp(uv - local.xy * CURRENT_SPEED * D / f32(S.flowSize), vec2f(0.0), vec2f(1.0));
+    let fp = clamp(vec2i(src * f32(S.size)), vec2i(0), vec2i(i32(S.size) - 1));
+    let fj = ix(fp.x, fp.y);
+    if (water[fj].x > 0.002) {
+      let carried = sampleClimate(src).x + groundTemp(ground[fj].x + water[fj].x, src.y, 0.0) - groundTemp(surface, uv.y, 0.0);
+      c.x = clamp(carried * (1.0 - CURRENT_FADE * D), -20.0, 20.0);
+    }
+  }
+  // an ocean current painted here (in automatic climate too, where the ground's
+  // temperature ignores the painted offset: it is added back for the sea)
+  let current = c.x * sea;
+  if (current != 0.0) {
+    let sst = tGround + c.x * S.world.z;
+    a.z = mix(a.z, sst, 1.0 - pow(1.0 - CURRENT_COUPLING * smoothstep(0.0, 3.0, abs(current)), D));
+  }
   let t = mix(tGround, a.z, 0.35);
-  // air rises in lows (cools, clouds, rain) and sinks in highs (dry, clear)
-  let cap = capacity(t) * clamp(1.0 + 0.25 * local.w, 0.6, 1.4);
+  // air rises in lows (cools, clouds, rain) and sinks in highs (dry, clear); under a fixed
+  // high (the drought power) it sinks hard: it holds much more vapour and nothing rains
+  let high = highAt(uv);
+  let cap = capacity(t) * clamp(1.0 + 0.25 * local.w, 0.6, 1.4) * (1.0 + 0.6 * high);
+  // (the sinking air brings dry air down with it: the air under the high dries out instead
+  // of carrying its vapour off to rain somewhere else)
+  a.x = mix(a.x, min(a.x, 0.45 * capacity(t)), 1.0 - pow(1.0 - 0.01 * high, D));
 
-  // sources: open water (the sea most of all), plants, and the humidity brush
+  // sources: open water (the sea most of all) and the humidity brush; what plants
+  // transpire is taken from the ground's water in the water cycle pass
   let wet = sea * (1.0 - frozen(t));
   a.x = mix(a.x, 0.95 * cap, 1.0 - pow(1.0 - 0.02 * wet, D));
-  a.x += 0.0004 * extra[i].x * cap * max(1.0 - a.x / cap, 0.0) * D;
   a.x = max(a.x + 0.01 * painted * cap * D, 0.0);
+  // a cold source keeps no more vapour than its air can hold (fog, not rain, as the brush)
+  if (source < 0.0) { a.x = min(a.x, cap); }
 
-  // sinks: condensation of anything above capacity, plus a light drizzle in humid air
-  let rh = a.x / cap;
-  let p = min((max(a.x - cap, 0.0) * 0.01 + a.x * 0.0008 * smoothstep(0.2, 1.0, rh)) * D, a.x);
+
+  // Where the wind drives the air up a mountain, the latent heat of its rain stays in it
+  // and it comes down the lee warmer (foehn). Elsewhere (storms, fronts) the rain partly
+  // evaporates as it falls and drags cold air down (downdraft): the air near the ground
+  // cools into a cold pool of high pressure that spreads out and pushes the warm air
+  // ahead of it (the gust front before a storm)
+  let e2 = 2.0 / f32(S.size);
+  let terrain = vec2f(
+    ground[ix(x + 2, y)].x - ground[ix(x - 2, y)].x,
+    ground[ix(x, y + 2)].x - ground[ix(x, y - 2)].x) / (2.0 * e2 * extent());
+  // how fast the wind pushes the air up the terrain (a calm breeze lifts nothing)
+  let upslope = dot(local.xy, terrain);
+  let orographic = smoothstep(0.01, 0.06, upslope);
+  // condensation of anything above capacity: slow in still air, but air driven up a
+  // slope wrings out most of its excess on the way (OROGRAPHIC_RAIN), so a range is a
+  // barrier the moisture does not cross; showers, storms and fronts come from the upper
+  // layer (see upperShader), which left the rain it made over this cell in air.y
+  let p = min(max(a.x - cap, 0.0) * min(CONDENSATION * D + OROGRAPHIC_RAIN * orographic * D, 1.0), a.x) * (1.0 - 0.95 * high);
+  let storms = airIn[i].y * (1.0 - 0.95 * high);
   a.x -= p;
-  a.z += p * 6.0;  // latent heat: air that has rained out comes down the lee warmer
-  a.y = p / D;
-  a.w = offset;
+  // (evaporation can cool the air only down to its wet-bulb temperature: by about a third
+  // of the way to the dew point; the water it takes goes back into the air)
+  let wetBulb = log(max(a.x, 0.0001) / capacity(a.z)) / 0.065 / 3.0;
+  let evaporated = clamp(-wetBulb / LATENT_HEAT, 0.0, RAIN_EVAPORATION * ((1.0 - orographic) * p + storms));
+  a.z += p * orographic * 6.0 - evaporated * LATENT_HEAT;
+  a.x += evaporated;
+  a.y = (p + storms - evaporated) / D;
+  a.w = rawW;
   airOut[i] = a;
 
   let rainRel = a.y * rainWater() * S.rain / 0.00000005;
@@ -444,16 +732,32 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 }
 `
 
-// How much warmer the air over a wind cell is than its ground's own temperature.
-const airAnomaly = /* wgsl */ `
+// How much lighter the air over a wind cell is than it would be at its ground's own
+// temperature, as a temperature (virtual temperature): warmth, and also water vapour,
+// whose molecules (18) are lighter than the nitrogen and oxygen (28, 32) they replace,
+// about 0.61·q·T, so humid air is buoyant too and helps lows form.
+const airAnomaly = virtualTemperature + /* wgsl */ `
 fn anomaly(x: i32, y: i32) -> f32 {
   let n = i32(S.flowSize);
   let cx = clamp(x, 0, n - 1) * 4 + 2;
   let cy = clamp(y, 0, n - 1) * 4 + 2;
   let j = ix(cx, cy);
   let v = (f32(cy) + 0.5) / f32(S.size);
-  return air[j].z - groundTemp(ground[j].x + water[j].x, v, climate[j].x);
+  return air[j].z + VIRTUAL * air[j].x - groundTemp(ground[j].x + water[j].x, v, climate[j].x);
 }
+`
+
+// Prevailing wind (uv per step): the slider's in manual climate; in automatic climate
+// that of the latitude belts (world v: −1 tropics … 2 polar).
+const planetaryWind = /* wgsl */ `
+fn planetary(uv: vec2f) -> vec2f {
+  let lat = clamp(worldUV(uv).y, -1.0, 2.0);
+  let trades = 1.0 - smoothstep(-0.3, 0.2, lat);
+  let polar = smoothstep(1.2, 1.6, lat);
+  let westerlies = 1.0 - trades - polar;
+  return (vec2f(-1.0, -0.3) * trades + vec2f(1.0, 0.25) * westerlies + vec2f(-1.0, -0.25) * polar) * length(S.wind.xy);
+}
+fn prevailing(uv: vec2f) -> vec2f { return select(S.wind.xy, planetary(uv), S.world.z > 0.5); }
 `
 
 export const windForceShader = header + /* wgsl */ `
@@ -463,23 +767,18 @@ export const windForceShader = header + /* wgsl */ `
 @group(0) @binding(4) var<storage, read> water: array<vec4f>;
 @group(0) @binding(5) var<storage, read> air: array<vec4f>;
 @group(0) @binding(6) var<storage, read> climate: array<vec4f>;
-` + bilinear('sampleGround', 'ground') + bilinear('sampleWindIn', 'windIn', 'S.flowSize') + airAnomaly + /* wgsl */ `
+` + bilinear('sampleGround', 'ground') + bilinear('sampleWindIn', 'windIn', 'S.flowSize') + airAnomaly + planetaryWind + /* wgsl */ `
 fn weatherAt(x: i32, y: i32) -> f32 { return windIn[wix(x, y)].w; }
-
-// Prevailing wind of the latitude belts (world v: −1 tropics … 2 polar).
-fn planetary(uv: vec2f) -> vec2f {
-  let lat = clamp(worldUV(uv).y, -1.0, 2.0);
-  let trades = 1.0 - smoothstep(-0.3, 0.2, lat);
-  let polar = smoothstep(1.2, 1.6, lat);
-  let westerlies = 1.0 - trades - polar;
-  return (vec2f(-1.0, -0.3) * trades + vec2f(1.0, 0.25) * westerlies + vec2f(-1.0, -0.25) * polar) * length(S.wind.xy);
-}
+// world units: the distance the heating is compared over (see below)
+const LOW_SCALE = 0.25;
+// pressure per step per °C of heating difference
+const LOW_FORCING = 0.0015;
 ` + windMain(/* wgsl */ `
   let F = f32(S.flowSize);
   let uv = (vec2f(f32(x), f32(y)) + 0.5) / F;
   var v = windIn[i];
 
-  let base = select(S.wind.xy, planetary(uv), S.world.z > 0.5);
+  let base = prevailing(uv);
 
   // weather: carried by the prevailing wind, spreading, fed by heating differences, fading.
   // Not by the local wind: that includes the air each low draws in and spins around
@@ -492,13 +791,14 @@ fn planetary(uv: vec2f) -> vec2f {
     // (gentle spreading and slow fading, so a system lives long enough to grow and drift:
     // half-life about 12 s)
     P = mix(sampleWindIn(back).w, around, 0.05);
-    // heating relative to the surroundings (8 low-res cells away), so there are highs as well as lows
-    let r = 8;
+    // heating relative to the surroundings LOW_SCALE world units away (the size of a
+    // thermal low: a warm continent against the sea around it), so there are highs as well
+    let r = max(8, i32(round(LOW_SCALE * F / extent())));
     let surroundings = (anomaly(x + r, y) + anomaly(x - r, y) + anomaly(x, y + r) + anomaly(x, y - r)) * 0.25;
     // Pressure is relative to the window's mean: the heating forcing is not exactly balanced
     // (the borders, the sea), and left alone it lifts the whole field until there are no
     // lows anywhere, so the measured mean is slowly taken out again.
-    P = clamp(P * 0.999 - 0.0003 * (anomaly(x, y) - surroundings) * S.sky.y - S.level.w * 0.003, -2.0, 2.0);
+    P = clamp(P * 0.999 - LOW_FORCING * (anomaly(x, y) - surroundings) * S.sky.y - S.level.w * 0.003, -2.0, 2.0);
   } else {
     // weather systems off: only what the pressure brush painted, slowly fading
     P = v.w * 0.995;
@@ -511,6 +811,23 @@ fn planetary(uv: vec2f) -> vec2f {
     let d = distance(uv, S.brushUV) / S.brushRadius;
     let cover = 1.0 - smoothstep(0.55, 1.0, d);
     P = mix(P, clamp(S.level.z * 0.75, -2.0, 2.0), cover * 0.08);
+  }
+  // Storms (the storm tool): deep lows held open at full depth while they live, drifting
+  // with the wind; the wind circles them, the air rises in them and rains out.
+  for (var k = 0; k < ${MAX_STORMS}; k++) {
+    let st = S.storms[k];
+    if (st.z <= 0.0) { continue; }
+    let sd = distance(uv, st.xy) / st.w;
+    let scover = 1.0 - smoothstep(0.5, 1.0, sd);
+    P = mix(P, -2.0 * st.z, scover * 0.1);
+  }
+  // Fixed highs (the drought power): held at full height where they were set
+  for (var k = 0; k < ${MAX_HIGHS}; k++) {
+    let hg = S.highs[k];
+    if (hg.z <= 0.0) { continue; }
+    let hd = distance(uv, hg.xy) / hg.w;
+    let hcover = 1.0 - smoothstep(0.5, 1.0, hd);
+    P = mix(P, 2.0 * hg.z, hcover * 0.1);
   }
 
   let gradP = 0.5 * vec2f(weatherAt(x + 1, y) - weatherAt(x - 1, y), weatherAt(x, y + 1) - weatherAt(x, y - 1)) * F;
@@ -542,19 +859,275 @@ fn pressure(x: i32, y: i32) -> f32 { return select(0.0, windIn[wix(x, y)].z, ins
   windOut[i] = vec4f(v.xy, p, v.w);
 `)
 
+// Air masses are told apart over this scale (world units, in wind cells at least one):
+// the air's temperature is patchy at the scale of single storms, and a cold air mass
+// spreads out or advances as a whole, not cell by cell.
+const airMassScale = /* wgsl */ `
+const AIR_MASS_SCALE = 0.03;
+fn airMassCells() -> i32 { return max(1, i32(round(AIR_MASS_SCALE * f32(S.flowSize) / extent()))); }
+`
+
+// The low-level wind's divergent part (wind cells per step at wind cell x, y), added
+// after the projection, which would otherwise cancel it. Needs weatherAt.
+// - air leaking from highs into lows (where it converges it rises, see upperShader)
+const lowLevelLeak = /* wgsl */ `
+fn leak(x: i32, y: i32) -> vec2f {
+  let F = f32(S.flowSize);
+  let gradP = 0.5 * vec2f(weatherAt(x + 1, y) - weatherAt(x - 1, y), weatherAt(x, y + 1) - weatherAt(x, y - 1));
+  return -0.0001 * gradP * F * F;
+}
+`
+// - cold air, heavier than the air around it, spreading out under it (a density current:
+//   the gust front of a storm's cold pool, the leading edge of a cold air mass), from the
+//   air masses the upper pass keeps in upper.w. Needs airMassScale and an upper buffer.
+const densityFlow = /* wgsl */ `
+// world units per step for 1 °C per world unit of difference
+const DENSITY_CURRENT = 0.000001;
+fn airMass(x: i32, y: i32) -> f32 { return upper[ixn(x, y, i32(S.flowSize))].w; }
+fn densityCurrent(x: i32, y: i32) -> vec2f {
+  let F = f32(S.flowSize);
+  let r = airMassCells();
+  let e = airMass(x + r, y);
+  let w = airMass(x - r, y);
+  let n = airMass(x, y + r);
+  let s = airMass(x, y - r);
+  // (none until the upper pass has measured them)
+  if (e == 0.0 || w == 0.0 || n == 0.0 || s == 0.0) { return vec2f(0.0); }
+  // (°C per wind cell → per world unit, world units → wind cells per step)
+  return DENSITY_CURRENT * vec2f(e - w, n - s) / f32(2 * r) * F * F / (extent() * extent());
+}
+`
+
 export const windProjectShader = header + /* wgsl */ `
 @group(0) @binding(1) var<storage, read> windIn: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> windOut: array<vec4f>;
+@group(0) @binding(3) var<storage, read> upper: array<vec4f>;
 
 fn pressure(x: i32, y: i32) -> f32 { return select(0.0, windIn[wix(x, y)].z, inside(x, y)); }
 fn weatherAt(x: i32, y: i32) -> f32 { return windIn[wix(x, y)].w; }
-` + windMain(/* wgsl */ `
-  let F = f32(S.flowSize);
+` + airMassScale + lowLevelLeak + densityFlow + windMain(/* wgsl */ `
   let v = windIn[i];
   let g = 0.5 * vec2f(pressure(x + 1, y) - pressure(x - 1, y), pressure(x, y + 1) - pressure(x, y - 1));
-  // air leaks from highs into lows
+  windOut[i] = vec4f(v.xy - g + leak(x, y) + densityCurrent(x, y), v.z, v.w);
+`)
+
+// Upper atmosphere: a second layer of air high above the ground (about 5 km), on the
+// wind grid. The air buffer is the layer near the ground; this one has its own
+// temperature and vapour, and its own wind: steered by the prevailing wind and the
+// weather systems but not blocked by the terrain, plus the thermal wind (it blows along
+// the temperature differences, with the cold air on its left, like the jet stream).
+// The two layers trade air:
+// - convection: air near the ground that, lifted, would end up warmer than the upper air
+//   (warm, and above all humid: its vapour condenses on the way and gives off its latent
+//   heat) rises in storms; the vapour the upper air can't hold rains out, the latent heat
+//   warms the upper air until it is no longer unstable, and upper air comes down in its
+//   place. Cold air arriving aloft (or warm humid air below) sets off storms; warm air
+//   aloft (an inversion) caps them.
+// - broad vertical motion: where the low-level wind converges into lows the air rises into
+//   the upper layer and its vapour rains out; where it flows out of highs upper air sinks,
+//   warming as it comes down and drying the air below (clear skies under highs).
+// - fronts: an advancing cold air mass lifts the air ahead of it (see below).
+// - the upper air condenses on its own when it is carried to colder places (rain ahead of
+//   a warm front, from the clouds it slides up into).
+// upper: x vapour (same units as the air's), y potential temperature above the
+// latitude's reference (upperReference; 0 = a standard atmosphere), z vertical motion
+// (share of the low-level air lifted per step, < 0 sinking), w the low-level air's
+// potential temperature, to tell how fast it changes (see coolingAt).
+// It also writes, in air.y of the cells under it, the rain it makes over the step; the
+// air pass adds it to its own and cools the air under it (see airShader).
+const upperModel = /* wgsl */ `
+// °C the upper layer is colder than sea-level air of the same potential temperature
+const UPPER_COOLING = 30.0;
+// height units (≈ 5 km at the default lapse rate): mountain tops reach the upper layer
+const UPPER_HEIGHT = 0.2;
+// °C a dry parcel ends up colder than the upper air in a standard atmosphere (it cools at
+// the dry rate, faster than the air around it)
+const DRY_STABILITY = 16.0;
+// °C of latent heat per unit of vapour that condenses (L·q/cp, 1 unit ≈ 11 g/kg)
+const LATENT = 27.0;
+// share of the low-level air that convection overturns per step, per √°C of instability
+// (updrafts are as fast as the square root of the energy the instability frees)
+const CONVECTION = 0.00045;
+// share of the air converging into lows that rises into the upper layer (most of that
+// broad inflow is a shallow circulation near the ground)
+const LIFT = 0.3;
+// °C across a front: the low-level air lifted per °C the advancing cold air cools a place
+const FRONT_CONTRAST = 4.0;
+// °C per step of advection below which there is no front
+const FRONT_MIN = 0.01;
+// warm fronts lift that much less (a gentler ramp)
+const WARM_FRONT = 0.5;
+// mass of the low-level air over that of the upper layer
+const LOWER_MASS = 0.5;
+// share of its difference to the reference the upper air loses per step (radiation)
+const RADIATE = 0.0005;
+// upper-wind speed (world units per step) per °C per world unit of the mean temperature
+const THERMAL_WIND = 0.0001;
+fn upperReference(v: f32) -> f32 { return groundTemp(0.0, v, 0.0); }
+`
+export const upperShader = header + upperModel + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> lowAir: array<vec4f>;
+@group(0) @binding(4) var<storage, read> upperIn: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> upperOut: array<vec4f>;
+@group(0) @binding(6) var<storage, read> wind: array<vec4f>;
+// (the last air pass's output: neighbours read from here, not from lowAir, which other
+// invocations are changing)
+@group(0) @binding(7) var<storage, read> air: array<vec4f>;
+// w: the air-mass map for the Fronts overlay (see below); the rest is the shadow pass's
+@group(0) @binding(8) var<storage, read_write> shadow: array<vec4f>;
+` + bilinear('sampleUpper', 'upperIn', 'S.flowSize') + planetaryWind + airMassScale + /* wgsl */ `
+fn weatherAt(x: i32, y: i32) -> f32 { return wind[ixn(x, y, i32(S.flowSize))].w; }
+` + lowLevelLeak + /* wgsl */ `
+// potential temperature of the low-level air over wind cell (x, y) above what the ground
+// at its latitude would give it (so the air flowing across the latitudes is no front),
+// and over the scale of an air mass around it
+fn lowTheta(x: i32, y: i32) -> f32 {
+  let n = i32(S.flowSize);
+  let cx = clamp(x, 0, n - 1) * 4;
+  let cy = clamp(y, 0, n - 1) * 4;
+  var t = 0.0;
+  for (var k = 0; k < 4; k++) {
+    let j = ix(cx + 1 + 2 * (k % 2), cy + 1 + 2 * (k / 2));
+    t += air[j].z + S.climate2.y * (ground[j].x + water[j].x);
+  }
+  return t * 0.25 - upperReference((f32(cy) + 2.0) / f32(S.size));
+}
+fn massTheta(x: i32, y: i32) -> f32 {
+  let k = max(airMassCells() / 4, 1);
+  return (lowTheta(x, y) * 2.0 + lowTheta(x + k, y) + lowTheta(x - k, y) + lowTheta(x, y + k) + lowTheta(x, y - k)) / 6.0;
+}
+// massTheta as of the last run: upper.w keeps it + 100 (0: not yet known)
+fn lastTheta(x: i32, y: i32) -> f32 { return upperIn[ixn(x, y, i32(S.flowSize))].w; }
+// how fast the low-level wind cools wind cell (x, y), bringing colder air (°C per step;
+// < 0 warmer air), from the last run's air masses (a run old, much cheaper)
+fn advectionAt(x: i32, y: i32) -> f32 {
+  let r = airMassCells();
+  let e = lastTheta(x + r, y);
+  let w = lastTheta(x - r, y);
+  let n = lastTheta(x, y + r);
+  let s = lastTheta(x, y - r);
+  if (e == 0.0 || w == 0.0 || n == 0.0 || s == 0.0) { return 0.0; }
+  return dot(wind[ixn(x, y, i32(S.flowSize))].xy, vec2f(e - w, n - s) / f32(2 * r));
+}
+// how fast wind cell (x, y) has actually cooled since the last run (°C per step; < 0
+// warmed), given its massTheta now
+fn coolingAt(x: i32, y: i32, now: f32) -> f32 {
+  let last = lastTheta(x, y);
+  return select(0.0, (last - 100.0 - now) / S.climateDt, last != 0.0);
+}
+// potential temperature of the whole column (both layers) over wind cell (x, y)
+fn columnTheta(x: i32, y: i32) -> f32 {
+  let n = i32(S.flowSize);
+  let cx = clamp(x, 0, n - 1);
+  let cy = clamp(y, 0, n - 1);
+  let j = ix(cx * 4 + 2, cy * 4 + 2);
+  let v = (f32(cy) + 0.5) / f32(n);
+  let low = air[j].z + S.climate2.y * (ground[j].x + water[j].x);
+  return 0.5 * (low + upperIn[ixn(cx, cy, n)].y + upperReference(v));
+}
+` + windMain(/* wgsl */ `
+  let F = f32(S.flowSize);
+  let D = S.climateDt;
+  let uv = (vec2f(f32(x), f32(y)) + 0.5) / F;
+  let reference = upperReference(uv.y);
+
+  // the upper wind (uv per step), and the air it brings
   let gradP = 0.5 * vec2f(weatherAt(x + 1, y) - weatherAt(x - 1, y), weatherAt(x, y + 1) - weatherAt(x, y - 1)) * F;
-  windOut[i] = vec4f(v.xy - g - 0.0001 * gradP * F, v.z, v.w);
+  let gradT = vec2f(columnTheta(x + 2, y) - columnTheta(x - 2, y), columnTheta(x, y + 2) - columnTheta(x, y - 2)) * F * 0.25;
+  let thermal = THERMAL_WIND * vec2f(-gradT.y, gradT.x) / (extent() * extent());
+  let flow = prevailing(uv) + vec2f(-gradP.y, gradP.x) * 0.00015 + thermal;
+  let back = uv - flow * D;
+  let backC = clamp(back, vec2f(0.0), vec2f(1.0));
+  var u = sampleUpper(backC);
+  // (potential temperature is what the air keeps as it moves; the field is relative to
+  // the latitude's reference)
+  u.y += upperReference(backC.y) - reference;
+  // fresh air across the upwind border: the air mass of the moment, half saturated
+  if (any(back != backC)) {
+    let mass = inflowAnomaly(uv);
+    u = vec4f(min(0.5 * S.wind.z * capacity(reference - UPPER_COOLING), capacity(reference + mass - UPPER_COOLING)), mass, 0.0, 0.0);
+  }
+  // radiation pulls it back towards the standard atmosphere
+  u.y *= pow(1.0 - RADIATE, D);
+
+  // air carried somewhere colder than it can hold its vapour at: it condenses (clouds,
+  // steady rain) and gives off its latent heat
+  let thetaUp0 = reference + u.y;
+  let condensed = max(u.x - capacity(thetaUp0 - UPPER_COOLING), 0.0) * min(0.05 * D, 1.0);
+  u.x -= condensed;
+  u.y += LATENT * condensed;
+  let thetaUp = reference + u.y;
+  let capUp = capacity(thetaUp - UPPER_COOLING);
+  // (in units of the low-level air's vapour, per cell under it)
+  let steady = condensed / LOWER_MASS;
+
+  // broad vertical motion: the convergence of the low-level wind (of its divergent part:
+  // what the projection leaves is numerical, not air piling up)
+  let leaking = 0.5 * (leak(x + 1, y).x - leak(x - 1, y).x + leak(x, y + 1).y - leak(x, y - 1).y);
+  // Fronts: where the wind drives cold air into warmer air, the cold air digs in under the
+  // warm air like a wedge and lifts it: the warm, humid air just ahead of the front (the
+  // front a little upwind lifts the air here). As much of the low-level air is lifted as
+  // the cold air cools the place, over the contrast across the front (when the cold air
+  // has come, the warm air is all above it). Warm air advancing glides up over the cold
+  // air on a gentler ramp. The air's temperature is carried by the wind, so fronts travel
+  // with it.
+  let speed = length(wind[i].xy);
+  let behind = vec2i(round(-select(vec2f(0.0), wind[i].xy / speed, speed > 1e-6) * f32(max(airMassCells() / 2, 1))));
+  // (only where the air really is changing: the wind blowing steadily across a contrast
+  // that stays put, say from a snowfield onto a sunny slope, is no front)
+  let here = massTheta(x, y);
+  let bx = x + behind.x;
+  let by = y + behind.y;
+  let cold = min(advectionAt(bx, by), coolingAt(bx, by, massTheta(bx, by)));
+  let warm = min(-advectionAt(x, y), -coolingAt(x, y, here));
+  // (weak advection, the air drifting over gentle differences, lifts nothing)
+  let frontal = (max(cold - FRONT_MIN, 0.0) + WARM_FRONT * max(warm - FRONT_MIN, 0.0)) / FRONT_CONTRAST;
+  let lifted = min(frontal * D, 0.3);
+  let broad = clamp(-leaking * LIFT * D, -0.2, 0.2);
+  let ascent = lifted + broad;
+  let rising = max(broad, 0.0);
+  let sinking = max(-ascent, 0.0);
+
+  var gainT = 0.0;
+  var gainQ = 0.0;
+  for (var dy = 0; dy < 4; dy++) {
+    for (var dx = 0; dx < 4; dx++) {
+      let j = ix(x * 4 + dx, y * 4 + dy);
+      var a = lowAir[j];
+      let h = ground[j].x + water[j].x;
+      let thetaLow = a.z + S.climate2.y * h;
+      // a parcel of this air lifted to the upper layer (mountain tops are already there)
+      let rise = clamp(1.0 - h / UPPER_HEIGHT, 0.0, 1.0);
+      let excess = max(a.x - capUp, 0.0);
+      let parcel = thetaLow - DRY_STABILITY * rise + LATENT * excess;
+      let buoyancy = parcel - thetaUp;
+      let convect = min(CONVECTION * sqrt(max(buoyancy, 0.0)) * D, 0.3);
+      // the broad rising air only makes it to the upper layer if, once there, it is about
+      // as warm as the air around it (stable air lifted falls back as it was); a front lifts
+      // the air whatever its stability
+      let up = convect + lifted + rising * smoothstep(-0.5 * DRY_STABILITY, 0.0, buoyancy);
+      // up: the lifted air, with what vapour the upper air can hold; the rest rains out
+      gainT += up * (parcel - thetaUp);
+      gainQ += up * (min(a.x, capUp) - u.x);
+      // down: upper air in its place, dry. The broad sinking warms as it comes down; a
+      // storm's downdrafts are cooled by the rain evaporating into them instead (see airShader)
+      a.x += (convect + sinking) * (u.x - a.x);
+      a.z += sinking * (thetaUp + DRY_STABILITY * rise - thetaLow);
+      a.y = up * excess + steady;
+      lowAir[j] = a;
+      // the overlay: air-mass temperature (0.01 °C steps, ±25) in the integer part, the
+      // vertical motion (±0.02 per step) in the fraction, and a fixed air-mass source
+      // painted here as 10 000 (cold) or 20 000 (warm) on top
+      let fixedSource = airSourceOf(a.w);
+      let fixedMark = select(0.0, select(10000.0, 20000.0, fixedSource > 0.0), abs(fixedSource) >= 0.05);
+      shadow[j].w = fixedMark + floor(clamp(here, -25.0, 25.0) * 100.0) + 2500.0 + 0.5 + clamp(ascent / D * 25.0, -0.49, 0.49);
+    }
+  }
+  u.y += LOWER_MASS * gainT / 16.0;
+  u.x = max(u.x + LOWER_MASS * gainQ / 16.0, 0.0);
+  upperOut[i] = vec4f(u.x, u.y, ascent / D, here + 100.0);
 `)
 
 // Sparse simulation: most of a map is dry and has no lava, and there the water flow,
@@ -758,6 +1331,112 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
 `
 export const WATER_FLOW_TILE = TILE
 
+// Local inertial shallow water (Bates et al. 2010, with the θ weighting of de Almeida et
+// al. 2012): the momentum equation without its advection term, solved on the cell faces.
+// Each cell owns the flux through its +x and +y faces (waterLast.xy, depth × cells per
+// step). Gravity pushes the water down the slope of its surface, bed friction (Manning)
+// holds it back, and the flux carries on from the last step (inertia), so water runs
+// down valleys, swings round bends and comes to rest flat in lakes and the sea. The
+// depth is then updated from what flows through the faces: mass is conserved exactly.
+// water.yz keep the flux at the cell centre (the mean of its faces), as before.
+const waterInertialModel = /* wgsl */ `
+// gravity; where the water is deep its waves are slowed to stay within a cell per step
+const GRAVITY = 20.0;
+const MAX_GH = 0.2;
+// Manning bed friction (sets how fast water runs at a given depth and slope)
+const MANNING = 0.0017;
+// weight of the face's own flux against its neighbours' (damps checkerboard ripples)
+const THETA = 0.8;
+// share of the flow lost to turbulence each step: deep water barely feels the bed, and
+// without this the sea would slosh for ever after filling
+const TURBULENCE = 0.005;
+fn dryTile(x: i32, y: i32) -> bool { return (tiles[tileOf(x, y)] & 1u) == 0u; }
+`
+// Pass 1: the new flux through this cell's +x and +y faces (before limiting), into
+// waterTmp.yz; waterTmp.x keeps the depth and .w the sediment for pass 2.
+export const waterFluxShader = header + activityTiles + waterInertialModel + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+@group(0) @binding(3) var<storage, read> last: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> dst: array<vec4f>;
+@group(0) @binding(5) var<storage, read> tiles: array<u32>;
+
+fn faceFlux(x: i32, y: i32, o: vec2i, q0: f32, qa: f32, qb: f32) -> f32 {
+  let n = i32(S.size);
+  let x2 = x + o.x;
+  let y2 = y + o.y;
+  // the border is a wall here; the water cycle drains it or holds it at sea level
+  if (x2 >= n || y2 >= n) { return 0.0; }
+  let i = ix(x, y);
+  let j = ix(x2, y2);
+  let z1 = ground[i].x;
+  let z2 = ground[j].x;
+  let e1 = z1 + water[i].x;
+  let e2 = z2 + water[j].x;
+  // depth of water that can flow between the two cells
+  let hf = max(e1, e2) - max(z1, z2);
+  if (hf <= 1e-7) { return 0.0; }
+  let g = min(GRAVITY, MAX_GH / hf);
+  let q = (THETA * q0 + (1.0 - THETA) * 0.5 * (qa + qb)) * (1.0 - TURBULENCE);
+  let pushed = (q - g * hf * (e2 - e1)) / (1.0 + g * MANNING * MANNING * abs(q) / pow(hf, 7.0 / 3.0));
+  // at most half a cell per step (a cell has four faces to share its water)
+  return clamp(pushed, -0.5 * hf, 0.5 * hf);
+}
+` + gridMain(/* wgsl */ `
+  let w = water[i];
+  if (dryTile(x, y)) { dst[i] = vec4f(w.x, 0.0, 0.0, w.w); return; }
+  let l = last[i];
+  let qx = faceFlux(x, y, vec2i(1, 0), l.x, last[ix(x - 1, y)].x, last[ix(x + 1, y)].x);
+  let qy = faceFlux(x, y, vec2i(0, 1), l.y, last[ix(x, y - 1)].y, last[ix(x, y + 1)].y);
+  dst[i] = vec4f(w.x, qx, qy, w.w);
+`)
+// Pass 2: no cell may send out more water than it holds (its outflows are scaled down
+// together); both cells of a face see the same scaled flux, so water is conserved. The
+// new depth, the cell-centre flux and the faces for the next step.
+export const waterDepthShader = header + activityTiles + waterInertialModel + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> src: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> last: array<vec4f>;
+@group(0) @binding(4) var<storage, read> tiles: array<u32>;
+
+fn inside(x: i32, y: i32) -> bool { let n = i32(S.size); return x >= 0 && y >= 0 && x < n && y < n; }
+// raw flux through the +x (k = 0) or +y (k = 1) face of a cell; nothing beyond the map
+fn raw(x: i32, y: i32, k: i32) -> f32 {
+  if (!inside(x, y)) { return 0.0; }
+  let s = src[ix(x, y)];
+  return select(s.z, s.y, k == 0);
+}
+// share of its outflow a cell can actually send
+fn limit(x: i32, y: i32) -> f32 {
+  if (!inside(x, y)) { return 1.0; }
+  let out = max(raw(x, y, 0), 0.0) + max(-raw(x - 1, y, 0), 0.0) +
+            max(raw(x, y, 1), 0.0) + max(-raw(x, y - 1, 1), 0.0);
+  let h = src[ix(x, y)].x;
+  return select(1.0, h / out, out > h);
+}
+// the flux through the face between (x, y) and its +x (k = 0) or +y neighbour, limited
+// by whichever cell it leaves
+fn face(x: i32, y: i32, k: i32) -> f32 {
+  let q = raw(x, y, k);
+  if (q >= 0.0) { return q * limit(x, y); }
+  return q * select(limit(x, y + 1), limit(x + 1, y), k == 0);
+}
+` + gridMain(/* wgsl */ `
+  let s = src[i];
+  if (dryTile(x, y)) {
+    dst[i] = s;
+    last[i] = vec4f(0.0);
+    return;
+  }
+  let east = face(x, y, 0);
+  let west = face(x - 1, y, 0);
+  let north = face(x, y, 1);
+  let south = face(x, y - 1, 1);
+  let h = max(s.x + west - east + south - north, 0.0);
+  dst[i] = vec4f(h, 0.5 * (east + west), 0.5 * (north + south), s.w);
+  last[i] = vec4f(east, north, 0.0, 0.0);
+`)
+
 // The same three passes split (as in the original shaders), for GPUs emulated on the
 // CPU: there the fused kernel's 16×16 workgroups, workgroup memory and barriers cost
 // far more than the arithmetic (measured ~150 ms per step at 256² on SwiftShader,
@@ -853,6 +1532,14 @@ export const waterCycleShader = header + /* wgsl */ `
 @group(0) @binding(7) var<storage, read> climate: array<vec4f>;
 @group(0) @binding(8) var<storage, read> lava: array<vec4f>;
 
+// transpiration of a full canopy per step at 15 °C in dry air (water height)
+const TRANSPIRE = 0.0000001;
+// share of a film of rain on the ground that evaporates per step (standing water: the potential)
+const FILM_EVAPORATION = 0.5;
+// water a full soil holds (height), how fast rain soaks into it, share that seeps away per step
+const SOIL_WATER = 0.0003;
+const INFILTRATE = 0.00000005;
+const SOIL_DRAIN = 0.0001;
 fn flux(x: i32, y: i32) -> vec2f { return src[ix(x, y)].yz; }
 ` + gridMain(/* wgsl */ `
   var w = src[i].xyz;
@@ -865,11 +1552,14 @@ fn flux(x: i32, y: i32) -> vec2f { return src[ix(x, y)].yz; }
   let thaw = max(t, 0.0) * (1.0 - cold);
 
   // precipitation: rain above freezing, snow below it, except on cliffs it slides
-  // off and on open water it melts into
+  // off and on open water it melts into. Rain on the sea joins the world ocean, whose
+  // level the border holds (added here it piled the sea into a dome that ran off to
+  // the borders as a current)
+  let sea = S.climate.w > 0.5 && h < S.climate.z;
   let precip = a.y * rainWater() * S.rain;
   let slope = (abs(ground[ix(x + 1, y)].x - ground[ix(x - 1, y)].x) + abs(ground[ix(x, y + 1)].x - ground[ix(x, y - 1)].x)) * cellsPerUnit() * 0.5;
   let sticks = (1.0 - smoothstep(0.8, 1.5, slope)) * (1.0 - smoothstep(0.0003, 0.001, w.x));
-  w.x += precip * (1.0 - cold) + precip * cold * (1.0 - sticks);
+  if (!sea) { w.x += precip * (1.0 - cold) + precip * cold * (1.0 - sticks); }
   e.z += precip * cold * 1.5 * sticks;
 
   // melt: degree-day style, faster the warmer it is
@@ -888,21 +1578,41 @@ fn flux(x: i32, y: i32) -> vec2f { return src[ix(x, y)].yz; }
   let freeze = min(w.x, max(-t, 0.0) * 0.0000001 * still * (1.0 - smoothstep(0.0, 0.003, e.w)));
   w.x -= freeze;
   e.w += freeze;
-  extra[i] = e;
 
   let g = ground[i];
-  let sea = S.climate.w > 0.5 && h < S.climate.z;
   if (!sea) {
-    let surface = 0.00000015 * capacity(t) * (1.0 - 0.6 * clamp(c.y, 0.0, 1.0)) + 0.00002 * w.x;
-    let evaporated = min(w.x, surface * (1.0 - cold) * S.evaporate);
-    w.x -= evaporated;
-    // moisture recycling: what evaporates from rivers, lakes and wet ground goes back
-    // into the air as vapour (the same water, in the air pass's units) and rains again
-    // further downwind, which is how humid air reaches deep into a continent
-    a.x += evaporated / max(rainWater(), 0.000001);
+    // soil water (e.y, the share of what the soil can hold): rain soaks into soil and
+    // sand, more under plants (litter and roots open the ground), and slowly seeps on
+    // into the groundwater
     let permeable = smoothstep(0.0, 0.002, g.z + g.w) * (1.0 - cold);
-    w.x -= min(w.x, 0.000000015 * permeable);
+    let soaked = min(w.x, INFILTRATE * permeable * (0.4 + e.x) * max(1.0 - e.y, 0.0));
+    w.x -= soaked;
+    // how much the air can take up here; standing water gives all of it, but a film of
+    // rain on the ground only a share of itself each step, the rest runs off
+    let potential = 0.00000015 * capacity(t) * (1.0 - 0.6 * clamp(c.y, 0.0, 1.0)) * (1.0 - cold) * S.evaporate;
+    let pool = smoothstep(0.00005, 0.0005, w.x);
+    let film = min(potential, FILM_EVAPORATION * w.x);
+    let evaporated = min(w.x, mix(film, potential, pool) + 0.00002 * w.x * (1.0 - cold) * S.evaporate);
+    w.x -= evaporated;
+    var stored = e.y * SOIL_WATER + soaked;
+    stored *= 1.0 - SOIL_DRAIN;
+    // bare ground dries out only near the surface; plants pull water from the whole
+    // root zone and breathe it out (transpiration), the more the denser, warmer and drier
+    // the air. A rainforest so gives much of its rain back to the air, long after the
+    // rain has run off bare ground, and the wind carries it inland to rain again: the
+    // "flying rivers" that water the heart of a continent
+    let dried = min(stored, potential * 0.25 * e.y * (1.0 - e.x));
+    stored -= dried;
+    let leaves = e.x * smoothstep(5.0, 22.0, t) * (1.0 - cold);
+    let transpired = min(stored, TRANSPIRE * leaves * capacity(t) * clamp(1.2 - c.y, 0.2, 1.0) * S.evaporate);
+    stored -= transpired;
+    e.y = clamp(stored / SOIL_WATER, 0.0, 1.0);
+    // moisture recycling: what evaporates from rivers, lakes and wet ground and what
+    // plants transpire goes back into the air as vapour (the same water, in the air
+    // pass's units) and rains again further downwind
+    a.x += (evaporated + dried + transpired) / max(rainWater(), 0.000001);
   }
+  extra[i] = e;
   // molten lava boils off the water on it into steam and heats the air above
   let lv = lava[i];
   let molten = smoothstep(0.0, 0.0003, lv.x) * lv.y;
@@ -1010,6 +1720,7 @@ export const sedimentShader = header + activityTiles + weatheringModel + /* wgsl
 @group(0) @binding(8) var<storage, read_write> fineOut: array<f32>;
 
 fn inside(x: i32, y: i32) -> bool { let n = i32(S.size); return x >= 0 && y >= 0 && x < n && y < n; }
+fn surfaceAt(x: i32, y: i32) -> f32 { let j = ix(x, y); return ground[j].x + water[j].x; }
 // Share of a cell's sediment leaving towards +x, -x, +y, -y this step (at most all of it).
 fn outflow(x: i32, y: i32) -> vec4f {
   let v = waterVelocity(water[ix(x, y)]);
@@ -1039,6 +1750,10 @@ fn bankCut(wx: i32, wy: i32, bx: i32, by: i32) -> f32 {
   let hard = select(rockHardness(worldUV(uvOf(bx, by)), gb.y, S.seed), 0.6, loose);
   return BANK_RATE * push * bank * S.erode / hard;
 }
+// Where water plunges down a steep face (a waterfall, water spilling over a dam), the
+// bed erodes this many times faster: the fall undercuts the lip and it retreats, and a
+// dam that water tops gives way in a rush.
+const PLUNGE = 8.0;
 ` + gridMain(/* wgsl */ `
   var g = ground[i];
   let w = water[i];
@@ -1072,12 +1787,28 @@ fn bankCut(wx: i32, wy: i32, bx: i32, by: i32) -> f32 {
   g.y -= lost - bankSoil;
 
   let wet = smoothstep(0.00002, 0.0005, w.x);
-  let slope = length(vec2f(ground[ix(x + 1, y)].x - ground[ix(x - 1, y)].x,
-                           ground[ix(x, y + 1)].x - ground[ix(x, y - 1)].x)) * 0.5 * cellsPerUnit();
-  let capacity = streamCapacity(length(vel), slope) * wet;
+  // the slope of the water surface, not of the bed: a lake's surface is flat, so it
+  // drops its load instead of scouring its floor, and the power goes into the outlet
+  // where the surface falls away, which cuts it down and lets the lake drain
+  let slope = length(vec2f(surfaceAt(x + 1, y) - surfaceAt(x - 1, y),
+                           surfaceAt(x, y + 1) - surfaceAt(x, y - 1))) * 0.5 * cellsPerUnit();
+  // the push on the bed grows with the depth (shear stress ~ depth × slope), so the
+  // deepest line of the flow scours most and a sheet of water spread over a valley floor
+  // drops its load: the flow gathers into a channel that keeps itself deep, beside dry
+  // flood plains, instead of flooding the whole floor
+  let depth = clamp(w.x / CHANNEL_DEPTH, 0.0, 3.0);
+  let capacity = streamCapacity(length(vel), slope) * wet * depth;
   let capCoarse = capacity * COARSE_SHARE;
   let capFine = capacity * (1.0 - COARSE_SHARE);
   let gone = wet < 0.01;
+  // the border opens onto the rest of the world: what the water brings there flows on out
+  // of the window (the water cycle drains the water there) instead of being dumped on the
+  // last cell, which piled up and raised the base level of the whole map
+  let edge = i32(S.size) - 1;
+  if (x == 0 || y == 0 || x == edge || y == edge) {
+    coarse = 0.0;
+    silt = 0.0;
+  }
   // too much to carry: sand settles fast and close (bars, the delta front), silt and
   // clay slowly and far (the delta's outer slope, lake beds, flood plains, as fertile soil)
   if (coarse > capCoarse) {
@@ -1093,7 +1824,8 @@ fn bankCut(wx: i32, wy: i32, bx: i32, by: i32) -> f32 {
   // room to carry more: loose sand first, then soil (held by roots), then bare rock
   let room = max(capCoarse - coarse, 0.0) + max(capFine - silt, 0.0);
   if (room > 0.0) {
-    var want = min(room * SED_ERODE * S.erode, 0.0002 * max(S.geo.x, 1.0));
+    let plunge = 1.0 + PLUNGE * smoothstep(2.0, 5.0, slope) * smoothstep(0.0003, 0.002, w.x);
+    var want = min(room * SED_ERODE * S.erode * plunge, 0.0002 * max(S.geo.x, 1.0) * plunge);
     let fromSand = min(want, g.w);
     g.w -= fromSand;
     want -= fromSand;
@@ -1169,18 +1901,27 @@ export const erodeShader = header + /* wgsl */ `
     lv.x = 0.0;
     lava[i] = lv;
   }
-  // tectonics: painted zones keep rising (or sinking), so erosion has mountains to wear
-  // down instead of only ever flattening the land; geological time speeds it up
-  g.y += lv.w * UPLIFT_RATE * S.geo.x;
-
+  // tectonics: where the plates push, the rock keeps rising (or sinking), so erosion has
+  // mountains to wear down instead of only ever flattening the land; geological time
+  // speeds it up. The crust cannot hold up a range of any height: the thicker it gets,
+  // the more it sinks under its own weight (isostasy) and the weaker its roots, so uplift
+  // fades out on the way to CRUST_MAX, and rock pushed beyond it spreads out and sinks
+  // back (gravitational collapse). Trenches stop deepening the same way.
+  // The load is the whole column: under thick piles of sediment the bed stops rising too.
+  let column = g.y + g.z + g.w;
+  let rise = lv.w * UPLIFT_RATE * S.geo.x;
+  let crest = smoothstep(CRUST_SOFT, CRUST_MAX, column);
+  let trench = smoothstep(CRUST_SOFT, CRUST_MAX, -column);
+  g.y += rise * select(1.0 - trench, 1.0 - crest, rise > 0.0);
+  g.y -= max(g.y - CRUST_MAX, 0.0) * COLLAPSE_RATE * S.geo.x;
   g.x = g.y + g.z + g.w + e.w + lv.x;
   dst[i] = g;
 
-  // moisture follows standing/flowing water and seeps into neighbours; it dries
-  // faster where it is hot
+  // soil water (filled and used up in the water cycle pass) seeps into the neighbours,
+  // and the ground under standing or flowing water is soaked
   let wet = clamp(w.x / 0.0005, 0.0, 1.0);
   let around = (extra[ix(x + 1, y)].y + extra[ix(x - 1, y)].y + extra[ix(x, y + 1)].y + extra[ix(x, y - 1)].y) * 0.25;
-  e.y = max(mix(e.y, around, 0.2) * (1.0 - 0.0005 * capacity(t)), wet);
+  e.y = max(mix(e.y, around, 0.2), wet);
   extraOut[i] = e;
 `)
 
@@ -1206,16 +1947,26 @@ fn solid(g: vec4f) -> f32 { return g.y + g.z + g.w; }
 fn exchange(g1: vec4f, x1: i32, y1: i32, x: i32, y: i32) -> vec2f {
   let g2 = src[ix(x, y)];
   let diff = (solid(g2) - solid(g1)) / 4.0;
-  let sdiff = clamp(diff, -g1.z / 2.0, g2.z / 2.0) * 0.08;
+  // soil creeps slowly on gentle slopes and slides off steep ones (the same for both
+  // cells, so soil is conserved)
+  let creep = 0.1 + 0.9 * smoothstep(0.4, 1.0, abs(diff) * 4.0 * cellsPerUnit());
+  let sdiff = clamp(diff, -g1.z / 2.0, g2.z / 2.0) * min(0.08 * S.geo.x, 0.4) * creep;
   // rock slumps once the step is steep enough; hard rock (judged on the higher side, so
   // both cells agree and rock is conserved) stands in steeper cliffs and gives way slower
   var hx = x1;
   var hy = y1;
   var top = g1.y;
   if (diff > 0.0) { hx = x; hy = y; top = g2.y; }
-  let hard = rockHardness(worldUV(uvOf(hx, hy)), top, S.seed);
+  // very high ranges are weaker under their own weight and slide at gentler angles
+  let hard = rockHardness(worldUV(uvOf(hx, hy)), top, S.seed) * (1.0 - 0.6 * smoothstep(CRUST_SOFT, CRUST_MAX, top));
+  // the threshold is a slope (tuned at 256 cells per unit), so cliffs keep their angle at any resolution
+  // Only the rock's own step can slide: sediment piled on top does not push the rock under
+  // it sideways (that dug ever deeper holes under sand banks).
   var gdiff = 0.0;
-  if (abs(diff) > 0.001 * hard) { gdiff = diff * 0.1 / hard; }
+  let rdiff = (g2.y - g1.y) / 4.0;
+  if (abs(diff) > 0.001 * hard * 256.0 / cellsPerUnit() && diff * rdiff > 0.0) {
+    gdiff = sign(diff) * min(abs(diff), abs(rdiff)) * min(0.1 * S.geo.x / hard, 0.5);
+  }
   return vec2f(gdiff, sdiff);
 }
 
@@ -1234,13 +1985,20 @@ fn sandExchange(g1: vec4f, x: i32, y: i32, dist: f32) -> f32 {
 fn iceExchange(g1: vec4f, ice1: f32, x: i32, y: i32) -> f32 {
   let j = ix(x, y);
   let ice2 = extraIn[j].w;
-  let mobile = smoothstep(0.0003, 0.004, max(ice1, ice2));
+  let thick = max(ice1, ice2);
+  let mobile = smoothstep(0.0003, 0.004, thick);
   let diff = (src[j].x - g1.x) * 0.25;
-  return clamp(diff * 0.05 * mobile, -ice1 * 0.2, ice2 * 0.2);
+  // thick ice creeps much faster than thin ice (roughly Glen's law), up to a fifth per step
+  let rate = 0.05 + 10.0 * min(thick, 0.02);
+  return clamp(diff * rate * mobile, -ice1 * 0.2, ice2 * 0.2);
 }
 
 // Sand that the wind can lift from a cell: dry, bare, not under water, snow or ice.
+// No sand blows in from beyond the map (the clamped border cell would otherwise hand on
+// sand and get it back from itself, an endless source).
 fn windborne(x: i32, y: i32) -> f32 {
+  let n = i32(S.size);
+  if (x < 0 || y < 0 || x >= n || y >= n) { return 0.0; }
   let j = ix(x, y);
   let e = extraIn[j];
   let open = (1.0 - smoothstep(0.0001, 0.0005, water[j].x)) * (1.0 - smoothstep(0.0, 0.0005, e.z + e.w));
@@ -1298,7 +2056,16 @@ fn windborne(x: i32, y: i32) -> f32 {
   let moved =
     abs(iceExchange(g, e.w, x + 1, y)) + abs(iceExchange(g, e.w, x - 1, y)) +
     abs(iceExchange(g, e.w, x, y + 1)) + abs(iceExchange(g, e.w, x, y - 1));
-  let abraded = min(moved * 0.15 * S.erode, max(g.y + c.x, 0.0));
+  // (a thick glacier bears down harder: it quarries the bed into a U-shaped valley)
+  let abraded = min(moved * (0.15 + 20.0 * min(e.w, 0.02)) * S.erode, max(g.y + c.x, 0.0));
+  // the soil under moving ice is scraped off into till
+  let scraped = min(moved * 0.5 * S.erode, max(g.z, 0.0));
+  // the glacier carries half of what it grinds off; the ice arriving at the margin (thin
+  // ice fed by thick ice flowing in) drops that debris there as ridges of till (moraines)
+  let margin = 1.0 - smoothstep(0.0002, 0.001, e.w);
+  let fed = max(iceExchange(g, e.w, x + 1, y), 0.0) + max(iceExchange(g, e.w, x - 1, y), 0.0) +
+    max(iceExchange(g, e.w, x, y + 1), 0.0) + max(iceExchange(g, e.w, x, y - 1), 0.0);
+  let till = fed * 0.3 * margin;
   e.w = max(e.w + ice, 0.0);
   // hot lava melts snow and ice and burns plants
   let lv = lava[i];
@@ -1306,9 +2073,13 @@ fn windborne(x: i32, y: i32) -> f32 {
   e.z *= 1.0 - 0.1 * burning;
   e.w *= 1.0 - 0.05 * burning;
 
+  // where it rains on sand, pioneer plants take hold and the sand slowly becomes soil
+  // (organic matter builds up); so a desert greens when the climate turns wet
+  let wetSand = smoothstep(0.3, 0.7, max(e.y, clamp(climate[i].z * 0.6, 0.0, 1.0))) * (1.0 - arid);
+  let fixed = min(g.w, 0.00003 * (0.2 + e.x) * wetSand * S.vegetation);
   g.y += c.x - abraded - blasted;
-  g.z += c.y + abraded - blown;
-  g.w = max(g.w + sand + blasted + blown, 0.0);
+  g.z += c.y + abraded * 0.5 - blown + fixed - scraped;
+  g.w = max(g.w + sand + blasted + blown + till - fixed + scraped, 0.0);
   g.x = g.y + g.z + g.w + e.w + lv.x;
   dst[i] = g;
 
@@ -1319,7 +2090,8 @@ fn windborne(x: i32, y: i32) -> f32 {
   // vegetation: grows on moist soil that is not under water, snow or ice, up to what
   // the climate supports; dies when drowned, bare, frozen or parched
   let slope = (abs(src[ix(x + 1, y)].x - src[ix(x - 1, y)].x) + abs(src[ix(x, y + 1)].x - src[ix(x, y - 1)].x)) * cellsPerUnit() * 0.5;
-  let soilOk = smoothstep(0.0002, 0.001, g.z);
+  // plants want soil; on wet sand pioneer species still take hold, more slowly
+  let soilOk = max(smoothstep(0.0002, 0.001, g.z), 0.4 * smoothstep(0.0002, 0.001, g.w) * smoothstep(0.3, 0.7, max(e.y, clamp(cl.z * 0.6, 0.0, 1.0))));
   let dry = 1.0 - smoothstep(0.001, 0.003, depth);
   let gentle = 1.0 - smoothstep(0.8, 1.6, slope);
   let snowFree = 1.0 - smoothstep(0.0001, 0.0006, e.z + e.w);
@@ -1334,10 +2106,298 @@ fn windborne(x: i32, y: i32) -> f32 {
   extra[i] = e;
 `)
 
+// Plate tectonics: works out, for every cell, how fast the plates make the rock there
+// rise or sink (lava.w, −1 … 1, applied by the erode pass). It only depends on where the
+// plates are and how they move, so it runs every few frames, not every step.
+// Plates moving together: two continents collide and push up a wide mountain belt
+// (Himalayas); where one side is low (ocean floor) it dives under the other, leaving a
+// trench in front and raising a mountain arc behind (Andes). Plates moving apart: a
+// continent splits along a sinking rift with raised shoulders (East African Rift); the
+// ocean floor wells up into a ridge. Plates sliding past each other only build stress.
+export const platesShader = header + platesModel('S.geo.y', 'S.geo.z', 'S.plates') + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> lava: array<vec4f>;
+
+fn rockAt(uv: vec2f) -> f32 {
+  let p = vec2i(floor(uv * f32(S.size)));
+  return ground[ix(p.x, p.y)].y;
+}
+fn bump(d: f32, at: f32, width: f32) -> f32 { let t = (d - at) / width; return exp(-t * t); }
+` + gridMain(/* wgsl */ `
+  let uv = uvOf(x, y);
+  let pp = platePair(worldUV(uv), S.seed);
+  let n = normalize(pp.b - pp.a);
+  // > 0: the plates close in on each other
+  let closing = dot(plateVelocity(pp.own, S.seed) - plateVelocity(pp.other, S.seed), n);
+  let d = pp.dist;
+  // which side is oceanic (under the sea) decides who dives under: rock height a little
+  // way into each plate; without a sea every plate is continental
+  let toUV = 1.0 / S.world.w;
+  let low = select(-1e9, S.climate.z, S.climate.w > 0.5);
+  let ownLow = rockAt(uv - n * 0.1 * toUV) < low;
+  let otherLow = rockAt(uv + n * (d + 0.1) * toUV) < low;
+  var u = 0.0;
+  if (closing > 0.0) {
+    var ownDives = ownLow && !otherLow;
+    var otherDives = otherLow && !ownLow;
+    if (ownLow && otherLow) {
+      // two ocean plates: the older, denser one (here: the one with the lower hash) dives
+      let s = plateSalt(S.seed) + 4u;
+      ownDives = plateHash(pp.own, s) < plateHash(pp.other, s);
+      otherDives = !ownDives;
+    }
+    if (ownDives) {
+      u = -0.8 * closing * bump(d, 0.015, 0.02);
+    } else if (otherDives) {
+      u = closing * (bump(d, 0.07, 0.04) + 0.3 * bump(d, 0.0, 0.03));
+    } else {
+      // two continents: the range rises along the suture, but its rock is crust squeezed in
+      // from the plates on either side, which so sink a little all over (evenly, so no
+      // basins open) and the collision does not keep adding rock to the world
+      u = closing * (bump(d, 0.0, 0.09) - 0.1);
+    }
+  } else {
+    let opening = -closing;
+    if (ownLow && otherLow) {
+      u = 0.5 * opening * bump(d, 0.0, 0.04);
+    } else {
+      u = opening * (0.3 * bump(d, 0.05, 0.025) - 0.8 * bump(d, 0.0, 0.025));
+    }
+  }
+  var lv = lava[i];
+  lv.w = clamp(u, -1.0, 1.0);
+  lava[i] = lv;
+`)
+
+// Earthquake: a fault slips at once along a stretch of plate boundary. Where the
+// plates collide one side jumps up (a fault scarp), where they pull apart a strip drops
+// (a graben); sideways faults only shake. The shaking breaks loose rock off steep slopes
+// into rubble (sand), which the settle pass then lets slide down. Reads ground, writes
+// groundTmp, which is copied back.
+export const quakeShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  var g = ground[i];
+  let rel = (uvOf(x, y) - S.quake.xy) * S.world.w;
+  let r = length(rel) / S.quake.w;
+  if (r >= 1.0 || S.quake2.z < 0.5) {
+    dst[i] = g;
+    return;
+  }
+  let fall = (1.0 - r * r) * (1.0 - r * r);
+  let n = vec2f(cos(S.quake.z), sin(S.quake.z));
+  let across = dot(rel, n);
+  // positive throw: the far side rises at the fault; negative: a narrow strip drops
+  let slip = S.quake2.x * fall * select(exp(-across * across / 0.0002), smoothstep(-0.004, 0.004, across), S.quake2.x > 0.0);
+  let slope = length(vec2f(ground[ix(x + 1, y)].x - ground[ix(x - 1, y)].x,
+                           ground[ix(x, y + 1)].x - ground[ix(x, y - 1)].x)) * 0.5 * cellsPerUnit();
+  let rubble = S.quake2.y * fall * smoothstep(0.6, 1.5, slope);
+  g.y += slip - rubble;
+  g.w += rubble;
+  g.x += slip;
+  dst[i] = g;
+`)
+
+// A meteor strike (the meteor tool): a bowl dug out of the ground with a raised rim of
+// shocked rock, a blanket of ejecta around it, a pool of melt on the floor, and the
+// blast clearing water, snow, ice and plants. Like the quake, it writes a copy of the
+// ground that is copied back.
+export const impactShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> extra: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> water: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> lava: array<vec4f>;
+@group(0) @binding(6) var<storage, read_write> air: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  var g = ground[i];
+  let R = S.impact.z;
+  if (R <= 0.0) { dst[i] = g; return; }
+  let rel = (uvOf(x, y) - S.impact.xy) * S.world.w;
+  let r = length(rel) / R;
+  if (r >= 3.0) { dst[i] = g; return; }
+  // the fireball: the air over the strike is heated by tens of degrees out to two and a
+  // half radii and takes up the vaporised water; hot humid air convects into a storm
+  var a = air[i];
+  let fire = max(1.0 - r / 2.5, 0.0);
+  a.z += 60.0 * fire * fire * min(S.impact.w * 40.0 + 0.3, 1.0);
+  a.x = min(a.x + water[i].x * 60.0 * fire, capacity(a.z));
+  air[i] = a;
+  let depth = S.impact.w;
+  var e = extra[i];
+  var w = water[i];
+  var lv = lava[i];
+  // the bowl: a paraboloid dug out of sand, then soil, then rock
+  var dig = depth * max(1.0 - r * r, 0.0);
+  let fromSand = min(dig, g.w);
+  g.w -= fromSand;
+  dig -= fromSand;
+  let fromSoil = min(dig, g.z);
+  g.z -= fromSoil;
+  dig -= fromSoil;
+  g.y -= dig;
+  // the rim: rock thrown up around the bowl, and a blanket of rubble thinning out to three radii
+  let rim = depth * 0.35 * exp(-(r - 1.1) * (r - 1.1) / 0.06);
+  g.y += rim * 0.6;
+  g.w += rim * 0.4 + depth * 0.12 * smoothstep(3.0, 1.0, r) * step(1.0, r);
+  // the floor melts into a pool of fresh lava
+  lv.x += depth * 0.3 * max(1.0 - r * r * 2.0, 0.0);
+  if (r < 0.7) { lv.y = 1.0; }
+  // the blast: water vaporised, snow and ice gone, plants burnt
+  let blast = smoothstep(1.0, 1.4, r);
+  w = vec4f(w.x * blast, w.yz * blast, w.w);
+  e.z *= smoothstep(1.2, 1.8, r);
+  e.w *= smoothstep(1.2, 1.8, r);
+  e.x *= smoothstep(1.5, 2.6, r);
+  g.x = g.y + g.z + g.w + e.w + lv.x;
+  dst[i] = g;
+  extra[i] = e;
+  water[i] = w;
+  lava[i] = lv;
+`)
+
+// A natural volcano waking up (see the engine's eruptions): a vent opens in the middle of
+// the site, like the volcano brush paints one, with a first gush of lava; when the eruption
+// is over the same pass plugs it again (the strength goes back down, never below zero).
+export const ventShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read_write> lava: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  let R = S.vent.z;
+  if (R <= 0.0) { return; }
+  let d = distance(uvOf(x, y), S.vent.xy) / R;
+  if (d >= 1.0) { return; }
+  let profile = 1.0 - smoothstep(0.2, 1.0, d);
+  var lv = lava[i];
+  lv.z = clamp(lv.z + S.vent.w * profile, 0.0, 1.0);
+  if (S.vent.w > 0.0) {
+    // the first gush
+    lv.x += 0.0015 * profile * S.vent.w;
+    lv.y = 1.0;
+  }
+  lava[i] = lv;
+`)
+
+// The strike's blast on the wind grid: the air is pushed out in a ring (strongest two
+// crater radii out) and piles up there as a passing high; the firestorm's low follows
+// (the engine sets a storm off at the strike).
+export const shockShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read_write> wind: array<vec4f>;
+` + windMain(/* wgsl */ `
+  let R = S.impact.z;
+  if (R <= 0.0) { return; }
+  let uv = (vec2f(f32(x), f32(y)) + 0.5) / f32(S.flowSize);
+  let rel = (uv - S.impact.xy) * S.world.w;
+  let r = length(rel) / R;
+  if (r < 0.05 || r > 6.0) { return; }
+  let ring = exp(-(r - 2.0) * (r - 2.0) / 2.0);
+  let push = 1.5 * ring * min(S.impact.w * 40.0 + 0.3, 1.5);
+  var v = wind[i];
+  wind[i] = vec4f(v.xy + normalize(rel) * push, v.z, min(v.w + 1.5 * ring, 2.0));
+`)
+
+// The works of the peoples (see life.ts): every frame, around each town that has the
+// technology, fields are kept green (and the forest cleared for them), irrigation draws
+// on the river, the land is terraced towards level, industry and big towns heat the air
+// over them (a heat island) and industry fouls its surroundings; a dam is a wall raised
+// in a river until the water backs up.
+export const worksShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dst: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> extra: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> water: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> climate: array<vec4f>;
+// works[0].x: how many; then per work (uv, radius (uv), kind bits), (tech, population, 0, 0)
+@group(0) @binding(6) var<storage, read> works: array<vec4f>;
+@group(0) @binding(7) var<storage, read_write> air: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  var g = ground[i];
+  let count = u32(works[0].x);
+  let uv = uvOf(x, y);
+  var e = extra[i];
+  var c = climate[i];
+  var w = water[i];
+  var ar = air[i];
+  var touched = false;
+  var wet = false;
+  var warmed = false;
+  for (var k = 0u; k < count; k++) {
+    let a = works[1u + k * 2u];
+    let b = works[2u + k * 2u];
+    let kind = u32(a.w);
+    if (kind == 8u) {
+      // a dam: a wall across the river (b.xy its direction, a.z half its length), raised bit
+      // by bit to its crest (b.z: the bed when it was begun plus DAM_HEIGHT); the water
+      // backs up behind it
+      let rel = uv - a.xy;
+      let along = dot(rel, b.xy);
+      let across = abs(rel.x * b.y - rel.y * b.x) * f32(S.size);
+      if (abs(along) > a.z || across > 1.2) { continue; }
+      let goal = b.z;
+      if (g.x < goal) {
+        let dh = min(goal - g.x, 0.00005);
+        g.y += dh;
+        g.x += dh;
+        touched = true;
+      }
+      continue;
+    }
+    let d = distance(uv, a.xy) / a.z;
+    if (d >= 1.0) { continue; }
+    let cover = 1.0 - smoothstep(0.6, 1.0, d);
+    let dry = w.x < 0.0005 && e.z < 0.0005 && e.w < 0.0005;
+    if ((kind & 1u) != 0u && dry) {
+      // fields: kept green, and greener than the wild land, as far as the people can work;
+      // the forest that stood there is cleared down to the fields
+      let crops = 0.55 + 0.4 * b.x;
+      e.x = min(e.x + 0.002 * cover * b.x, max(e.x, crops));
+      e.x = min(e.x, crops + 0.08 + (1.0 - cover));
+      touched = true;
+    }
+    if ((kind & 16u) != 0u && w.x > 0.0003 && w.x < 0.03) {
+      // irrigation: the fields drink from the river, which runs smaller downstream
+      w.x -= min(w.x * 0.01 * cover, 0.00002);
+      wet = true;
+    }
+    if ((kind & 32u) != 0u) {
+      // a big town: stone and roofs hold the day's heat (a heat island)
+      ar.z += 0.006 * cover;
+      warmed = true;
+    }
+    if ((kind & 2u) != 0u && w.x < 0.001) {
+      // terracing: the land is levelled towards its surroundings
+      let r = 6;
+      let mean = (ground[ix(x + r, y)].x + ground[ix(x - r, y)].x + ground[ix(x, y + r)].x + ground[ix(x, y - r)].x) * 0.25;
+      let dh = (mean - g.x) * 0.003 * cover * b.x;
+      g.y += dh;
+      g.x += dh;
+      touched = true;
+    }
+    if ((kind & 4u) != 0u) {
+      // industry: heat and smog over the city (in the air itself, so it counts in every
+      // climate mode); the plants around it suffer
+      c.x = clamp(c.x + (3.5 * cover - max(c.x, 0.0)) * 0.002, -20.0, 20.0);
+      ar.z += 0.015 * cover;
+      e.x = max(e.x - 0.0006 * cover, 0.0);
+      touched = true;
+      warmed = true;
+    }
+  }
+  dst[i] = g;
+  if (touched) {
+    extra[i] = e;
+    climate[i] = c;
+  }
+  if (wet) { water[i] = w; }
+  if (warmed) { air[i] = ar; }
+`)
+
 // god.shader: the brush adds or removes rock, soil or sand with a noisy profile.
 // Brush water (originally in cycle.shader) is applied here too, so painting works while paused.
 // The climate brush paints a local temperature offset and a local humidity offset.
 export const paintShader = header + simplex + /* wgsl */ `
+// °C off the ground's temperature per unit of the air-mass brush's strength
+const AIR_MASS_BRUSH = 5.0;
 @group(0) @binding(1) var<storage, read_write> ground: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> extra: array<vec4f>;
 @group(0) @binding(3) var<storage, read_write> water: array<vec4f>;
@@ -1347,21 +2407,42 @@ export const paintShader = header + simplex + /* wgsl */ `
 ` + gridMain(/* wgsl */ `
   let uv = uvOf(x, y);
   let s = brushFactor(uv);
+  // clearing the fixed air masses: every cell, brush or no brush
+  if (S.source.y > 0.5) {
+    var a0 = air[i];
+    a0.w = packAirW(airHumidityOf(a0.w), 0.0);
+    air[i] = a0;
+  }
   if (s <= 0.0) { return; }
   var w = water[i];
   w.x = clamp(w.x + s * S.waterF * 0.0001, 0.0, 1.0);
   water[i] = w;
   var c = climate[i];
   c.x = clamp(c.x + s * S.climate2.z * 0.05, -20.0, 20.0);
+  // the current brush: the same offset, but only where there is sea to carry it
+  if (S.source.z != 0.0 && w.x > 0.002) {
+    c.x = clamp(c.x + s * S.source.z * 0.05, -20.0, 20.0);
+  }
   climate[i] = c;
   var a = air[i];
-  a.w = clamp(a.w + s * S.climate2.w * 0.003, -1.0, 1.0);
+  let humidity = airHumidityOf(a.w) + s * S.climate2.w * 0.003;
+  // the fixed air-mass brush paints a source in the middle of the brush (as the volcano
+  // brush does its vent); the air pass keeps the air there warm or cold from then on
+  let source = airSourceOf(a.w) + s * s * s * S.source.x * 0.02;
+  a.w = packAirW(humidity, source);
+  // the air-mass brush: pulls the air near the ground towards a cold (or warm) mass, so
+  // many °C off the ground's own temperature; the wind then carries the mass away (the
+  // ground only warms it back slowly, see AIR_COUPLING). A cold mass keeps no more vapour
+  // than it can hold, so painting it does not rain by itself.
+  if (S.geo.w != 0.0) {
+    let massT = groundTemp(ground[i].x + w.x, uv.y, c.x) + clamp(S.geo.w, -4.0, 4.0) * AIR_MASS_BRUSH;
+    a.z = mix(a.z, massT, s * 0.1);
+    a.x = min(a.x, capacity(a.z));
+  }
   air[i] = a;
   // the volcano brush opens (or plugs) a vent in the middle of the brush
   var lv = lava[i];
   lv.z = clamp(lv.z + s * s * s * S.sky.w * 0.02, 0.0, 1.0);
-  // the tectonic brush marks zones that rise (or sink) from now on
-  lv.w = clamp(lv.w + s * S.geo.y * 0.02, -1.0, 1.0);
   lava[i] = lv;
   var h = 0.1;
   for (var k = 2; k < 8; k++) {
@@ -1521,7 +2602,7 @@ fn facing(n: vec3f) -> f32 {
   var fromWater = fromGround;
   if (depth > 0.00001) { fromWater = march(uv, g + depth); }
   // (z is the accumulated height change, filled in by changeShader right after)
-  shadow[i] = vec4f(min(fromGround, facing(normals[i].xyz)), min(fromWater, facing(wnormals[i].xyz)), shadow[i].z, 0.0);
+  shadow[i] = vec4f(min(fromGround, facing(normals[i].xyz)), min(fromWater, facing(wnormals[i].xyz)), shadow[i].zw);
 `)
 
 // How much the ground has risen (+) or been worn down (−) since the reference terrain
@@ -1586,6 +2667,25 @@ fn main() {
 // Slides a buffer when the simulation window moves through the infinite world:
 // cell (x, y) takes what was at (x + dx, y + dy); cells coming in from outside start
 // empty and are then generated or restored.
+// The same for a buffer with one float per cell (the fine sediment).
+export const shiftScalarShader = /* wgsl */ `
+struct Shift { size: u32, pad: u32, dx: i32, dy: i32 }
+@group(0) @binding(0) var<uniform> P: Shift;
+@group(0) @binding(1) var<storage, read> src: array<f32>;
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let n = i32(P.size);
+  if (i32(id.x) >= n || i32(id.y) >= n) { return; }
+  let sx = i32(id.x) + P.dx;
+  let sy = i32(id.y) + P.dy;
+  var v = 0.0;
+  if (sx >= 0 && sy >= 0 && sx < n && sy < n) { v = src[u32(sy * n + sx)]; }
+  dst[id.y * u32(n) + id.x] = v;
+}
+`
+
 export const shiftShader = /* wgsl */ `
 struct Shift { size: u32, pad: u32, dx: i32, dy: i32 }
 @group(0) @binding(0) var<uniform> P: Shift;

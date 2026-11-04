@@ -14,6 +14,15 @@
   touch-action: none;
 }
 
+/* names over the map, drawn by the engine */
+.labels {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
 /* ---- surfaces ---- */
 
 .glass {
@@ -387,14 +396,119 @@ kbd {
   padding: 8px;
   border-radius: 22px;
   max-width: calc(100% - 32px);
-  overflow-x: auto;
-  scrollbar-width: none;
   z-index: 10;
+  /* (no overflow clipping: the tooltips rise above the bar) */
+  overflow: visible;
+  flex-wrap: nowrap;
 }
 
 .tool-group {
+  position: relative;
   display: flex;
   gap: 4px;
+  padding: 10px 6px 2px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.tool-group .group-name {
+  position: absolute;
+  top: -1px;
+  left: 10px;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+.tool-group.group-bencao .group-name {
+  color: #8fd6a4;
+}
+
+.tool-group.group-praga .group-name {
+  color: #ff9a7a;
+}
+
+
+.toolbar > .more {
+  width: 28px;
+  height: 48px;
+  padding: 0;
+  font-size: 1.1rem;
+  color: var(--muted);
+}
+
+.toolbar > .more.active {
+  color: var(--accent);
+}
+
+/* the rewind timeline over the toolbar */
+.timestrip {
+  position: absolute;
+  left: 50%;
+  bottom: 88px;
+  transform: translateX(-50%);
+  width: min(640px, calc(100% - 48px));
+  height: 22px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border-radius: 11px;
+  cursor: pointer;
+  z-index: 9;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+.timestrip .ts-track {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.14);
+}
+.timestrip .ts-tick {
+  position: absolute;
+  top: 1px;
+  width: 1px;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.45);
+  transform: translateX(-0.5px);
+}
+.timestrip .ts-mark {
+  position: absolute;
+  top: -2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(0, 0, 0, 0.6);
+  transform: translateX(-5px);
+}
+.timestrip .ts-mark.major {
+  top: -4px;
+  width: 14px;
+  height: 14px;
+  transform: translateX(-7px);
+}
+.timestrip .ts-label {
+  white-space: nowrap;
+}
+.timestrip .ts-tip {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 100%;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(20, 20, 24, 0.92);
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
 
 .tool {
@@ -1123,6 +1237,138 @@ button.wide.active {
   flex: none;
 }
 
+.civs li {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+.civ-name {
+  font-weight: 600;
+}
+
+.wars {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.town-card header,
+.probe-town header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.town-card header strong,
+.probe-town header strong {
+  flex: 1;
+}
+
+.probe-town {
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.probe-town .small {
+  margin: 4px 0 0;
+  font-size: 0.72rem;
+}
+
+.needs {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 10px;
+  align-items: center;
+  font-size: 0.78rem;
+}
+
+.needs li {
+  display: contents;
+}
+
+.bar {
+  position: relative;
+  display: block;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--control);
+  overflow: hidden;
+}
+
+.bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent, #4ea3ff);
+  opacity: 0.75;
+  border-radius: 7px;
+}
+
+.bar-label {
+  position: relative;
+  display: block;
+  text-align: center;
+  font-size: 0.68rem;
+  line-height: 14px;
+}
+
+.chronicle {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--muted);
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.chronicle li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.chronicle li.major {
+  color: var(--text, #fff);
+  font-weight: 600;
+}
+
+.chronicle {
+  max-height: 220px;
+}
+
+.timeline-box {
+  margin-top: 8px;
+}
+
+.timeline {
+  display: block;
+  width: 100%;
+  height: 80px;
+  background: var(--control);
+  border-radius: 8px;
+}
+
+.timeline .total {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.chronicle .swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 4px;
+}
+
 .analysis {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -1352,4 +1598,134 @@ button.wide.active {
   .status-chip {
     display: none;
   }
+}
+
+/* the air-mass brush: fixed / loose, and clearing the fixed masses */
+.mode-switch.air-fixed {
+  margin-left: 4px;
+}
+
+.mode-switch.air-fixed button {
+  width: auto;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 550;
+}
+
+/* challenges */
+.challenge {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.challenge.active {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+}
+
+.challenge.done {
+  border-color: rgba(120, 220, 140, 0.6);
+}
+
+.challenge-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.challenge-goal,
+.challenge-status {
+  font-size: 0.78rem;
+  color: var(--text-soft);
+  margin-top: 2px;
+}
+
+.challenge.done .challenge-status {
+  color: rgb(150, 230, 165);
+  font-weight: 600;
+}
+
+.progress {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.progress span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.6s ease;
+}
+
+.challenge.done .progress span {
+  background: rgb(120, 220, 140);
+}
+
+/* ---- the chronicle as it happens: cards in the corner ---- */
+
+.event-cards {
+  position: absolute;
+  left: 16px;
+  bottom: 96px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  width: min(340px, calc(100% - 32px));
+  z-index: 40;
+  pointer-events: none;
+}
+
+.event-cards > * {
+  pointer-events: auto;
+}
+
+.event-cards .follow {
+  align-self: flex-start;
+  font-size: 0.78rem;
+  padding: 5px 10px;
+  color: var(--text-soft);
+}
+
+.event-cards .follow.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.event-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  animation: rise-in 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.event-card .swatch {
+  margin-top: 4px;
+}
+
+.event-card .text {
+  flex: 1;
+}
+
+.event-card.major {
+  border-color: rgba(255, 220, 140, 0.45);
+  font-weight: 600;
+}
+
+.event-card button.icon {
+  width: 28px;
+  height: 28px;
+  flex: none;
 }

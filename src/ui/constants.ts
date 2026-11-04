@@ -1,12 +1,22 @@
-import type { Overlay, Quality, QualityLevel, ResolutionSetting, Tool } from '../engine/settings'
+import { CIV_COLORS } from '../engine/life'
+import type { FpsLimit, Overlay, Quality, QualityLevel, ResolutionSetting, Tool } from '../engine/settings'
+
+/** A people's colour as CSS. */
+export const civCss = (k: number) => `rgb(${CIV_COLORS[k].map((v) => Math.round(v * 255)).join(', ')})`
 
 export const MODE_LABELS: Partial<Record<Tool, [string, string]>> = {
+  sun: ['Esquentar o planeta 1 °C', 'Esfriar o planeta 1 °C'],
+  drought: ['Decretar uma seca', 'Apagar a seca'],
   heat: ['Esquentar', 'Esfriar'],
   humidity: ['Umedecer', 'Secar'],
   volcano: ['Abrir cratera', 'Tampar'],
   pressure: ['Alta pressão', 'Baixa pressão'],
-  uplift: ['Soerguer', 'Afundar'],
+  airmass: ['Ar quente', 'Ar frio'],
+  current: ['Corrente quente', 'Corrente fria'],
 }
+
+/** The air-mass brush's modes while its masses are fixed in place. */
+export const FIXED_AIR_LABELS: [string, string] = ['Fonte de ar quente', 'Fonte de ar frio']
 
 export const OVERLAYS: { id: Overlay; label: string }[] = [
   { id: 'none', label: 'Normal' },
@@ -18,6 +28,10 @@ export const OVERLAYS: { id: Overlay; label: string }[] = [
   { id: 'erosion', label: 'Erosão' },
   { id: 'change', label: 'Mudança' },
   { id: 'rivers', label: 'Rios' },
+  { id: 'plates', label: 'Placas' },
+  { id: 'airmass', label: 'Frentes' },
+  { id: 'civilization', label: 'Povos' },
+  { id: 'current', label: 'Correntes' },
 ]
 
 // same colours as biomeColor() in the render shader
@@ -45,6 +59,7 @@ export const RESOLUTIONS: { value: ResolutionSetting; label: string }[] = [
   { value: 256, label: '256²' },
   { value: 512, label: '512²' },
   { value: 1024, label: '1024²' },
+  { value: 2048, label: '2048² (GPU forte)' },
 ]
 
 export const QUALITIES: { value: Quality; label: string }[] = [
@@ -52,6 +67,13 @@ export const QUALITIES: { value: Quality; label: string }[] = [
   { value: 'low', label: 'Baixa' },
   { value: 'medium', label: 'Média' },
   { value: 'high', label: 'Alta' },
+]
+
+export const FPS_LIMITS: { value: FpsLimit; label: string }[] = [
+  { value: 30, label: '30 fps (econômico)' },
+  { value: 60, label: '60 fps' },
+  { value: 120, label: '120 fps' },
+  { value: 0, label: 'Sem limite' },
 ]
 
 export const QUALITY_NAMES: Record<QualityLevel, string> = { low: 'baixa', medium: 'média', high: 'alta' }

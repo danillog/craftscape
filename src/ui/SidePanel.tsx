@@ -1,27 +1,75 @@
 import { useRef, type ReactNode } from 'react'
 import type { Engine } from '../engine/engine'
 import { scenarioById } from '../engine/scenarios'
+import { CHALLENGES } from '../engine/challenges'
+import { CIV_COLORS, type HistoryPoint } from '../engine/life'
 import {
   TEMPERATURE_MAX,
   TEMPERATURE_MIN,
   climateOf,
   type AreaSetting,
+  type FpsLimit,
   type Quality,
   type ResolutionSetting,
 } from '../engine/settings'
 import { clockOf } from '../engine/sky'
-import { BIOMES, EROSION_LEGEND, OVERLAYS, QUALITIES, QUALITY_NAMES, RESOLUTIONS, compass } from './constants'
+import { BIOMES, EROSION_LEGEND, FPS_LIMITS, OVERLAYS, QUALITIES, QUALITY_NAMES, RESOLUTIONS, compass } from './constants'
 import { ClimateAnalysis, Section, Segmented, Slider, Toggle } from './controls'
 import { Icon } from './icons'
 import { useSettings, useStats } from './useEngine'
 
-export type PanelTab = 'climate' | 'map' | 'world'
+export type PanelTab = 'climate' | 'map' | 'world' | 'life' | 'challenges'
 
 const TABS: { id: PanelTab; label: string; icon: (p: { size?: number }) => ReactNode }[] = [
   { id: 'climate', label: 'Clima', icon: Icon.climate },
   { id: 'map', label: 'Mapa', icon: Icon.layers },
   { id: 'world', label: 'Mundo', icon: Icon.globe },
+  { id: 'life', label: 'Vida', icon: Icon.life },
+  { id: 'challenges', label: 'Desafios', icon: Icon.flag },
 ]
+
+const percent = (v: number) => `${Math.round(v * 100)}%`
+const civCss = (k: number) => `rgb(${CIV_COLORS[k].map((v) => Math.round(v * 255)).join(', ')})`
+
+/** People per civ over the years: one line per people, the world total dashed. */
+function Timeline({ history, lineage }: { history: HistoryPoint[]; lineage: { id: number; name: string; color: number }[] }) {
+  const W = 300
+  const H = 80
+  const y0 = history[0].year
+  const y1 = history[history.length - 1].year
+  const span = Math.max(1, y1 - y0)
+  const max = Math.max(1, ...history.map((h) => h.total))
+  const path = (pts: [number, number][]) =>
+    pts
+      .map(([x, y], k) => `${k ? 'L' : 'M'}${(((x - y0) / span) * W).toFixed(1)},${(H - 2 - (y / max) * (H - 6)).toFixed(1)}`)
+      .join(' ')
+  return (
+    <div className="timeline-box">
+      <svg className="timeline" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label="População por povo ao longo dos anos">
+        <path d={path(history.map((h) => [h.year, h.total]))} className="total" />
+        {lineage.map((c) => {
+          const pts: [number, number][] = history.map((h) => [h.year, h.people.find((p) => p[0] === c.id)?.[1] ?? 0])
+          if (!pts.some((p) => p[1] > 0)) return null
+          return <path key={c.id} d={path(pts)} stroke={civCss(c.color)} fill="none" strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+        })}
+      </svg>
+      <p className="hint">
+        Linha do tempo: ano {y0} a {y1} · pico de {max} pessoas · tracejado: o mundo todo.
+      </p>
+    </div>
+  )
+}
+
+/** A need, 0–1, as a bar with an optional label instead of the percentage. */
+function Bar({ value, label }: { value: number; label?: string }) {
+  const v = Math.max(0, Math.min(1, value))
+  return (
+    <span className="bar" role="img" aria-label={label ?? percent(v)}>
+      <span className="bar-fill" style={{ width: `${Math.round(v * 100)}%` }} />
+      <span className="bar-label">{label ?? percent(v)}</span>
+    </span>
+  )
+}
 
 /** Vertical tab rail on the right edge; the active tab's panel slides out next to it. */
 export function SidePanel({
@@ -65,6 +113,257 @@ export function SidePanel({
             </button>
           </header>
           <div className="drawer-body">
+            {tab === 'life' && (
+              <>
+                <Section title="Vida">
+                  {s.life && stats.life?.selected ? (
+                    <div className="town-card">
+                      <header>
+                        <span className="swatch" style={{ background: civCss(stats.life.selected.color) }} />
+                        <strong>Cidade de {stats.life.selected.civ}</strong>
+                        <span className="muted">
+                          {stats.life.selected.people} pessoas · {Math.max(1, Math.round(stats.life.selected.age / 10))}{' '}
+                          {Math.round(stats.life.selected.age / 10) <= 1 ? 'ano' : 'anos'}
+                        </span>
+                      </header>
+                      <p className="hint">
+                        Estado: {stats.life.selected.status}. {stats.life.selected.trend[0].toUpperCase()}
+                        {stats.life.selected.trend.slice(1)}.{stats.life.selected.capital ? ' É a capital.' : ''}
+                      </p>
+                      <ul className="needs">
+                        <li>
+                          <span>Comida</span>
+                          <Bar value={stats.life.selected.needs.food} />
+                        </li>
+                        <li>
+                          <span>Umidade</span>
+                          <Bar value={stats.life.selected.needs.moist} />
+                        </li>
+                        <li>
+                          <span>Clima</span>
+                          <Bar
+                            value={1 - Math.min(1, stats.life.selected.needs.hardship * 4)}
+                            label={`${stats.life.selected.needs.temperature.toFixed(0)} °C`}
+                          />
+                        </li>
+                        <li>
+                          <span>Celeiro</span>
+                          <Bar value={stats.life.selected.needs.granary} />
+                        </li>
+                        <li>
+                          <span>Lotação</span>
+                          <Bar
+                            value={stats.life.selected.needs.capacity > 0 ? stats.life.selected.pop / stats.life.selected.needs.capacity : 0}
+                            label={`${stats.life.selected.people} de ${Math.round(stats.life.selected.needs.capacity * 200)}`}
+                          />
+                        </li>
+                        <li>
+                          <span>Tecnologia</span>
+                          <Bar value={stats.life.selected.tech} />
+                        </li>
+                        <li>
+                          <span>Adaptação</span>
+                          <Bar value={stats.life.selected.adapt} />
+                        </li>
+                      </ul>
+                      <p className="hint">
+                        Obras:{' '}
+                        {[
+                          stats.life.selected.works.farms && 'fazendas',
+                          stats.life.selected.works.irrigation && 'irrigação',
+                          stats.life.selected.works.dam && 'represa',
+                          stats.life.selected.works.terraces && 'terraplenagem',
+                          stats.life.selected.works.industry && 'indústria',
+                          stats.life.selected.needs.hunting && 'caça',
+                        ]
+                          .filter(Boolean)
+                          .join(', ') || 'nenhuma ainda'}
+                        . Fazendas com 25% de tecnologia, represa com 50%, terraplenagem com 70%, indústria com 80%.
+                        {stats.life.selected.monument && ` Tem ${stats.life.selected.monument === 'torre' ? 'uma' : 'um'} ${stats.life.selected.monument}.`}
+                        {stats.life.selected.faith && ` O povo segue o ${stats.life.selected.faith}.`}
+                      </p>
+                    </div>
+                  ) : (
+                    s.life && (
+                      <p className="hint">
+                        Com a ferramenta Inspecionar, passe o mouse sobre uma cidade para ver o que ela precisa, e
+                        clique para acompanhá-la aqui.
+                      </p>
+                    )
+                  )}
+                  <Toggle
+                    label="Vida: manadas e civilizações"
+                    checked={s.life}
+                    onChange={(life) => engine.set({ life })}
+                  />
+                  {s.life && (
+                    <>
+                      <Toggle
+                        label="Mapa político: territórios e fronteiras"
+                        checked={s.politicalMap}
+                        onChange={(politicalMap) => engine.set({ politicalMap })}
+                      />
+                      <Toggle
+                        label="Seguir os acontecimentos: a câmera voa até cada evento"
+                        checked={s.followEvents}
+                        onChange={(followEvents) => engine.set({ followEvents })}
+                      />
+                      <p className="hint">
+                        Manadas procuram pasto e água e fogem de lava, enchente, gelo e calor. Povos só vivem
+                        onde há umidade e calor suficientes: as cidades (telhados na cor do povo) crescem com pasto
+                        e água perto, fundam outras, aprendem (as paredes viram pedra, surge uma torre) e disputam
+                        fronteiras. Quanto mais frio (ou quente), mais adaptação e tecnologia um povo precisa para
+                        ficar ali; cidades cinzentas estão sofrendo com o clima. No mapa político, cada povo pinta
+                        suas terras; a fronteira fica vermelha e pulsa onde há guerra, e as batalhas deixam uma
+                        marca no chão.
+                        {stats.life &&
+                          ` Agora: ${stats.life.herds} manadas, ${stats.life.villages} cidades, ${stats.life.people} pessoas.`}
+                      </p>
+                      {stats.life && (
+                        <p className="hint">
+                          <strong>Ano {stats.life.year}.</strong>
+                          {stats.life.ending && <strong> {stats.life.ending}</strong>}
+                        </p>
+                      )}
+                      {stats.life && stats.life.civs.length > 0 && (
+                        <ul className="legend single civs">
+                          {stats.life.civs.map((c) => (
+                            <li key={c.id}>
+                              <span className="swatch" style={{ background: civCss(c.color) }} />
+                              <span className="civ-name">
+                                {c.name}
+                                {c.atWar ? ' ⚔' : ''}
+                                <span className="muted"> · {c.era} · poder {c.power}</span>
+                              </span>
+                              <span className="muted">
+                                {c.towns} {c.towns === 1 ? 'cidade' : 'cidades'} · {c.people} pessoas · capital com {c.capital} ·{' '}
+                                {c.faith} · tec. {percent(c.tech)} · adapt. frio {percent(c.adapts.cold)}, calor {percent(c.adapts.heat)}
+                                , seca {percent(c.adapts.dry)}, cheia {percent(c.adapts.flood)}
+                                {c.monuments > 0 && ` · ${c.monuments} ${c.monuments === 1 ? 'monumento' : 'monumentos'}`}
+                                {c.trade > 0 && ` · comércio com ${c.trade}`}
+                                {c.allies.length > 0 && ` · aliado de ${c.allies.join(', ')}`}
+                                {c.famine > 0 && ` · fome em ${percent(c.famine)} das cidades`}
+                                {c.plague > 0 && ` · peste em ${percent(c.plague)} das cidades`}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {stats.life && (
+                        <p className="hint">
+                          Fauna:{' '}
+                          {stats.life.fauna
+                            .map((f) => (f.extinct ? `${f.name} (extintos)` : `${f.herds} ${f.herds === 1 ? 'manada' : 'manadas'} de ${f.name}`))
+                            .join(', ')}
+                          . Cada espécie vive no seu bioma e migra com as estações; os povos sem agricultura caçam as manadas
+                          por perto.
+                          {(stats.life.routes > 0 || stats.life.ruins > 0 || stats.life.monuments > 0) &&
+                            ` No mapa: ${stats.life.routes} ${stats.life.routes === 1 ? 'estrada ou rota' : 'estradas e rotas'}, ${stats.life.monuments} ${stats.life.monuments === 1 ? 'monumento' : 'monumentos'}, ${stats.life.ruins} ${stats.life.ruins === 1 ? 'ruína' : 'ruínas'}.`}
+                          {stats.life.plagued > 0 &&
+                            ` A peste corre em ${stats.life.plagued} ${stats.life.plagued === 1 ? 'cidade' : 'cidades'}.`}
+                        </p>
+                      )}
+                      {stats.life && stats.life.history.length > 2 && (
+                        <Timeline history={stats.life.history} lineage={stats.life.lineage} />
+                      )}
+                      {stats.life && stats.life.wars.length > 0 && (
+                        <ul className="legend single civs wars">
+                          {stats.life.wars.map((w) => (
+                            <li key={`${w.a}:${w.b}`}>
+                              <span className="swatch" style={{ background: civCss(w.aColor) }} />
+                              <span className="civ-name">{w.a}</span>
+                              <span className="muted">⚔</span>
+                              <span className="swatch" style={{ background: civCss(w.bColor) }} />
+                              <span className="civ-name">{w.b}</span>
+                              <span className="muted">
+                                {w.cause === 'aliança' ? 'por aliança' : `por ${w.cause}`} ·{' '}
+                                {Math.max(1, Math.round(w.age / 10))} {Math.round(w.age / 10) <= 1 ? 'ano' : 'anos'} ·{' '}
+                                {w.battles} {w.battles === 1 ? 'batalha' : 'batalhas'} · cidades tomadas {w.taken[0]}–
+                                {w.taken[1]}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {stats.life && stats.life.events.length > 0 && (
+                        <ul className="chronicle">
+                          {stats.life.events.map((e, k) => (
+                            <li key={`${k}:${e.text}`} className={e.major ? 'major' : undefined}>
+                              <span className="swatch" style={{ background: civCss(e.color) }} />
+                              <span>
+                                <span className="muted">{e.year} · </span>
+                                {e.text}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  )}
+                  {stats.life && (stats.life.dams > 0 || stats.life.industries > 0 || stats.civWarming > 0) && (
+                    <p className="hint">
+                      Obras: {stats.life.dams} {stats.life.dams === 1 ? 'represa' : 'represas'}, {stats.life.industries}{' '}
+                      {stats.life.industries === 1 ? 'cidade industrial' : 'cidades industriais'}.
+                      {stats.civWarming > 0 &&
+                        ` A indústria aquece o planeta ${stats.civWarming.toFixed(1).replace('.', ',')} °C.`}
+                    </p>
+                  )}
+                  <p className="hint">
+                    Conforme aprendem, os povos mudam a terra: fazendas em volta das cidades (tec. 25%), represas nos
+                    rios (50%), terraplenagem (70%) e indústria (80%), que esquenta e polui a região e aquece o
+                    planeta inteiro.
+                  </p>
+                  {s.life && (
+                    <div className="row">
+                      <button type="button" onClick={() => void engine.exportPoliticalMap()}>
+                        <Icon.download size={16} /> Mapa político (PNG)
+                      </button>
+                      <button type="button" onClick={() => void engine.exportChronicle()}>
+                        <Icon.download size={16} /> Crônica (PNG)
+                      </button>
+                    </div>
+                  )}
+                </Section>
+              </>
+            )}
+            {tab === 'challenges' && (
+              <Section title="Desafios">
+                <p className="hint">
+                  Metas lidas da análise do clima, atualizada a cada poucos segundos. Escolha uma, mude o mundo e
+                  veja a barra subir.
+                </p>
+                {CHALLENGES.map((c) => {
+                  const active = stats.challenge?.id === c.id ? stats.challenge : null
+                  return (
+                    <div key={c.id} className={`challenge ${active ? 'active' : ''} ${active?.done ? 'done' : ''}`}>
+                      <div className="challenge-head">
+                        <div>
+                          <strong>{c.name}</strong>
+                          <div className="challenge-goal">{c.goal}</div>
+                        </div>
+                        <button
+                          type="button"
+                          className={active ? 'ghost' : ''}
+                          onClick={() => (active ? engine.stopChallenge() : engine.startChallenge(c.id))}
+                        >
+                          {active ? 'Parar' : 'Começar'}
+                        </button>
+                      </div>
+                      {active && (
+                        <>
+                          <div className="progress" role="progressbar" aria-valuenow={Math.round(active.progress * 100)}>
+                            <span style={{ width: percent(active.progress) }} />
+                          </div>
+                          <div className="challenge-status">
+                            {active.done ? 'Concluído!' : `${percent(active.progress)} · ${c.hint}`}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )
+                })}
+              </Section>
+            )}
             {tab === 'climate' && (
               <>
                 <Section title="Clima">
@@ -73,6 +372,24 @@ export function SidePanel({
                     checked={s.autoClimate}
                     onChange={(autoClimate) => engine.set({ autoClimate })}
                   />
+                  {stats.godWarming !== 0 && (
+                    <p className="hint">
+                      Sol (poder J): {stats.godWarming > 0 ? '+' : ''}
+                      {stats.godWarming.toFixed(0)} °C no planeta inteiro, em qualquer clima.
+                    </p>
+                  )}
+                  {stats.droughts > 0 && (
+                    <p className="hint">
+                      {stats.droughts === 1 ? 'Uma seca decretada' : `${stats.droughts} secas decretadas`} (poder N): não chove
+                      nessas regiões até você apagá-las.
+                    </p>
+                  )}
+                  {stats.dust > 0.05 && (
+                    <p className="hint">
+                      Poeira de impacto no ar: −{stats.dust.toFixed(1).replace('.', ',')} °C no planeta inteiro até
+                      ela baixar.
+                    </p>
+                  )}
                   {s.autoClimate ? (
                     <p className="hint">
                       A simulação decide: ventos dos cinturões de latitude (alísios no sul quente, ventos de oeste no
@@ -131,9 +448,12 @@ export function SidePanel({
                       onChange={(seaLevel) => engine.set({ seaLevel })}
                     />
                   )}
+                  {s.ocean && <Toggle label="Marés" checked={s.tides} onChange={(tides) => engine.set({ tides })} />}
                   <p className="hint">
                     Congela acima de {climateOf(s).snowLine.toFixed(3)} no centro
                     {s.ocean && ` · mar ${climateOf(s).seaLevel.toFixed(3)}`}
+                    {s.ocean && stats.tide !== 0 && ` · maré ${stats.tide > 0 ? '+' : ''}${(stats.tide * 1000).toFixed(1)}‰`}
+                    {s.ocean && stats.civWarming > 0 && ` · o aquecimento industrial sobe o mar ${(stats.civWarming * 4).toFixed(0)}‰`}
                   </p>
                 </Section>
                 <Section title="Dia e noite">
@@ -316,15 +636,62 @@ export function SidePanel({
                       grandes em azul escuro. Bom para ver as bacias e onde os rios se juntam.
                     </p>
                   )}
+                  {s.overlay === 'plates' && (
+                    <p className="hint">
+                      Cada placa tectônica com uma cor e as bordas em linha escura; as setas mostram para onde cada
+                      uma se move. Vermelho: as placas estão levantando a rocha (colisão, arco de montanhas). Azul:
+                      afundando (fossa, rifte). Use a ferramenta Placas (U) para mudar a direção.
+                    </p>
+                  )}
                   {s.overlay === 'rain' && <p className="hint">Chuva média recente: marrom seco, azul chuvoso.</p>}
                   {s.overlay === 'humidity' && (
                     <p className="hint">Umidade do ar: marrom seco, branco saturado (nuvens).</p>
+                  )}
+                  {s.overlay === 'airmass' && (
+                    <p className="hint">
+                      Massas de ar: azul mais frio que o normal da latitude, laranja mais quente. Roxo: o ar é
+                      forçado a subir (frentes e tempestades); escuro: desce. Quadriculado: massa de ar fixa
+                      pintada ali.
+                    </p>
                   )}
                   {s.overlay === 'pressure' && (
                     <p className="hint">
                       Roxo: baixa pressão (nuvens e chuva, o vento gira no sentido anti-horário). Laranja: alta (tempo
                       seco).
                     </p>
+                  )}
+                  {s.overlay === 'current' && (
+                    <p className="hint">
+                      Correntes marinhas: mar mais quente que o normal em vermelho, mais frio em azul. O vento arrasta
+                      a corrente pela superfície; o ar que passa por cima dela esquenta e umedece (ou esfria e seca)
+                      e leva isso para a costa a sotavento. Pinte com o pincel Corrente (O), só no mar.
+                    </p>
+                  )}
+                  {s.overlay === 'civilization' && (
+                    <>
+                      <p className="hint">
+                        O mapa dos povos: cada povo pinta suas terras; fronteiras em linha escura, frentes de guerra em
+                        vermelho pulsando, batalhas marcadas no chão. As cidades mostram a população (casas) e a
+                        tecnologia (torre, paredes de pedra).
+                        {!s.life && ' Ligue a vida na aba Mundo para ver os povos.'}
+                      </p>
+                      {stats.life && stats.life.civs.length > 0 && (
+                        <ul className="legend single">
+                          {stats.life.civs.map((c) => (
+                            <li key={c.id}>
+                              <span className="swatch" style={{ background: civCss(c.color) }} />
+                              <span className="civ-name">
+                                {c.name}
+                                {c.atWar ? ' ⚔' : ''}
+                              </span>
+                              <span className="muted">
+                                {c.towns} {c.towns === 1 ? 'cidade' : 'cidades'} · {c.people} pessoas
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
                   )}
                 </Section>
                 <button type="button" className={`wide ${section ? 'active' : ''}`} onClick={() => onSection(!section)}>
@@ -379,10 +746,37 @@ export function SidePanel({
                       onChange={(v) => engine.set({ geologicTime: Number(v) as 1 | 10 | 30 })}
                     />
                     <p className="hint">
-                      Acelera erosão, intemperismo e as zonas tectônicas (pincel Tectônica, tecla U); a água e o clima
-                      seguem no ritmo normal. Bom para ver vales e cânions se formarem.
+                      Acelera erosão, intemperismo e o movimento das placas tectônicas; a água e o clima seguem no
+                      ritmo normal. Bom para ver vales, cânions e cordilheiras se formarem.
                     </p>
                   </div>
+                  <Toggle
+                    label="Terremotos"
+                    checked={s.earthquakes}
+                    onChange={(earthquakes) => engine.set({ earthquakes })}
+                  />
+                  <Toggle label="Vulcões" checked={s.volcanoes} onChange={(volcanoes) => engine.set({ volcanoes })} />
+                  {stats.volcanoes.length > 0 && (
+                    <p className="hint">
+                      Vulcões:{' '}
+                      {stats.volcanoes.map((v) => `${v.name} (${v.erupting ? 'em erupção' : 'adormecido'})`).join(', ')}. Nascem
+                      onde as placas colidem ou se afastam, erguem um cone de lava a cada erupção e a cinza esfria a região.
+                    </p>
+                  )}
+                  <Slider
+                    label="Deriva das placas"
+                    value={s.plateDrift}
+                    min={0}
+                    max={3}
+                    step={0.1}
+                    format={(v) => `${v.toFixed(1).replace('.', ',')}×`}
+                    onChange={(plateDrift) => engine.set({ plateDrift })}
+                  />
+                  <p className="hint">
+                    As placas deslizam de verdade: as fronteiras migram, placas crescem e encolhem, e as
+                    cordilheiras ficam para trás de onde a fronteira passou. Veja no mapa Placas (tecla U para
+                    arrastar uma placa).
+                  </p>
                 </Section>
                 <Section title="Terreno">
                   <Toggle
@@ -417,17 +811,21 @@ export function SidePanel({
                   <div className="field">
                     <span className="field-label">Área simulada</span>
                     <Segmented
-                      value={String(s.area) as '1' | '1.5' | '2'}
+                      value={String(s.area) as '1' | '1.5' | '2' | '3' | '4'}
                       options={[
                         { id: '1', label: '1×', hint: 'O quadrado clássico' },
                         { id: '1.5', label: '1,5×', hint: '2,25× mais terreno simulado' },
                         { id: '2', label: '2×', hint: '4× mais terreno simulado' },
+                        { id: '3', label: '3×', hint: '9× mais terreno simulado' },
+                        { id: '4', label: '4×', hint: '16× mais terreno simulado' },
                       ]}
                       onChange={(v) => engine.set({ area: Number(v) as AreaSetting })}
                     />
                     <p className="hint">
                       Quanto terreno é simulado de verdade (rios, clima, erosão). Com a resolução automática o detalhe
-                      se mantém e a GPU trabalha mais ({stats.resolution}² agora). Mudar a área cria um mundo novo.
+                      se mantém e a GPU trabalha mais ({stats.resolution}² agora; até{' '}
+                      {engine.supportsHugeWorld ? '2048²' : '1024²'} nesta GPU, depois o detalhe diminui). Mudar a área
+                      cria um mundo novo.
                     </p>
                   </div>
                   <label className="select">
@@ -439,7 +837,7 @@ export function SidePanel({
                         engine.set({ resolution: v === 'auto' ? 'auto' : (Number(v) as ResolutionSetting) })
                       }}
                     >
-                      {RESOLUTIONS.map((r) => (
+                      {RESOLUTIONS.filter((r) => r.value !== 2048 || engine.supportsHugeWorld).map((r) => (
                         <option key={r.value} value={String(r.value)}>
                           {r.label}
                           {r.value === 'auto' && stats.resolution ? ` (${stats.resolution}²)` : ''}
@@ -458,6 +856,17 @@ export function SidePanel({
                       ))}
                     </select>
                   </label>
+                  <label className="select">
+                    <span>Limite de quadros</span>
+                    <select value={String(s.fpsLimit)} onChange={(e) => engine.set({ fpsLimit: Number(e.target.value) as FpsLimit })}>
+                      {FPS_LIMITS.map((f) => (
+                        <option key={f.value} value={String(f.value)}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <p className="hint">Menos quadros por segundo esquentam menos a placa de vídeo. Com a janela fora de foco o mapa é redesenhado só 10 vezes por segundo.</p>
                 </Section>
                 <Section title="Câmera">
                   <Segmented

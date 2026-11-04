@@ -1,3 +1,6 @@
+import type { ChallengeState } from './challenges'
+import type { LifeStats, TownReport } from './life'
+import type { BoundaryKind } from './plates'
 import type { ScenarioId } from './scenarios'
 
 /** How the generated terrain is shaped (see terrainHeight in the simulation shaders). */
@@ -14,16 +17,30 @@ export interface TerrainShape {
 
 /** 'inspect' paints nothing: the cursor reports what is under it. */
 export type Tool =
-  'inspect' | 'rock' | 'soil' | 'sand' | 'water' | 'level' | 'heat' | 'humidity' | 'volcano' | 'pressure' | 'uplift'
+  | 'inspect' | 'rock' | 'soil' | 'sand' | 'water' | 'level' | 'heat' | 'humidity' | 'volcano' | 'pressure' | 'airmass'
+  | 'plates' | 'current' | 'storm' | 'meteor' | 'sun' | 'drought'
 export type BrushMode = 'add' | 'remove'
 export type CameraMode = 'orbit' | 'fly'
-export type ResolutionSetting = 'auto' | 256 | 512 | 1024
+export type ResolutionSetting = 'auto' | 256 | 512 | 1024 | 2048
 /** Simulated area: the window's width in world units (1 = the classic square). */
-export type AreaSetting = 1 | 1.5 | 2
+export type AreaSetting = 1 | 1.5 | 2 | 3 | 4
 export type QualityLevel = 'low' | 'medium' | 'high'
 export type Quality = 'auto' | QualityLevel
+export type FpsLimit = 30 | 60 | 120 | 0
 export type Overlay =
-  'none' | 'biome' | 'temperature' | 'rain' | 'humidity' | 'pressure' | 'erosion' | 'change' | 'rivers'
+  | 'none'
+  | 'biome'
+  | 'temperature'
+  | 'rain'
+  | 'humidity'
+  | 'pressure'
+  | 'erosion'
+  | 'change'
+  | 'rivers'
+  | 'plates'
+  | 'airmass'
+  | 'civilization'
+  | 'current'
 
 export interface Settings {
   tool: Tool
@@ -44,6 +61,14 @@ export interface Settings {
   speed: number
   /** Geological time: erosion, weathering and tectonic uplift run this many times faster. */
   geologicTime: 1 | 10 | 30
+  /** Earthquakes strike now and then along the plate boundaries. */
+  earthquakes: boolean
+  /** Volcanoes wake up now and then on the plate boundaries, erupt for a while and go quiet. */
+  volcanoes: boolean
+  /** The sea rises and falls twice a day. */
+  tides: boolean
+  /** How fast the plates drift (1: a plate crosses a tenth of the world in 20 s at 30×). */
+  plateDrift: number
 
   seed: number
   /** The world this terrain started from, and the shape it gives the generator. */
@@ -53,6 +78,16 @@ export interface Settings {
   area: AreaSetting
   /** Graphics quality; automatic starts from the device and steps down while frames are slow. */
   quality: Quality
+  /** Frames per second the loop aims at (0: every screen refresh). Fewer frames mean a cooler GPU. */
+  fpsLimit: FpsLimit
+  /** The air-mass brush paints sources that stay put (the wind no longer carries the mass off). */
+  airMassFixed: boolean
+  /** Herds and villages live on the terrain and answer to the climate. */
+  life: boolean
+  /** Political map: each people's land painted on the terrain, borders and war fronts. */
+  politicalMap: boolean
+  /** The camera flies to each event of the chronicle as it happens (a watching god). */
+  followEvents: boolean
   /** The terrain goes on forever: the simulated window follows the camera through the world. */
   infiniteWorld: boolean
   /**
@@ -122,12 +157,21 @@ export const defaultSettings: Settings = {
   paused: false,
   speed: 1,
   geologicTime: 1,
+  earthquakes: true,
+  volcanoes: true,
+  tides: true,
+  plateDrift: 1,
   seed: 1,
   scenario: 'classic',
   terrainShape: { continents: 0, continentScale: 0.55, offset: 0, relief: 1 },
   resolution: 'auto',
   area: 1,
   quality: 'auto',
+  fpsLimit: 60,
+  airMassFixed: false,
+  life: true,
+  politicalMap: true,
+  followEvents: false,
   infiniteWorld: true,
   autoClimate: false,
   temperature: 0,
@@ -254,11 +298,22 @@ export interface Probe {
   rain: number
   lava: number
   vent: number
-  /** Tectonic zone: −1 sinking … 1 rising. */
+  /** Fixed air-mass source painted here: −1 cold … 1 warm, 0 none. */
+  airSource: number
+  /** Plate uplift here: −1 sinking … 1 rising. */
   tectonic: number
+  /** The plate under the cursor: its drift (degrees, 0 = east; speed up to ~1) and the boundary nearby, if any. */
+  plate: {
+    direction: number
+    speed: number
+    boundary: BoundaryKind | null
+    closing: number
+  }
   /** Wind towards, in degrees (0 = east, 90 = north), and speed in the slider's units. */
   windDirection: number
   windSpeed: number
+  /** The town under the cursor, if the life is on and one is near. */
+  town: TownReport | null
   /** Weather pressure anomaly: lows < 0 < highs. */
   pressure: number
   /** Index into the biome list (biome() in the render shader). */
@@ -267,6 +322,8 @@ export interface Probe {
 
 export const BRUSH_MIN = 0.01
 export const BRUSH_MAX = 0.15
+/** The biggest brush grows with the simulated area, so it covers the same share of the map. */
+export const brushMax = (area: number) => BRUSH_MAX * Math.max(area, 1)
 
 /** What the climate analysis found in the simulated window (see Engine.analyzeClimate). */
 export interface ClimateReport {
@@ -284,6 +341,14 @@ export interface ClimateReport {
   windSpeed: number
   lows: number
   highs: number
+  /** Share of the cells under water (more than a film). */
+  waterShare: number
+  /** Share of the cells under glacier ice. */
+  iceShare: number
+  /** Share of the cells with molten lava on them. */
+  lavaShare: number
+  /** Mean vegetation density, 0–1. */
+  vegetation: number
 }
 
 export const DAYS_PER_YEAR = 8
@@ -310,6 +375,35 @@ export interface Stats {
   climate: ClimateReport | null
   /** Automatic climate: the season and its temperature anomaly. */
   season: { name: string; anomaly: number } | null
+  /** Dust from meteor strikes still in the air, in °C of cooling. */
+  dust: number
+  /** Warming from the peoples' industry, in °C. */
+  civWarming: number
+  /** Warming (or cooling) the player decreed with the sun power, in °C. */
+  godWarming: number
+  /** Fixed highs standing (the drought power). */
+  droughts: number
+  /** The challenge being played, if any. */
+  challenge: ChallengeState | null
+  /** Herds, villages and people alive (null with the life off). */
+  life: LifeStats | null
+  /** How far back the rewind reaches, in simulated seconds. */
+  rewindSeconds: number
+  /** The volcanoes born on the plate boundaries, erupting or dormant. */
+  volcanoes: { name: string; erupting: boolean }[]
+  /** The tide right now, in height units above the mean sea level. */
+  tide: number
+  /** The rewind timeline: how far back it reaches and what happened along it. */
+  timeline: Timeline
+}
+
+/** What the rewind ring covers, for the strip over the toolbar: everything in simulated seconds before now. */
+export interface Timeline {
+  reach: number
+  /** Seconds ago of each snapshot that can be gone back to. */
+  snapshots: number[]
+  /** Events of the chronicle within reach: seconds ago, text, civ colour, importance. */
+  marks: { ago: number; text: string; color: number; major: boolean }[]
 }
 
 export const emptyStats: Stats = {
@@ -324,4 +418,14 @@ export const emptyStats: Stats = {
   storedRegions: 0,
   climate: null,
   season: null,
+  dust: 0,
+  civWarming: 0,
+  godWarming: 0,
+  droughts: 0,
+  challenge: null,
+  life: null,
+  rewindSeconds: 0,
+  volcanoes: [],
+  tide: 0,
+  timeline: { reach: 0, snapshots: [], marks: [] },
 }

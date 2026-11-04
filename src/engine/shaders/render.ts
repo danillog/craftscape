@@ -3,9 +3,10 @@
 // Florian Boesch (AGPL-3.0): spherical-harmonics "beach" lighting, Rayleigh-ish
 // absorption fog and a 1/1.8 gamma.
 
-import { FAR_GRID, FAR_TEXELS_PER_WINDOW, weatheringModel } from './sim'
+import { CIV_COLORS, DAM_HALF, DAM_HEIGHT, TERRITORY_N } from '../life'
+import { FAR_GRID, FAR_TEXELS_PER_WINDOW, MAX_PLATE_OVERRIDES, platesModel, weatheringModel } from './sim'
 
-export const CAMERA_UNIFORM_SIZE = 368
+export const CAMERA_UNIFORM_SIZE = 368 + MAX_PLATE_OVERRIDES * 32
 
 const common = /* wgsl */ `
 struct Cam {
@@ -16,15 +17,17 @@ struct Cam {
   light: vec4f,     // xyz: direction towards the light casting shadows (sun by day, moon by night)
   brush: vec4f,     // uv.x, uv.y, radius, visible
   params: vec4f,    // N, flow size, overlay (0 none, 1 biome, 2 temperature, 3 rain, 4 humidity, 5 pressure, 6 erosion,
-                    // 7 change, 8 rivers), time
-  chunk: vec4f,     // cells per chunk, chunks per side, unused, ring inner radius
+                    // 7 change, 8 rivers, 9 plates, 10 air masses, 11 peoples, 12 currents), time
+  chunk: vec4f,     // cells per chunk, chunks per side, point of the year (0 start of spring … 1; −1 no seasons), ring inner radius
   viewport: vec4f,
   sun: vec4f,       // xyz: direction towards the sun (may be below the horizon), w: daylight
   clouds: vec4f,    // xy: cloud drift (uv), z: simulated seconds
   world: vec4f,     // xy: window origin in the world (window widths), z: infinite world on,
                     // w: simulated area, the window's width in world units
   far: vec4f,       // distant terrain: sea level, ocean on, temperature at height 0, lapse rate
-  far2: vec4f,      // x: north–south temperature difference per window, y: terrain seed
+  far2: vec4f,      // x: north–south temperature difference per window, y: terrain seed,
+                    // z: plate time, w: number of plate overrides (see platesModel)
+  plates: array<vec4f, ${MAX_PLATE_OVERRIDES * 2}>,
 }
 @group(0) @binding(0) var<uniform> C: Cam;
 
@@ -101,6 +104,29 @@ fn aerial(exident: vec3f, world: vec3f) -> vec3f {
   return mix(near, behind, haze);
 }
 
+// The peoples' map (overlay 11) is drawn like an atlas, whatever the hour: parchment land
+// tinted by altitude and shaded by a fixed north-west light, flat blue water, snow and ice
+// white; the territories are painted over it (see territoryShader).
+fn politicalLand(height: f32, snow: f32, ice: f32, normal: vec3f) -> vec3f {
+  let above = clamp((height - C.far.x) / 0.1, 0.0, 1.0);
+  var land = mix(vec3f(0.78, 0.74, 0.60), vec3f(0.55, 0.47, 0.38), sqrt(above));
+  land = mix(land, vec3f(0.88, 0.90, 0.92), max(smoothstep(0.00003, 0.0004, snow), smoothstep(0.0001, 0.001, ice)));
+  let shade = 0.5 + 0.5 * max(dot(normal, normalize(vec3f(-0.5, 0.6, 0.45))), 0.0);
+  return land * shade;
+}
+// Distance on the atlas fades towards the paper, never towards the sky: the map reads the
+// same at midnight as at noon.
+fn atlasFade(color: vec3f, world: vec3f) -> vec3f {
+  let d = distance(world, C.eye.xyz) / C.world.w;
+  let haze = 1.0 - exp(-pow(d / 2.4, 2.0));
+  return mix(color, vec3f(0.62, 0.60, 0.54), haze);
+}
+fn politicalWater(depth: f32) -> vec3f {
+  let sea = mix(vec3f(0.44, 0.58, 0.76), vec3f(0.24, 0.36, 0.58), smoothstep(0.0, 0.025, depth));
+  // a darker line along the shore
+  return sea * mix(0.72, 1.0, smoothstep(0.0, 0.0012, depth));
+}
+
 // Colour of the light: white by day, orange low in the sky, dim blue moonlight at night.
 fn lightColor() -> vec3f {
   let sunColor = mix(vec3f(1.0, 0.55, 0.3), vec3f(1.0), smoothstep(0.05, 0.35, C.sun.y));
@@ -127,6 +153,7 @@ const terrainBindings = /* wgsl */ `
 fn sNormals(t: Taps) -> vec4f { return lerp4(normals[t.i00], normals[t.i10], normals[t.i01], normals[t.i11], t.f); }
 fn sExtra(t: Taps) -> vec4f { return lerp4(extra[t.i00], extra[t.i10], extra[t.i01], extra[t.i11], t.f); }
 fn sLava(t: Taps) -> vec4f { return lerp4(lava[t.i00], lava[t.i10], lava[t.i01], lava[t.i11], t.f); }
+fn tectonicAt(uv: vec2f) -> f32 { return sLava(taps(uv)).w; }
 fn pressureAt(uv: vec2f) -> f32 {
   let n = i32(C.params.y);
   let t = uv * f32(n) - 0.5;
@@ -214,6 +241,8 @@ const waterBindings = /* wgsl */ `
 fn sFine(t: Taps) -> f32 { return mix(mix(fine[t.i00], fine[t.i10], t.f.x), mix(fine[t.i01], fine[t.i11], t.f.x), t.f.y); }
 fn sWNormals(t: Taps) -> vec4f { return lerp4(wnormals[t.i00], wnormals[t.i10], wnormals[t.i01], wnormals[t.i11], t.f); }
 fn pressureAt(uv: vec2f) -> f32 { return 0.0; }
+// lakes and seas show the plates but not the uplift under them
+fn tectonicAt(uv: vec2f) -> f32 { return 0.0; }
 // On the water surface the Erosion map shows the streams that cut into their beds.
 // Deep water hardly touches the bottom (the coast's surf shows on the land beside
 // it), so open sea and lakes stay clear.
@@ -228,7 +257,7 @@ fn erosionAt(uv: vec2f) -> vec4f {
 }
 `
 
-const buffers = weatheringModel + /* wgsl */ `
+const buffers = weatheringModel + platesModel('C.far2.z', 'C.far2.w', 'C.plates') + /* wgsl */ `
 @group(1) @binding(0) var texSampler: sampler;
 @group(1) @binding(1) var rockTex: texture_2d<f32>;
 @group(1) @binding(2) var rockNormalTex: texture_2d<f32>;
@@ -374,12 +403,44 @@ fn temperatureColor(t: f32) -> vec3f {
 // Overlay colour and opacity for the selected map; zero when off.
 fn overlayColor(c: vec4f, uv: vec2f) -> vec4f {
   let mode = u32(C.params.z);
+  if (mode == 12u) {
+    // the ocean currents: the sea's temperature anomaly (what the current brush paints and
+    // the wind carries along): red warm, blue cold, fading where there is none; the land
+    // keeps its colours (the terrain pass skips this mode)
+    let warm = smoothstep(0.0, 4.0, c.x);
+    let cold = smoothstep(0.0, 4.0, -c.x);
+    let col = mix(mix(vec3f(0.5), vec3f(0.95, 0.25, 0.1), warm), vec3f(0.15, 0.35, 1.0), cold);
+    let band = 0.85 + 0.15 * smoothstep(0.35, 0.5, abs(fract(abs(c.x) * 0.5) - 0.5));
+    return vec4f(col * band, 0.9 * smoothstep(0.15, 1.0, abs(c.x)));
+  }
   if (mode == 5u) {
     // lows blue/violet, highs orange, with isobar-like bands
     let p = pressureAt(uv);
     let col = mix(mix(vec3f(0.35, 0.25, 0.85), vec3f(0.92), smoothstep(-0.8, 0.0, p)), vec3f(0.95, 0.55, 0.15), smoothstep(0.0, 0.8, p));
     let band = 0.85 + 0.15 * smoothstep(0.35, 0.5, abs(fract(p * 4.0) - 0.5));
     return vec4f(col * band, 0.75);
+  }
+  if (mode == 10u) {
+    // air masses: blue where the air is colder than its latitude's, orange where warmer;
+    // violet lines where the air is forced up (fronts, storms), dimmer where it sinks
+    // (packed by upperShader into shadow.w, per 4×4 block; nearest texel, since the
+    // packing does not interpolate)
+    let packed = shadow[taps(uv).i00].w;
+    // a fixed air-mass source painted here: 1 cold, 2 warm (see upperShader)
+    let fixed = floor(packed / 10000.0);
+    let w = packed - fixed * 10000.0;
+    let dev = select((floor(w) - 2500.0) / 100.0, 0.0, w < 1.0);
+    let rise = select((fract(w) - 0.5) / 25.0, 0.0, w < 1.0);
+    var col = mix(mix(vec3f(0.15, 0.35, 0.95), vec3f(0.93), smoothstep(-5.0, 0.0, dev)), vec3f(0.95, 0.45, 0.15), smoothstep(0.0, 5.0, dev));
+    col = mix(col, vec3f(0.5, 0.1, 0.75), 0.9 * smoothstep(0.0005, 0.004, rise));
+    col *= 1.0 - 0.3 * smoothstep(-0.0005, -0.004, rise);
+    if (fixed > 0.5) {
+      // the painted sources: a checkered stipple in deep blue (cold) or deep orange (warm)
+      let cell = floor(uv * C.params.x * 0.5);
+      let stipple = abs(cell.x + cell.y) % 2.0;
+      col = mix(col, select(vec3f(0.95, 0.3, 0.0), vec3f(0.0, 0.15, 0.85), fixed < 1.5), 0.7 * stipple);
+    }
+    return vec4f(col, 0.78);
   }
   if (mode == 6u) { return erosionAt(uv); }
   if (mode == 7u) {
@@ -394,9 +455,23 @@ fn overlayColor(c: vec4f, uv: vec2f) -> vec4f {
   if (mode == 8u) {
     // drainage network: land dimmed, water by discharge (thin streams pale, big rivers deep blue)
     let wv = sWater(taps(uv));
-    if (wv.x < 0.0002) { return vec4f(vec3f(0.5, 0.5, 0.47), 0.6); }
-    let flow = clamp(log(1.0 + length(wv.yz) * 2000.0) / log(1.0 + 100.0), 0.0, 1.0);
+    if (wv.x < 0.0001) { return vec4f(vec3f(0.5, 0.5, 0.47), 0.6); }
+    // (the thinnest streams, a film in a cell or two wide, still show as pale lines)
+    let flow = clamp(log(1.0 + length(wv.yz) * 4000.0) / log(1.0 + 200.0), 0.0, 1.0);
     return vec4f(mix(vec3f(0.62, 0.86, 1.0), vec3f(0.0, 0.18, 0.75), flow), 0.92);
+  }
+  if (mode == 9u) {
+    // plates: each its own muted colour, boundaries drawn as dark lines; on top, red where
+    // the plates push the rock up and blue where they pull it down
+    let pp = platePair((uv + C.world.xy) * C.world.w, C.far2.y);
+    // pale pastels, so the strong red and blue of the uplift stand out
+    let hue = plateHash(pp.own, 11u) + vec3f(0.0, 0.333, 0.667);
+    var col = 0.78 - 0.12 * cos(6.2831853 * hue);
+    let u = tectonicAt(uv);
+    col = mix(col, vec3f(0.9, 0.22, 0.1), smoothstep(0.02, 0.5, u));
+    col = mix(col, vec3f(0.12, 0.3, 0.9), smoothstep(0.02, 0.5, -u));
+    let line = 1.0 - smoothstep(0.004, 0.008, pp.dist);
+    return vec4f(mix(col, vec3f(0.08), line * 0.8), 0.8);
   }
   if (mode == 1u) { return vec4f(biomeColor(biome(c.w, c.z)), 0.75); }
   if (mode == 2u) { return vec4f(temperatureColor(c.w), 0.75); }
@@ -464,6 +539,23 @@ fn fs(in: VOut) -> @location(0) vec4f {
   tint = mix(tint, vec3f(0.75, 1.05, 0.6), warm * lush);
   tint = mix(tint, vec3f(0.6, 0.8, 0.7), cool * (1.0 - arid));
   tint = mix(tint, vec3f(0.9, 0.82, 0.6), 1.0 - smoothstep(-4.0, 2.0, temp));
+  // the seasons: in the temperate biomes the leaves turn gold and red in autumn, the land
+  // goes dull in winter and fresh, with a few blossoms, in spring; dry lands yellow in summer
+  let phase = C.chunk.z;
+  if (phase >= 0.0) {
+    let temperate = (1.0 - warm * lush) * (1.0 - arid) * smoothstep(-2.0, 10.0, temp) * (1.0 - smoothstep(20.0, 28.0, temp));
+    let spring = max(1.0 - smoothstep(0.04, 0.2, phase), smoothstep(0.94, 1.0, phase));
+    let summer = smoothstep(0.18, 0.3, phase) * (1.0 - smoothstep(0.45, 0.55, phase));
+    let autumn = smoothstep(0.5, 0.6, phase) * (1.0 - smoothstep(0.7, 0.82, phase));
+    let winter = smoothstep(0.72, 0.82, phase) * (1.0 - smoothstep(0.94, 1.0, phase));
+    let leaves = smoothstep(0.35, 0.75, veg);
+    tint = mix(tint, vec3f(1.55, 0.9, 0.3) * mix(0.8, 1.15, grain), autumn * temperate * leaves * 0.85);
+    tint = mix(tint, vec3f(1.5, 0.75, 0.2), autumn * temperate * leaves * smoothstep(0.6, 0.85, grain) * 0.5);
+    tint = mix(tint, vec3f(0.85, 0.78, 0.6), winter * temperate * 0.55);
+    tint = mix(tint, vec3f(1.05, 1.15, 0.7), spring * temperate * 0.35);
+    tint = mix(tint, vec3f(1.35, 0.95, 1.0), spring * temperate * leaves * smoothstep(0.78, 0.86, grain) * 0.7);
+    tint = mix(tint, vec3f(1.25, 1.05, 0.55), summer * (1.0 - lush) * smoothstep(0.3, 0.6, 1.0 - cl.z) * 0.5);
+  }
   // bare soil until plants take hold (the original always drew soil as grass); ochre in hot dry places
   let bare = mix(vec3f(0.36, 0.28, 0.19), vec3f(0.62, 0.42, 0.25), arid * warm) * (0.6 + luma(grassColor) * 1.2);
   var soil = mix(bare, grassColor * tint, veg);
@@ -495,10 +587,15 @@ fn fs(in: VOut) -> @location(0) vec4f {
   normal = mix(normal, baseNormal, lavaCover * 0.5);
   let glow = vec3f(1.0, 0.13, 0.01) * lavaCover * lv.y * lv.y * (0.25 + 1.1 * crackle);
 
+  if (u32(C.params.z) == 11u) {
+    let atlas = politicalLand(g.x, ex.z, ex.w, baseNormal) * mix(0.85, 1.0, occlusion);
+    return vec4f(finish(atlasFade(atlas * selection(in.world), in.world)), 1.0);
+  }
   let shadowed = mix(0.3, 1.0, sShadow(t).x) * cloudShade(cl);
   let light = lightColor();
   var exident = shLight(normal) * occlusion * shadowed * color * light;
-  let overlay = overlayColor(cl, uv);
+  // (the currents map colours only the water)
+  let overlay = select(overlayColor(cl, uv), vec4f(0.0), u32(C.params.z) == 12u);
   exident = mix(exident, overlay.rgb * mix(0.55, 1.0, shadowed) * occlusion * mix(vec3f(0.6), light, 0.5), overlay.a);
   exident += glow * (1.0 - overlay.a);
   let incident = aerial(exident * selection(in.world), in.world);
@@ -551,6 +648,9 @@ fn fs(in: VOut) -> @location(0) vec4f {
   let w = sWater(t).xyz;
   let depth = clamp(w.x / 0.001, 0.0, 1.0);
   if (depth <= 0.0) { discard; }
+  if (u32(C.params.z) == 11u) {
+    return vec4f(finish(atlasFade(politicalWater(w.x) * selection(in.world), in.world)), depth);
+  }
   let speed = clamp(length(w.yz) / 0.02, 0.0, 1.0);
 
   let baseNormal = normalize(sWNormals(t).xyz);
@@ -697,16 +797,713 @@ fn fs(in: ArrowOut) -> @location(0) vec4f {
 }
 `
 
-// 3D clouds as a stack of horizontal slices (drawn far to near, so blending works
-// from above and below). Coverage comes from the simulated humidity and rain; the
-// shape from drifting noise. Thicker clouds grow taller and are darker underneath.
-export const CLOUD_SLICES = 20
+// Plate arrows: one big arrow on each plate's site, pointing where the plate drifts
+// (worked out on the CPU, see Engine.plateArrows); the plate being dragged is highlighted.
+export const MAX_PLATE_ARROWS = 32
+export const plateArrowShader = common + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+// per arrow: (uv, velocity in world units per unit of speed), (selected, 0, 0, 0)
+@group(0) @binding(3) var<storage, read> arrows: array<vec4f>;
+
+fn ixn(x: i32, y: i32, n: i32) -> u32 {
+  return u32(clamp(y, 0, n - 1) * n + clamp(x, 0, n - 1));
+}
+fn surfaceAt(uv: vec2f) -> f32 {
+  let n = i32(C.params.x);
+  let p = vec2i(floor(uv * f32(n)));
+  let j = ixn(p.x, p.y, n);
+  return ground[j].x + water[j].x;
+}
+
+struct ArrowOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec3f,
+}
+
+const SHAPE = array<vec2f, 9>(
+  vec2f(0.0, -0.5), vec2f(0.62, -0.5), vec2f(0.0, 0.5),
+  vec2f(0.0, 0.5), vec2f(0.62, -0.5), vec2f(0.62, 0.5),
+  vec2f(0.62, -1.6), vec2f(1.0, 0.0), vec2f(0.62, 1.6),
+);
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> ArrowOut {
+  let a = arrows[inst * 2u];
+  let selected = arrows[inst * 2u + 1u].x;
+  let speed = length(a.zw);
+  let dir = select(vec2f(1.0, 0.0), a.zw / max(speed, 1e-9), speed > 1e-6);
+  let side = vec2f(-dir.y, dir.x);
+  // in window uv: a quarter of a world unit at full speed
+  let len = (0.08 + 0.22 * speed) / C.world.w;
+  let s = SHAPE[vi];
+  let uv = a.xy + dir * (s.x - 0.35) * len + side * s.y * 0.018 / C.world.w;
+  let world = worldPos(uv, surfaceAt(clamp(uv, vec2f(0.0), vec2f(1.0))) + 0.012);
+  var out: ArrowOut;
+  out.pos = C.viewProj * vec4f(world, 1.0);
+  out.color = select(vec3f(0.95, 0.95, 0.92), vec3f(1.0, 0.78, 0.2), selected > 0.5);
+  return out;
+}
+
+@fragment
+fn fs(in: ArrowOut) -> @location(0) vec4f {
+  return vec4f(in.color, 0.95);
+}
+`
+
+/// Life markers: the peoples' towns and works, their travellers, the herds and the rest,
+// drawn as little boxes with pyramid roofs standing on the terrain.
+export const MAX_LIFE = 384
+/**
+ * Vertices drawn per life marker: up to LIFE_HOUSES slots of 36 vertices (4 walls, pyramid
+ * roof). A town uses slot 0 for its hall, 1–7 for houses, 8–11 and 16–23 for its city wall,
+ * 12–14 for its factory, chimney and smoke, and 15 for its monument.
+ */
+export const LIFE_HOUSES = 24
+export const LIFE_VERTICES = LIFE_HOUSES * 36
+
+const civPalette = /* wgsl */ `
+const CIV_PALETTE = array<vec3f, ${CIV_COLORS.length}>(${CIV_COLORS.map(
+  (c) => `vec3f(${c.map((v) => v.toFixed(2)).join(', ')})`,
+).join(', ')});
+`
+
+// Life markers. Herds are a few low animals (their kind sets their size and coat). A town is
+// a hall and a cluster of houses (more as it grows) whose shapes follow its era: huts of
+// thatch, then wooden houses with roofs in the people's colour, stone walls and a keep, a
+// palace, brick works with a smoking chimney, and glass towers; a learned, big town rings
+// itself with a wall, and a monument stands beside it if it raised one (pyramid, temple or
+// tower). Ruins are broken walls sinking into the land, boats a hull and a sail on the sea
+// routes, parties (caravans, armies, migrants, settlers) a file of little figures walking
+// their road, dams a stone wall across the river, and battles a red burst on the ground
+// that fades. Every marker gets LIFE_VERTICES vertices: a slot is 36 (4 walls of 6, a
+// pyramid roof of 12); unused ones collapse to a point.
+export const lifeShader = common + civPalette + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+// per marker: (uv, kind (0 herd, 1 town, 2 battle, 3 ruin, 4 boat, 5 party, 6 dam), size),
+// (health (a boat, party or dam: its heading), civ colour index, tech,
+//  flag: a herd's species, a town's or ruin's monument, a party's kind (0 caravan, 1 army, 2 migrants, 3 settlers))
+@group(0) @binding(3) var<storage, read> markers: array<vec4f>;
+
+fn ixn(x: i32, y: i32, n: i32) -> u32 {
+  return u32(clamp(y, 0, n - 1) * n + clamp(x, 0, n - 1));
+}
+fn surfaceAt(uv: vec2f) -> f32 {
+  let n = i32(C.params.x);
+  let p = vec2i(floor(uv * f32(n)));
+  let j = ixn(p.x, p.y, n);
+  return ground[j].x + water[j].x;
+}
+fn hash2(a: u32, b: u32) -> f32 {
+  var h = a * 374761393u + b * 668265263u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  return f32(h & 0xffffu) / 65535.0;
+}
+
+struct LifeOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec3f,
+  @location(1) world: vec3f,
+  @location(2) alpha: f32,
+}
+
+// corners of a unit square, counter-clockwise seen from above
+const CORNER = array<vec2f, 4>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
+// the two triangles of a quad: corner indices
+const QUAD = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+// coats of the species (see SPECIES in life.ts): deer, bison, camels, mammoths, elephants
+const COATS = array<vec3f, 5>(vec3f(0.6, 0.4, 0.22), vec3f(0.3, 0.2, 0.12), vec3f(0.78, 0.64, 0.4), vec3f(0.42, 0.32, 0.25), vec3f(0.5, 0.5, 0.53));
+const STONE = vec3f(0.62, 0.6, 0.56);
+const THATCH = vec3f(0.6, 0.5, 0.28);
+const WOOD = vec3f(0.55, 0.42, 0.28);
+const BRICK = vec3f(0.52, 0.31, 0.25);
+const GLASS = vec3f(0.7, 0.77, 0.85);
+
+// One piece of a marker: a box with a pyramid roof. Its footprint is hw across and
+// hw * stretch along, turned by heading; it stands offset (world units) from the marker,
+// lifted from the ground by lift.
+struct Piece {
+  on: bool,
+  hw: f32,
+  stretch: f32,
+  h: f32,
+  roofH: f32,
+  offset: vec2f,
+  heading: f32,
+  lift: f32,
+  noRoof: bool,
+  wall: vec3f,
+  roof: vec3f,
+  alpha: f32,
+  /** Stands at an absolute height (base) instead of on the ground. */
+  absolute: bool,
+  base: f32,
+}
+
+// the eras by technology (see ERAS in life.ts): stone, bronze, iron, medieval, renaissance, industrial, modern
+fn eraOf(tech: f32) -> u32 {
+  if (tech >= 0.92) { return 6u; }
+  if (tech >= 0.8) { return 5u; }
+  if (tech >= 0.6) { return 4u; }
+  if (tech >= 0.45) { return 3u; }
+  if (tech >= 0.3) { return 2u; }
+  if (tech >= 0.15) { return 1u; }
+  return 0u;
+}
+
+// an offset (world units, as the pieces take it) for a step along and across a heading
+fn along(heading: f32, s: f32, across: f32) -> vec2f {
+  return vec2f(cos(heading), -sin(heading)) * s + vec2f(-sin(heading), -cos(heading)) * across;
+}
+
+fn piece(kind: u32, slot: u32, m: vec4f, extra: vec4f, inst: u32) -> Piece {
+  var p: Piece;
+  p.on = false;
+  p.hw = 0.0022;
+  p.stretch = 1.0;
+  p.h = 0.0028;
+  p.roofH = 0.0;
+  p.offset = vec2f(0.0);
+  p.heading = 0.0;
+  p.lift = -0.0008;
+  p.noRoof = false;
+  p.alpha = 1.0;
+  p.wall = WOOD;
+  p.roof = vec3f(0.5);
+  p.absolute = false;
+  p.base = 0.0;
+  let size = m.w;
+  let health = extra.x;
+  let tint = CIV_PALETTE[u32(clamp(extra.y, 0.0, ${CIV_COLORS.length - 1}.0))];
+  let tech = extra.z;
+  let flag = u32(extra.w + 0.5);
+  let time = C.clouds.z;
+  let jitter = hash2(inst, slot);
+  let jitter2 = hash2(slot, inst);
+
+  if (kind == 0u) {
+    // a herd: three animals, bigger for the big species
+    if (slot >= 3u) { return p; }
+    p.on = true;
+    p.hw = 0.0008 + 0.0009 * size;
+    p.h = 0.0008 + 0.0012 * size;
+    p.roofH = p.h * 0.25;
+    let spread = 0.003 + 0.002 * size;
+    if (slot > 0u) {
+      let a = f32(slot) * 2.399963 + jitter * 1.2;
+      p.offset = vec2f(cos(a), sin(a)) * spread * (0.6 + 0.4 * jitter2);
+    }
+    let coat = COATS[min(flag, 4u)];
+    p.wall = mix(coat * 0.7 + vec3f(0.15), coat, health);
+    p.roof = p.wall * 0.75;
+    return p;
+  }
+
+  if (kind == 1u) {
+    let era = eraOf(tech);
+    let houses = 1u + u32(round(size * 6.0));
+    let spread = 0.006 + 0.006 * size;
+    // the climate's strain (and the plague) shows as grey
+    let grey = vec3f(0.45, 0.45, 0.47);
+    let strain = 0.35 + 0.65 * health;
+    if (slot == 0u) {
+      // the hall: a great hut, a longhouse, a keep, a palace, a glass tower
+      p.on = true;
+      let grow = 1.0 + 0.3 * size;
+      if (era == 0u) { p.hw = 0.0026 * grow; p.h = 0.002; p.roofH = 0.0032; p.wall = WOOD * 0.8; p.roof = THATCH; }
+      else if (era <= 2u) { p.hw = 0.0022 * grow; p.stretch = 1.8; p.h = 0.0032; p.roofH = 0.0016; p.wall = WOOD; p.roof = tint; }
+      else if (era == 3u) { p.hw = 0.0022 * grow; p.h = 0.009; p.roofH = 0.0025; p.wall = STONE; p.roof = tint * 0.85; }
+      else if (era <= 5u) { p.hw = 0.0032 * grow; p.stretch = 1.5; p.h = 0.0045; p.roofH = 0.0028; p.wall = vec3f(0.86, 0.83, 0.75); p.roof = tint; }
+      else { p.hw = 0.002 * grow; p.h = 0.018; p.roofH = 0.0003; p.wall = GLASS; p.roof = vec3f(0.45, 0.5, 0.56); }
+      p.heading = jitter * 0.6;
+    } else if (slot < 8u) {
+      // the houses, in a loose ring, shaped by the era
+      if (slot >= houses) { return p; }
+      p.on = true;
+      let a = f32(slot) * 2.399963 + jitter * 1.2;
+      p.offset = vec2f(cos(a), sin(a)) * spread * (0.6 + 0.4 * jitter2);
+      p.heading = jitter2 * 3.14159;
+      let scale = 0.75 + 0.35 * hash2(inst * 7u, slot);
+      if (era == 0u) { p.hw = 0.0015 * scale; p.h = 0.0015 * scale; p.roofH = p.h * 1.1; p.wall = WOOD * 0.8; p.roof = mix(THATCH, tint, 0.35); }
+      else if (era <= 2u) { p.hw = 0.002 * scale; p.h = 0.0026 * scale; p.roofH = p.h * 0.5; p.wall = WOOD; p.roof = tint; }
+      else if (era == 3u) { p.hw = 0.002 * scale; p.h = 0.0032 * scale; p.roofH = p.h * 0.55; p.wall = mix(WOOD, STONE, 0.6); p.roof = tint * 0.8; }
+      else if (era == 4u) { p.hw = 0.0021 * scale; p.stretch = 1.3; p.h = 0.0036 * scale; p.roofH = p.h * 0.4; p.wall = vec3f(0.85, 0.82, 0.74); p.roof = tint * 0.9; }
+      else if (era == 5u) { p.hw = 0.0022 * scale; p.stretch = 1.4; p.h = 0.004 * scale; p.roofH = p.h * 0.25; p.wall = BRICK; p.roof = mix(vec3f(0.3, 0.3, 0.32), tint, 0.3); }
+      else { p.hw = 0.0018 * scale; p.h = (0.005 + 0.006 * jitter) * scale; p.roofH = 0.0002; p.wall = mix(GLASS, tint, 0.15); p.roof = vec3f(0.5, 0.55, 0.6); }
+    } else if (slot < 12u || slot >= 16u) {
+      // the city wall: three stretches a side around the houses, each on its own ground,
+      // once the people works iron, until cannon make it moot
+      if (era < 2u || era > 4u || size < 0.5) { return p; }
+      p.on = true;
+      let ring = spread * 1.15 + 0.0015;
+      let piece = select(slot - 16u + 4u, slot - 8u, slot < 12u);
+      let side = piece % 4u;
+      let third = f32(piece / 4u) - 1.0;
+      p.heading = f32(side) * 1.5707963;
+      p.offset = along(p.heading, third * ring * 0.667, ring);
+      p.hw = 0.0003;
+      p.stretch = (ring * 0.36) / p.hw;
+      p.h = 0.0013;
+      p.lift = -0.0005;
+      p.roofH = 0.0002;
+      p.wall = STONE * 0.9;
+      p.roof = STONE * 0.75;
+    } else if (slot < 15u) {
+      // the works: a brick factory, its chimney and the smoke over it
+      if (era < 5u || size < 0.5) { return p; }
+      p.on = true;
+      let at = vec2f(-spread - 0.0035, -0.002);
+      if (slot == 12u) { p.offset = at; p.hw = 0.0028; p.stretch = 1.6; p.h = 0.0026; p.roofH = 0.0002; p.wall = BRICK; p.roof = vec3f(0.3, 0.3, 0.32); }
+      else if (slot == 13u) { p.offset = at + vec2f(0.003, 0.0014); p.hw = 0.00045; p.h = 0.0078; p.roofH = 0.0001; p.wall = vec3f(0.4, 0.38, 0.37); p.roof = p.wall; }
+      else {
+        let drift = fract(time * 0.25 + jitter);
+        p.offset = at + vec2f(0.003 + drift * 0.004, 0.0014 + sin(time * 0.9) * 0.0008);
+        p.hw = 0.0009 + 0.002 * drift;
+        p.h = 0.003;
+        p.lift = 0.0075 + drift * 0.004;
+        p.noRoof = true;
+        p.wall = vec3f(0.6, 0.6, 0.62);
+        p.alpha = 0.3 * (1.0 - drift);
+      }
+    } else {
+      // the monument stands apart, on the town's east side
+      if (flag == 0u) { return p; }
+      p.on = true;
+      p.offset = vec2f(spread + 0.004, 0.0015);
+      if (flag == 1u) { p.hw = 0.0036; p.h = 0.0005; p.roofH = 0.0042; p.wall = vec3f(0.82, 0.72, 0.52); p.roof = p.wall; }
+      else if (flag == 2u) { p.hw = 0.0032; p.h = 0.003; p.roofH = 0.0012; p.wall = vec3f(0.9, 0.88, 0.8); p.roof = vec3f(0.55, 0.5, 0.45); }
+      else { p.hw = 0.0013; p.h = 0.0095; p.roofH = 0.0026; p.wall = vec3f(0.86, 0.85, 0.8); p.roof = tint; }
+      return p;
+    }
+    p.wall = mix(grey, p.wall, strain);
+    p.roof = mix(grey, p.roof, strain);
+    return p;
+  }
+
+  if (kind == 3u) {
+    // a ruin: three broken walls, lower the older, and the stump of its monument
+    let stone = mix(vec3f(0.5, 0.47, 0.42), tint, 0.12) * (0.9 + 0.2 * jitter);
+    if (slot < 3u) {
+      p.on = true;
+      p.noRoof = true;
+      p.h = 0.0028 * (0.25 + 0.45 * size);
+      p.lift = -0.0008 - 0.0012 * (1.0 - size);
+      if (slot > 0u) {
+        let a = f32(slot) * 2.399963 + jitter * 1.2;
+        p.offset = vec2f(cos(a), sin(a)) * 0.007 * (0.6 + 0.4 * jitter2);
+      }
+      p.hw = 0.0022 * (0.75 + 0.35 * hash2(inst * 7u, slot));
+      p.wall = stone;
+      return p;
+    }
+    if (slot == 15u && flag > 0u) {
+      p.on = true;
+      p.offset = vec2f(0.011, 0.0015);
+      p.noRoof = flag != 1u;
+      if (flag == 1u) { p.hw = 0.0036; p.h = 0.00025; p.roofH = 0.0013; }
+      else if (flag == 2u) { p.hw = 0.0032; p.h = 0.0015; }
+      else { p.hw = 0.0013; p.h = 0.0047; }
+      p.wall = stone;
+      p.roof = stone;
+    }
+    return p;
+  }
+
+  if (kind == 4u) {
+    // a boat: a long hull and a sail, bobbing
+    if (slot > 0u) { return p; }
+    p.on = true;
+    p.hw = 0.0009;
+    p.h = 0.0005;
+    p.stretch = 2.4;
+    p.roofH = 0.0028;
+    p.heading = health;
+    p.lift = 0.0001 + 0.00015 * sin(time * 3.0 + f32(inst));
+    p.wall = vec3f(0.36, 0.25, 0.14);
+    p.roof = mix(vec3f(0.95, 0.93, 0.86), tint, 0.35);
+    return p;
+  }
+
+  if (kind == 5u) {
+    // a party on the road: a file of little figures walking, led by a cart or a banner
+    let n = 3u + u32(round(size * 4.0));
+    if (slot >= n) { return p; }
+    p.on = true;
+    p.heading = health;
+    let step = f32(slot) - f32(n - 1u) * 0.5;
+    p.offset = along(p.heading, -step * 0.0016, (jitter2 - 0.5) * 0.0012);
+    p.hw = 0.00045;
+    p.h = 0.0015;
+    p.roofH = 0.0005;
+    p.lift = 0.00015 * abs(sin(time * 9.0 + f32(slot) * 1.7 + jitter * 6.0));
+    if (flag == 0u) { p.wall = vec3f(0.5, 0.38, 0.25); p.roof = vec3f(0.78, 0.65, 0.4); }
+    else if (flag == 1u) { p.wall = tint * 0.8; p.roof = vec3f(0.75, 0.75, 0.78); }
+    else if (flag == 2u) { p.wall = vec3f(0.45, 0.42, 0.38); p.roof = vec3f(0.33, 0.29, 0.27); p.h = 0.0009; }
+    else { p.wall = vec3f(0.55, 0.45, 0.32); p.roof = tint; }
+    if (slot == 0u) {
+      if (flag == 1u) {
+        // the banner: a pole with the people's colours flying from it
+        p.hw = 0.0002; p.h = 0.0045; p.roofH = 0.0016; p.wall = vec3f(0.45, 0.35, 0.25); p.roof = tint; p.lift = 0.0;
+      } else if (flag != 2u) {
+        // a cart or a wagon leads the way
+        p.hw = 0.0007; p.stretch = 1.7; p.h = 0.001; p.roofH = 0.0007; p.lift = 0.0001;
+        p.roof = select(vec3f(0.75, 0.6, 0.35), mix(vec3f(0.9, 0.88, 0.8), tint, 0.3), flag == 3u);
+      }
+    }
+    return p;
+  }
+
+  if (kind == 6u) {
+    // a dam: a stone wall across the river in short stretches, from the bed up to its crest
+    // (tech carries the crest height); the stretches buried in the banks are not drawn
+    let crest = tech;
+    let n = 9u;
+    if (slot >= n) { return p; }
+    p.heading = health;
+    let cell = C.world.w / C.params.x;
+    let step = (2.0 * ${DAM_HALF}) / f32(n);
+    p.offset = along(p.heading, (f32(slot) - f32(n - 1u) * 0.5) * step, 0.0);
+    let at = clamp(m.xy + p.offset / C.world.w, vec2f(0.0), vec2f(0.9999));
+    let j = ixn(i32(at.x * C.params.x), i32(at.y * C.params.x), i32(C.params.x));
+    // the bank is higher than the crest here: nothing to build
+    if (ground[j].x > crest - 0.0008) { return p; }
+    p.on = true;
+    p.absolute = true;
+    p.hw = cell * 1.4;
+    p.stretch = (step * 0.5) / p.hw;
+    p.base = crest - ${DAM_HEIGHT} - 0.002;
+    p.h = ${DAM_HEIGHT} + 0.003;
+    p.roofH = 0.00005;
+    p.wall = vec3f(0.47, 0.45, 0.42);
+    p.roof = vec3f(0.6, 0.58, 0.54);
+    return p;
+  }
+  return p;
+}
+
+fn gone(out: ptr<function, LifeOut>) {
+  (*out).pos = vec4f(0.0, 0.0, 2.0, 1.0);
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> LifeOut {
+  let m = markers[inst * 2u];
+  let extra = markers[inst * 2u + 1u];
+  let kind = u32(m.z + 0.5);
+  let slot = vi / 36u;
+  let k = vi % 36u;
+  var out: LifeOut;
+  out.alpha = 1.0;
+
+  if (kind == 2u) {
+    // a battle: a flat eight-pointed burst, the first 24 vertices
+    if (vi >= 24u) { gone(&out); return out; }
+    let t = f32(vi / 3u);
+    let c = vi % 3u;
+    let r = (0.012 + 0.008 * (1.0 - m.w)) / C.world.w;
+    let a0 = t * 0.785398;
+    let a1 = a0 + 0.392699;
+    var p = vec2f(0.0);
+    if (c == 1u) { p = vec2f(cos(a0), sin(a0)) * r; }
+    if (c == 2u) { p = vec2f(cos(a1), sin(a1)) * r * 0.45; }
+    let uv = m.xy + p;
+    let world = worldPos(uv, surfaceAt(clamp(uv, vec2f(0.0), vec2f(1.0))) + 0.0015);
+    out.pos = C.viewProj * vec4f(world, 1.0);
+    out.world = world;
+    out.color = mix(vec3f(1.0, 0.25, 0.1), vec3f(1.0, 0.8, 0.3), select(0.0, 1.0, c == 0u));
+    out.alpha = 0.85 * m.w;
+    return out;
+  }
+
+  let p = piece(kind, slot, m, extra, inst);
+  if (!p.on) { gone(&out); return out; }
+  if (p.noRoof && k >= 24u) { gone(&out); return out; }
+
+  let center = m.xy + p.offset / C.world.w;
+  let base = select(surfaceAt(clamp(center, vec2f(0.0), vec2f(1.0))) + p.lift, p.base, p.absolute);
+  let hw = p.hw;
+  let h = p.h;
+
+  var local = vec3f(0.0);
+  var normal = vec3f(0.0, 1.0, 0.0);
+  var roof = false;
+  if (k < 24u) {
+    // wall f between corners f and f+1
+    let f = k / 6u;
+    let q = QUAD[k % 6u];
+    let c0 = CORNER[f];
+    let c1 = CORNER[(f + 1u) % 4u];
+    let at = select(c0, c1, q == 1u || q == 2u);
+    let up = select(0.0, h, q == 2u || q == 3u);
+    local = vec3f(at.x * hw * p.stretch, up, at.y * hw);
+    let edge = c1 - c0;
+    normal = normalize(vec3f(edge.y, 0.0, -edge.x));
+  } else {
+    roof = true;
+    let t = (k - 24u) / 3u;
+    let c = (k - 24u) % 3u;
+    var c0 = CORNER[t] * vec2f(hw * p.stretch, hw) * 1.15;
+    var c1 = CORNER[(t + 1u) % 4u] * vec2f(hw * p.stretch, hw) * 1.15;
+    if (kind == 4u) {
+      // the sail: a narrow pyramid amidships
+      c0 = CORNER[t] * vec2f(hw * 0.9, hw * 0.25);
+      c1 = CORNER[(t + 1u) % 4u] * vec2f(hw * 0.9, hw * 0.25);
+    }
+    if (c == 0u) { local = vec3f(c0.x, h, c0.y); }
+    else if (c == 1u) { local = vec3f(c1.x, h, c1.y); }
+    else { local = vec3f(0.0, h + p.roofH, 0.0); }
+    let e = c1 - c0;
+    // a flat roof is lit as one face, not as four
+    normal = select(normalize(vec3f(e.y, length(e) * 0.8, -e.x)), vec3f(0.0, 1.0, 0.0), p.roofH < 0.00015);
+  }
+  if (p.heading != 0.0) {
+    // turned to its heading (window v runs the other way from world z)
+    let ch = cos(p.heading);
+    let sh = sin(p.heading);
+    local = vec3f(local.x * ch + local.z * sh, local.y, -local.x * sh + local.z * ch);
+    normal = vec3f(normal.x * ch + normal.z * sh, normal.y, -normal.x * sh + normal.z * ch);
+  }
+  // the window's v runs the other way from world z
+  let world = worldPos(center, base) + vec3f(local.x, local.y, -local.z);
+  out.pos = C.viewProj * vec4f(world, 1.0);
+  out.world = world;
+
+  let color = select(p.wall, p.roof, roof) * (0.92 + 0.16 * hash2(inst * 3u, slot));
+  let sunLit = max(dot(normal, normalize(C.light.xyz)), 0.0);
+  let shade = 0.45 + 0.55 * sunLit;
+  out.color = color * shade;
+  out.alpha = p.alpha;
+  return out;
+}
+
+@fragment
+fn fs(in: LifeOut) -> @location(0) vec4f {
+  let lit = aerial(in.color * lightColor() * mix(0.5, 1.0, C.sun.w), in.world);
+  return vec4f(finish(lit), in.alpha);
+}
+`
+
+// Roads and routes: each segment is a thin strip of ROAD_PIECES quads laid on the terrain
+// between two towns (dirt, then paved as the people learns), golden and dashed for a trade
+// route between peoples, and a faint wake line for a sea route. A piece over open water is
+// not drawn (the river is forded; the sea is sailed).
+export const ROAD_PIECES = 16
+export const ROAD_VERTICES = ROAD_PIECES * 6
+export const roadShader = common + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+// per segment: (a.uv, b.uv), (kind: 0 dirt road, 1 paved road, 2 trade route, 3 sea route; 0, 0, 0)
+@group(0) @binding(3) var<storage, read> roads: array<vec4f>;
+
+fn ixn(x: i32, y: i32, n: i32) -> u32 {
+  return u32(clamp(y, 0, n - 1) * n + clamp(x, 0, n - 1));
+}
+fn cellOf(uv: vec2f) -> u32 {
+  let n = i32(C.params.x);
+  let p = vec2i(floor(clamp(uv, vec2f(0.0), vec2f(0.9999)) * f32(n)));
+  return ixn(p.x, p.y, n);
+}
+
+struct RoadOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec3f,
+  @location(1) world: vec3f,
+  @location(2) alpha: f32,
+  @location(3) along: f32,
+  @location(4) @interpolate(flat) kind: f32,
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> RoadOut {
+  let seg = roads[inst * 2u];
+  let info = roads[inst * 2u + 1u];
+  let kind = u32(info.x + 0.5);
+  let piece = vi / 6u;
+  let q = vi % 6u;
+  // corners: (t0, -1), (t1, -1), (t1, 1), (t0, -1), (t1, 1), (t0, 1)
+  let atEnd = q == 1u || q == 2u || q == 4u;
+  let side = select(-1.0, 1.0, q == 2u || q == 4u || q == 5u);
+  let t = (f32(piece) + select(0.0, 1.0, atEnd)) / ${ROAD_PIECES}.0;
+  let a = seg.xy;
+  let b = seg.zw;
+  let d = b - a;
+  let len = max(length(d), 0.00001);
+  let dir = d / len;
+  let nrm = vec2f(-dir.y, dir.x);
+  var width = 0.0009;
+  if (kind == 1u) { width = 0.0012; }
+  if (kind == 3u) { width = 0.0022; }
+  let uv = a + d * t + nrm * (width / C.world.w) * side;
+  let j = cellOf(uv);
+  let depth = water[j].x;
+  var out: RoadOut;
+  // roads stop at open water; sea routes show only on it
+  let wet = depth > 0.0015;
+  if ((kind != 3u && wet) || (kind == 3u && !wet)) {
+    out.pos = vec4f(0.0, 0.0, 2.0, 1.0);
+    return out;
+  }
+  let world = worldPos(uv, ground[j].x + depth + select(0.0005, 0.0002, kind == 3u));
+  out.pos = C.viewProj * vec4f(world, 1.0);
+  out.world = world;
+  out.along = t * len * C.world.w;
+  out.kind = f32(kind);
+  if (kind == 0u) { out.color = vec3f(0.42, 0.33, 0.22); out.alpha = 0.8; }
+  else if (kind == 1u) { out.color = vec3f(0.4, 0.39, 0.37); out.alpha = 0.9; }
+  else if (kind == 2u) { out.color = vec3f(0.8, 0.65, 0.3); out.alpha = 0.9; }
+  else { out.color = vec3f(0.85, 0.92, 1.0); out.alpha = 0.35; }
+  return out;
+}
+
+@fragment
+fn fs(in: RoadOut) -> @location(0) vec4f {
+  var alpha = in.alpha;
+  // trade and sea routes are dashed
+  if (in.kind > 1.5) {
+    let dash = fract(in.along * 150.0);
+    alpha *= smoothstep(0.35, 0.45, dash);
+  }
+  let lit = aerial(in.color * lightColor() * mix(0.6, 1.0, C.sun.w), in.world);
+  return vec4f(finish(lit), alpha);
+}
+`
+
+// The political map: one quad per cell of a grid over the window, laid on the terrain,
+// filled with the owner's colour. Edges with a different owner are drawn as a border, in
+// red and pulsing where the two are at war.
+export const territoryShader = common + civPalette + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read> water: array<vec4f>;
+// per cell: 0 nobody; else owner colour + 1 in the low 4 bits, bits 4.. one per colour at war with
+@group(0) @binding(3) var<storage, read> owners: array<u32>;
+
+const T = ${TERRITORY_N};
+
+fn ixn(x: i32, y: i32, n: i32) -> u32 {
+  return u32(clamp(y, 0, n - 1) * n + clamp(x, 0, n - 1));
+}
+fn surfaceAt(uv: vec2f) -> f32 {
+  let n = i32(C.params.x);
+  let p = vec2i(floor(uv * f32(n)));
+  let j = ixn(p.x, p.y, n);
+  return ground[j].x + water[j].x;
+}
+fn ownerAt(x: i32, y: i32) -> u32 {
+  if (x < 0 || y < 0 || x >= T || y >= T) { return 0u; }
+  return owners[u32(y * T + x)];
+}
+
+struct TerrOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec3f,
+  @location(1) local: vec2f,
+  // per edge (left, right, top, bottom): 0 inside, 1 border, 2 war front
+  @location(2) @interpolate(flat) edges: vec4f,
+  @location(3) world: vec3f,
+}
+
+const QUAD = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(0.0, 1.0));
+
+fn edgeKind(mine: u32, other: u32) -> f32 {
+  let me = mine & 15u;
+  let it = other & 15u;
+  if (it == me) { return 0.0; }
+  if (it != 0u && ((mine >> (4u + it - 1u)) & 1u) == 1u) { return 2.0; }
+  return 1.0;
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> TerrOut {
+  var out: TerrOut;
+  let cell = owners[inst];
+  if ((cell & 15u) == 0u) {
+    out.pos = vec4f(0.0, 0.0, 2.0, 1.0);
+    return out;
+  }
+  let x = i32(inst % u32(T));
+  let y = i32(inst / u32(T));
+  let q = QUAD[vi];
+  let uv = (vec2f(f32(x), f32(y)) + q) / f32(T);
+  let world = worldPos(uv, surfaceAt(clamp(uv, vec2f(0.0), vec2f(0.9999))) + 0.0006);
+  out.pos = C.viewProj * vec4f(world, 1.0);
+  out.world = world;
+  out.local = q;
+  out.color = CIV_PALETTE[(cell & 15u) - 1u];
+  out.edges = vec4f(
+    edgeKind(cell, ownerAt(x - 1, y)),
+    edgeKind(cell, ownerAt(x + 1, y)),
+    edgeKind(cell, ownerAt(x, y - 1)),
+    edgeKind(cell, ownerAt(x, y + 1)),
+  );
+  return out;
+}
+
+@fragment
+fn fs(in: TerrOut) -> @location(0) vec4f {
+  // distance to the nearest edge that is a border, and that border's kind
+  var d = 1.0;
+  var kind = 0.0;
+  let dl = in.local.x;
+  let dr = 1.0 - in.local.x;
+  let dt = in.local.y;
+  let db = 1.0 - in.local.y;
+  if (in.edges.x > 0.0 && dl < d) { d = dl; kind = in.edges.x; }
+  if (in.edges.y > 0.0 && dr < d) { d = dr; kind = in.edges.y; }
+  if (in.edges.z > 0.0 && dt < d) { d = dt; kind = in.edges.z; }
+  if (in.edges.w > 0.0 && db < d) { d = db; kind = in.edges.w; }
+  // on the peoples' map the territories are painted solid; otherwise a tint over the land
+  let strong = abs(C.params.z - 11.0) < 0.5;
+  var color = in.color;
+  var alpha = select(0.26, 0.6, strong);
+  if (kind > 0.0) {
+    let width = select(select(0.22, 0.16, strong), 0.4, kind > 1.5);
+    let line = 1.0 - smoothstep(width * 0.6, width, d);
+    if (kind > 1.5) {
+      let pulse = 0.6 + 0.4 * sin(C.params.w * 4.0);
+      color = mix(color, vec3f(1.0, 0.12, 0.08), line);
+      alpha = mix(alpha, 0.95 * pulse, line);
+    } else {
+      color = mix(color, color * select(0.45, 0.3, strong), line);
+      alpha = mix(alpha, select(0.8, 1.0, strong), line);
+    }
+  }
+  if (strong) {
+    // on the atlas the colours are flat, whatever the hour
+    return vec4f(finish(atlasFade(color, in.world)), alpha);
+  }
+  let lit = aerial(color * lightColor() * mix(0.6, 1.0, C.sun.w), in.world);
+  return vec4f(finish(lit), alpha);
+}
+`
+
+// 3D clouds: a slab of cloud over the window, ray-marched. The slab's box is drawn and
+// each pixel on its far side marches the view ray through the slab. The simulated
+// humidity and rain give the cover; drifting noise shapes it into cumulus: columns with a
+// flat base and bumpy tops, taller and denser the thicker the cover. Each lit sample looks
+// a few steps towards the sun to shade the undersides (Beer's law), with the sky lighting
+// the rest, and a forward-scattering glow when looking towards the sun. The march starts
+// at a dithered offset per pixel (interleaved gradient noise), so there are no slices from
+// any angle and no visible grain.
+export const CLOUD_STEPS = 24
 export const cloudShader = common + /* wgsl */ `
 @group(0) @binding(1) var<storage, read> climate: array<vec4f>;
 @group(0) @binding(2) var<storage, read> air: array<vec4f>;
+@group(0) @binding(3) var<storage, read> ground: array<vec4f>;
+@group(0) @binding(4) var<storage, read> water: array<vec4f>;
 
 const BASE = 0.1;
-const DEPTH = 0.15;
+const DEPTH = 0.08;
+// the cloud base rides over the terrain: this much above the ground where the ground is
+// higher than BASE, so clouds climb a range instead of passing through it
+const OVER_GROUND = 0.012;
+// how far above BASE + DEPTH the slab's box reaches, for the clouds over the high ground
+const RANGE = 0.16;
+// optical depth of the whole slab crossed straight up through a solid cloud
+const EXTINCTION = 8.0;
+// steps towards the light to shade a sample, and how far apart (in slab depths)
+const LIGHT_STEPS = 3;
+const LIGHT_STEP = 0.3;
 
 fn ixn(x: i32, y: i32, n: i32) -> u32 {
   return u32(clamp(y, 0, n - 1) * n + clamp(x, 0, n - 1));
@@ -722,7 +1519,32 @@ fn coverage(uv: vec2f) -> f32 {
   let i11 = ixn(b.x + 1, b.y + 1, n);
   let rh = mix(mix(climate[i00].y, climate[i10].y, f.x), mix(climate[i01].y, climate[i11].y, f.x), f.y);
   let rain = mix(mix(air[i00].y, air[i10].y, f.x), mix(air[i01].y, air[i11].y, f.x), f.y);
-  return clamp(smoothstep(0.7, 1.05, rh) + smoothstep(0.0005, 0.004, rain) * 0.6, 0.0, 1.0);
+  // (thinning out towards the edge of the window, where the slab ends)
+  let inset = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  return clamp(smoothstep(0.72, 1.05, rh) + smoothstep(0.0005, 0.004, rain) * 0.6, 0.0, 1.0) * smoothstep(0.0, 0.05, inset);
+}
+fn surfaceAt(uv: vec2f) -> f32 {
+  let n = i32(C.params.x);
+  let p = vec2i(floor(uv * f32(n)));
+  let j = ixn(p.x, p.y, n);
+  return ground[j].x + water[j].x;
+}
+// the terrain under a point, smoothly (bilinear), for the cloud base
+fn surfaceSmooth(uv: vec2f) -> f32 {
+  let n = i32(C.params.x);
+  let t = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(n) - 0.5;
+  let b = vec2i(floor(t));
+  let f = fract(t);
+  let i00 = ixn(b.x, b.y, n);
+  let i10 = ixn(b.x + 1, b.y, n);
+  let i01 = ixn(b.x, b.y + 1, n);
+  let i11 = ixn(b.x + 1, b.y + 1, n);
+  return mix(mix(ground[i00].x + water[i00].x, ground[i10].x + water[i10].x, f.x),
+             mix(ground[i01].x + water[i01].x, ground[i11].x + water[i11].x, f.x), f.y);
+}
+// where the cloud layer starts over a place: BASE, lifted over the high ground
+fn baseAt(uv: vec2f) -> f32 {
+  return max(BASE, surfaceSmooth(uv) + OVER_GROUND);
 }
 ` + /* wgsl */ `
 fn hash3(p: vec3f) -> f32 { return fract(sin(dot(p, vec3f(127.1, 311.7, 74.7))) * 43758.5453); }
@@ -735,48 +1557,156 @@ fn valueNoise(p: vec3f) -> f32 {
     mix(mix(hash3(i + vec3f(0.0, 0.0, 1.0)), hash3(i + vec3f(1.0, 0.0, 1.0)), u.x), mix(hash3(i + vec3f(0.0, 1.0, 1.0)), hash3(i + vec3f(1.0, 1.0, 1.0)), u.x), u.y),
     u.z);
 }
-fn fbm(p: vec3f) -> f32 {
-  return valueNoise(p) * 0.55 + valueNoise(p * 2.03) * 0.3 + valueNoise(p * 4.1) * 0.15;
+// billowy noise: four octaves for the shape, two for the shading samples
+fn fbm(p: vec3f, detail: bool) -> f32 {
+  var v = valueNoise(p) * 0.5 + valueNoise(p * 2.07 + 11.0) * 0.25;
+  if (detail) { v += valueNoise(p * 4.13 + 23.0) * 0.125 + valueNoise(p * 8.31 + 37.0) * 0.0625; } else { v *= 1.25; }
+  return v / 0.9375;
+}
+// dithered start of the march (an ordered 4×4 pattern: fine and even, unlike random grain)
+fn dither(p: vec2f) -> f32 {
+  var m = array<f32, 16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+  let q = vec2u(p) % 4u;
+  return (m[q.y * 4u + q.x] + 0.5) / 16.0;
 }
 
 struct CloudOut {
   @builtin(position) pos: vec4f,
-  @location(0) uv: vec2f,
-  @location(1) world: vec3f,
-  @location(2) layer: f32,
+  @location(0) world: vec3f,
 }
 
+// The slab's box: 12 triangles over the window, from BASE to BASE + DEPTH + RANGE.
 @vertex
-fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> CloudOut {
-  let corners = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0));
-  let N = ${CLOUD_SLICES}u;
-  // far to near: bottom first when looking down from above the clouds
-  var k = inst;
-  if (C.eye.y < BASE + DEPTH * 0.5) { k = N - 1u - inst; }
-  let layer = (f32(k) + 0.5) / f32(N);
-  let uv = corners[vi];
-  let world = worldPos(uv, BASE + layer * DEPTH);
+fn vs(@builtin(vertex_index) vi: u32) -> CloudOut {
+  let corners = array<vec3f, 8>(
+    vec3f(0.0, 0.0, 0.0), vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(1.0, 1.0, 0.0),
+    vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 1.0), vec3f(0.0, 1.0, 1.0), vec3f(1.0, 1.0, 1.0));
+  let faces = array<u32, 36>(
+    0u, 1u, 2u, 2u, 1u, 3u,  4u, 6u, 5u, 5u, 6u, 7u,
+    0u, 4u, 1u, 1u, 4u, 5u,  2u, 3u, 6u, 6u, 3u, 7u,
+    0u, 2u, 4u, 4u, 2u, 6u,  1u, 5u, 3u, 3u, 5u, 7u);
+  let c = corners[faces[vi]];
+  let world = worldPos(c.xy, BASE + c.z * (DEPTH + RANGE));
   var out: CloudOut;
   out.pos = C.viewProj * vec4f(world, 1.0);
-  out.uv = uv;
   out.world = world;
-  out.layer = layer;
   return out;
+}
+
+// Window uv of a world position (the inverse of worldPos).
+fn uvOfWorld(p: vec3f) -> vec2f {
+  return vec2f(p.x / C.world.w - C.world.x + 0.5, 0.5 - C.world.y - p.z / C.world.w);
+}
+
+// Cloud density (0 – 1) at a world point under the given cover. Cumulus: the cover
+// decides how much of the noise is cloud and how tall the columns grow; each column's
+// top varies with its own noise, the base is flat.
+fn density(p: vec3f, cov: f32, detail: bool) -> f32 {
+  let uv = uvOfWorld(p);
+  let layer = (p.y - baseAt(uv)) / DEPTH;
+  let drift = vec3f(C.clouds.xy * 5.0, C.clouds.z * 0.002);
+  // wider than tall: the noise is stretched sideways
+  let q = vec3f((uv + C.world.xy) * C.world.w * 5.0, layer * 1.2) + drift;
+  let column = valueNoise(vec3f(q.xy * 0.6, 3.7));
+  let top = (0.35 + 0.5 * cov) * (0.65 + 0.35 * column);
+  let profile = smoothstep(0.0, 0.12, layer) * (1.0 - smoothstep(top - 0.45, top, layer));
+  if (profile <= 0.0) { return 0.0; }
+  let n = fbm(q, detail);
+  // (even under full cover the noise keeps gaps and bumps in the blanket)
+  let threshold = 0.9 - 0.45 * cov;
+  return smoothstep(threshold, threshold + 0.3, n) * profile;
+}
+
+// How much of the light reaches a point: a couple of coarse samples towards the light
+// (under the same cover: it changes little over that distance).
+fn lit(p: vec3f, dir: vec3f, cov: f32) -> f32 {
+  var depth = 0.0;
+  for (var k = 1; k <= LIGHT_STEPS; k++) {
+    let q = p + dir * (LIGHT_STEP * DEPTH * f32(k));
+    let b = baseAt(uvOfWorld(q));
+    if (q.y > b + DEPTH || q.y < b) { break; }
+    depth += density(q, cov, false);
+  }
+  return exp(-depth * LIGHT_STEP * EXTINCTION * 0.6);
 }
 
 @fragment
 fn fs(in: CloudOut) -> @location(0) vec4f {
-  let cov = coverage(in.uv);
-  if (cov <= 0.01) { discard; }
-  let top = 0.15 + 0.85 * cov;
-  let profile = smoothstep(0.0, 0.12, in.layer) * (1.0 - smoothstep(top - 0.2, top, in.layer));
-  let p = vec3f(((in.uv + C.world.xy) * C.world.w + C.clouds.xy) * 9.0, in.layer * 2.5 + C.clouds.z * 0.003);
-  let density = clamp((fbm(p) + cov * 0.9 - 0.95) * 3.0, 0.0, 1.0) * profile;
-  if (density <= 0.0) { discard; }
-  let height = in.layer / max(top, 0.01);
-  let shade = mix(0.45, 1.05, height) * (1.0 - 0.35 * cov * (1.0 - height));
-  let color = aerial(vec3f(shade) * lightColor(), in.world);
-  return vec4f(finish(color), density * 0.3);
+  let eye = C.eye.xyz;
+  let ray = in.world - eye;
+  let far = length(ray);
+  let dir = ray / far;
+  // where the ray enters and leaves the slab (the box around the window)
+  let lo = vec3f((C.world.x - 0.5) * C.world.w, BASE, (-0.5 - C.world.y) * C.world.w);
+  let hi = vec3f((C.world.x + 0.5) * C.world.w, BASE + DEPTH + RANGE, (0.5 - C.world.y) * C.world.w);
+  let inv = 1.0 / dir;
+  let t0 = (lo - eye) * inv;
+  let t1 = (hi - eye) * inv;
+  let tn = min(t0, t1);
+  let tf = max(t0, t1);
+  let enter = max(max(tn.x, tn.y), max(tn.z, 0.0));
+  let leave = min(min(tf.x, tf.y), tf.z);
+  // only the face where the ray leaves marches (the entry face would do it again)
+  if (leave <= enter || far < leave - 0.0005 * C.world.w) { discard; }
+  // coarse steps through clear air (no longer than straight down through the slab takes,
+  // so a ray crossing it at a low angle samples the noise as finely), four times finer
+  // inside a cloud, stepping back on entering one so its edge lands where it should
+  let n = clamp(i32((leave - enter) / (DEPTH / ${CLOUD_STEPS}.0)), ${CLOUD_STEPS}, ${CLOUD_STEPS * 4});
+  let dt = (leave - enter) / f32(n);
+  let fine = dt * 0.25;
+  var t = enter + dither(in.pos.xy) * dt;
+  // the light: the sun (or the moon), and its colour; a glow towards it
+  let lightDir = normalize(C.light.xyz);
+  let towards = max(dot(dir, lightDir), 0.0);
+  let glow = 1.0 + 1.5 * pow(towards, 6.0);
+  let sun = lightColor();
+  // the sky lights the clouds from above, the ground a little from below
+  let skyLight = pow(skyColor(vec3f(0.0, 1.0, 0.0)), vec3f(1.8));
+  var color = vec3f(0.0);
+  var alpha = 0.0;
+  var inside = false;
+  var clear = 0;
+  // (the fine steps are limited; past that the march goes on coarsely)
+  for (var k = 0; k < n + 64; k++) {
+    if (t >= leave) { break; }
+    let p = eye + dir * t;
+    let uv = uvOfWorld(p);
+    // into a mountain: nothing beyond it shows
+    if (surfaceAt(clamp(uv, vec2f(0.0), vec2f(1.0))) > p.y) { break; }
+    // above or below the cloud layer here: stride on through the clear air
+    let b = baseAt(uv);
+    if (!inside && (p.y < b - 0.002 || p.y > b + DEPTH + 0.002)) { t += dt * 2.0; continue; }
+    let cov = coverage(uv);
+    var d = 0.0;
+    if (cov > 0.01) { d = density(p, cov, true); }
+    let step = select(dt, fine, inside && k < n + 60);
+    if (d > 0.002) {
+      if (!inside) {
+        inside = true;
+        clear = 0;
+        t -= dt * 0.75;
+        continue;
+      }
+      clear = 0;
+      let layer = (p.y - baseAt(uv)) / DEPTH;
+      var shade = 1.0;
+      if (d > 0.03) { shade = lit(p, lightDir, cov); }
+      // ambient: brighter towards the top of the cloud, dim at the base
+      let ambient = skyLight * mix(0.22, 0.55, layer);
+      let direct = sun * shade * glow * 0.6;
+      let sample = finish(aerial(ambient + direct, p));
+      let a = 1.0 - exp(-d * EXTINCTION * step / DEPTH);
+      color += (1.0 - alpha) * a * sample;
+      alpha += (1.0 - alpha) * a;
+      if (alpha > 0.97) { break; }
+    } else if (inside) {
+      clear++;
+      if (clear > 4) { inside = false; }
+    }
+    t += step;
+  }
+  if (alpha <= 0.002) { discard; }
+  return vec4f(color / alpha, alpha);
 }
 `
 
@@ -839,6 +1769,11 @@ fn fs(in: FarOut) -> @location(0) vec4f {
   let sea = C.far.y > 0.5 && in.height < C.far.x;
   let lat = clamp((in.uv.y + C.world.y) * C.world.w, -1.0, 2.0);
   let t = C.far.z - C.far.w * max(in.height, C.far.x) + C.far2.x * (0.5 - lat);
+  if (u32(C.params.z) == 11u) {
+    // the atlas goes on past the window
+    let paper = select(politicalLand(in.height, 0.0, select(0.0, 0.002, t < -1.0), in.normal), politicalWater(C.far.x - in.height), sea);
+    return vec4f(finish(atlasFade(paper, in.world)), 1.0);
+  }
   var color: vec3f;
   var normal = in.normal;
   if (sea) {

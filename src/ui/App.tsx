@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Engine, WebGPUUnavailableError, type WebGPUFailure } from '../engine/engine'
 import { Compass } from './Compass'
+import { EventCards } from './EventCards'
 import { PhotoBar } from './PhotoBar'
 import { ProbeCard } from './ProbeCard'
 import { SectionView } from './SectionView'
@@ -71,6 +72,7 @@ function Interface({ engine }: { engine: Engine }) {
       <Toolbar engine={engine} />
       <StatusChip engine={engine} />
       <ProbeCard engine={engine} />
+      <EventCards engine={engine} />
       <Toast engine={engine} />
       <HelpOverlay engine={engine} />
       {welcome && <Welcome engine={engine} first={welcome === 'first'} onClose={closeWelcome} />}

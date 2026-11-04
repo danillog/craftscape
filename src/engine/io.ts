@@ -3,17 +3,21 @@ import { STATE_KEYS, type SimState, type StateKey } from './simulation'
 
 // .craftscape file: gzip( "CSCP" | u32 version | u32 size | f32 seed | ground | water | waterLast | extra | climate | air | lava
 //                        | i32 originX | i32 originY | u32 regionCount | regionCount × (i32 tx | i32 ty | 7 arrays)
-//                        | f32 area | f32 continents | f32 continentScale | f32 offset | f32 relief )
+//                        | f32 area | f32 continents | f32 continentScale | f32 offset | f32 relief
+//                        | fine: size² × f32 | f32 plateTime )
 // Regions are the visited parts of the infinite world outside the window, (size/4)² cells each.
 // The area is the window's width in world units; the shape is how new regions are generated.
 // Older versions stop earlier (v1 after extra, v2 after air, v3 after lava, v4 after the
 // regions); they load at the world origin with a neutral climate, no lava, area 1 and the
-// classic terrain shape.
+// classic terrain shape. v6 has the same layout, but waterLast holds the water flux
+// through the cell faces (see waterFluxShader). v7 adds the fine sediment in suspension
+// (one float per window cell) after the trailer; the regions keep none. v8 adds the plate
+// time (how far the plates have drifted, see plates.ts) after the fine sediment.
 const MAGIC = 0x50435343 // "CSCP" little-endian
-const VERSION = 5
+const VERSION = 8
 const HEADER_BYTES = 16
 const ARRAYS = STATE_KEYS
-const ARRAYS_IN_VERSION: Record<number, number> = { 1: 4, 2: 6, 3: 7, 4: 7, 5: 7 }
+const ARRAYS_IN_VERSION: Record<number, number> = { 1: 4, 2: 6, 3: 7, 4: 7, 5: 7, 6: 7, 7: 7, 8: 7 }
 const TRAILER_BYTES = 20
 const CLASSIC_SHAPE: TerrainShape = { continents: 0, continentScale: 0.55, offset: 0, relief: 1 }
 
@@ -41,19 +45,22 @@ export interface SavedTerrain {
   /** Window width in world units. */
   area: number
   shape: TerrainShape
+  /** Plate time (see plates.ts); 0 in files from before v8. */
+  plateTime: number
 }
 
 async function pipeThrough(data: BlobPart, stream: CompressionStream | DecompressionStream): Promise<ArrayBuffer> {
   return new Response(new Blob([data]).stream().pipeThrough(stream)).arrayBuffer()
 }
 
-export async function encodeTerrain({ state, seed, origin, regions, area, shape }: SavedTerrain): Promise<Blob> {
+export async function encodeTerrain({ state, seed, origin, regions, area, shape, plateTime }: SavedTerrain): Promise<Blob> {
   const floats = state.size * state.size * 4
   const regionFloats = (state.size / 4) ** 2 * 4
   const windowBytes = HEADER_BYTES + floats * 4 * ARRAYS.length
   const regionBytes = 8 + regionFloats * 4 * ARRAYS.length
   const trailerAt = windowBytes + 12 + regions.length * regionBytes
-  const buffer = new ArrayBuffer(trailerAt + TRAILER_BYTES)
+  const cells = state.size * state.size
+  const buffer = new ArrayBuffer(trailerAt + TRAILER_BYTES + cells * 4 + 4)
   const header = new DataView(buffer)
   header.setUint32(0, MAGIC, true)
   header.setUint32(4, VERSION, true)
@@ -76,6 +83,8 @@ export async function encodeTerrain({ state, seed, origin, regions, area, shape 
     shape.offset,
     shape.relief,
   ])
+  if (state.fine) new Float32Array(buffer, trailerAt + TRAILER_BYTES, cells).set(state.fine)
+  header.setFloat32(trailerAt + TRAILER_BYTES + cells * 4, plateTime, true)
   return new Blob([await pipeThrough(buffer, new CompressionStream('gzip'))], { type: 'application/octet-stream' })
 }
 
@@ -92,7 +101,7 @@ export async function decodeTerrain(file: Blob): Promise<SavedTerrain> {
   const size = header.getUint32(8, true)
   const floats = size * size * 4
   const arrays = ARRAYS_IN_VERSION[version]
-  if (size < 256 || size > 1024 || size % 64 !== 0 || buffer.byteLength < HEADER_BYTES + floats * 4 * arrays) {
+  if (size < 256 || size > 2048 || size % 64 !== 0 || buffer.byteLength < HEADER_BYTES + floats * 4 * arrays) {
     throw new Error('Arquivo de terreno corrompido.')
   }
   const read = (k: number) =>
@@ -103,6 +112,7 @@ export async function decodeTerrain(file: Blob): Promise<SavedTerrain> {
   const regions: SavedRegion[] = []
   let area = 1
   let shape = CLASSIC_SHAPE
+  let plateTime = 0
   const windowBytes = HEADER_BYTES + floats * 4 * arrays
   if (version >= 4 && buffer.byteLength >= windowBytes + 12) {
     origin[0] = header.getInt32(windowBytes, true)
@@ -127,9 +137,21 @@ export async function decodeTerrain(file: Blob): Promise<SavedTerrain> {
       )
       area = a > 0 ? a : 1
       shape = { continents, continentScale, offset, relief }
+      const fineAt = trailerAt + TRAILER_BYTES
+      if (version >= 7 && buffer.byteLength >= fineAt + size * size * 4) {
+        state.fine = new Float32Array(buffer.slice(fineAt, fineAt + size * size * 4))
+      }
+      const plateAt = fineAt + size * size * 4
+      if (version >= 8 && buffer.byteLength >= plateAt + 4) plateTime = header.getFloat32(plateAt, true)
     }
   }
-  return { seed: header.getFloat32(12, true), state, origin, regions, area, shape }
+  // before v6 the water flowed by another method, which kept something else in waterLast
+  // (now the flux through each cell's faces): the water starts again from rest
+  if (version < 6) {
+    state.waterLast.fill(0)
+    for (const [, , data] of regions) data.waterLast.fill(0)
+  }
+  return { seed: header.getFloat32(12, true), state, origin, regions, area, shape, plateTime }
 }
 
 /** Grayscale image → rock heights in roughly the range of the generated terrain. */
@@ -161,8 +183,8 @@ export async function heightmapToState(file: Blob, size: number): Promise<SimSta
 export function resampleState(state: SimState, size: number): SimState {
   if (state.size === size) return state
   const src = state.size
-  const resample = (data: Float32Array) => {
-    const out = new Float32Array(size * size * 4)
+  const resample = (data: Float32Array, channels = 4) => {
+    const out = new Float32Array(size * size * channels)
     for (let y = 0; y < size; y++) {
       const fy = Math.min(Math.max(((y + 0.5) / size) * src - 0.5, 0), src - 1)
       const y0 = Math.floor(fy)
@@ -173,10 +195,10 @@ export function resampleState(state: SimState, size: number): SimState {
         const x0 = Math.floor(fx)
         const x1 = Math.min(x0 + 1, src - 1)
         const tx = fx - x0
-        for (let c = 0; c < 4; c++) {
-          const a = data[(y0 * src + x0) * 4 + c] * (1 - tx) + data[(y0 * src + x1) * 4 + c] * tx
-          const b = data[(y1 * src + x0) * 4 + c] * (1 - tx) + data[(y1 * src + x1) * 4 + c] * tx
-          out[(y * size + x) * 4 + c] = a * (1 - ty) + b * ty
+        for (let c = 0; c < channels; c++) {
+          const a = data[(y0 * src + x0) * channels + c] * (1 - tx) + data[(y0 * src + x1) * channels + c] * tx
+          const b = data[(y1 * src + x0) * channels + c] * (1 - tx) + data[(y1 * src + x1) * channels + c] * tx
+          out[(y * size + x) * channels + c] = a * (1 - ty) + b * ty
         }
       }
     }
@@ -184,6 +206,7 @@ export function resampleState(state: SimState, size: number): SimState {
   }
   const out = { size } as SimState
   for (const key of ARRAYS) out[key] = resample(state[key])
+  if (state.fine) out.fine = resample(state.fine, 1)
   return out
 }
 

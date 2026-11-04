@@ -15,6 +15,9 @@ export interface InputHandlers {
   /** Centers the view on the terrain under the cursor. */
   focus(): void
   selectTool(tool: Tool): void
+  /** B held: steps the world back in time, one snapshot per call; released: done. */
+  rewind(): void
+  rewindEnd(): void
   toggleMode(): void
   toggleHelp(): void
   /** Escape: closes the shortcut sheet, or leaves photo mode. */
@@ -96,6 +99,16 @@ export class Input {
     })
   }
 
+  /** A paint press began since the last frame (it may be over already: a quick click at a low frame rate). */
+  private pressLatched = false
+
+  /** Whether a paint press began since the last call; cleared by the call. */
+  takePress() {
+    const pressed = this.pressLatched
+    this.pressLatched = false
+    return pressed
+  }
+
   /** Space held over the terrain, or a pointer dragging in paint mode. */
   get painting() {
     if (this.spaceHeld && this.cursor) return true
@@ -129,6 +142,7 @@ export class Input {
     if (e.button === 1 || e.button === 2 || (e.button === 0 && e.shiftKey && !this.handlers.paintOnClick()))
       mode = 'pan'
     else if (this.handlers.paintOnClick()) mode = 'paint'
+    if (mode === 'paint') this.pressLatched = true
     this.pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, mode, touch })
     if (this.pointers.size === 2) {
       // second finger: switch both to a camera gesture
@@ -192,6 +206,11 @@ export class Input {
     if (ARROWS.includes(e.code)) e.preventDefault() // don't scroll the panel or move sliders
     if (down) this.keys.add(e.code)
     else this.keys.delete(e.code)
+    if (e.code === 'KeyB' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (down) this.handlers.rewind()
+      else this.handlers.rewindEnd()
+      return
+    }
     if (!down || e.repeat) return
     if (e.code === 'Escape') {
       this.handlers.closeHelp()
@@ -213,7 +232,13 @@ export class Input {
     else if (e.code === 'KeyF') this.handlers.focus()
     else if (e.code === 'KeyX') this.handlers.toggleMode()
     else if (e.code === 'KeyK') this.handlers.togglePhoto()
-    else if (e.code === 'KeyU') this.handlers.selectTool('uplift')
+    else if (e.code === 'KeyU') this.handlers.selectTool('plates')
+    else if (e.code === 'KeyM') this.handlers.selectTool('airmass')
+    else if (e.code === 'KeyO') this.handlers.selectTool('current')
+    else if (e.code === 'KeyT') this.handlers.selectTool('storm')
+    else if (e.code === 'KeyI') this.handlers.selectTool('meteor')
+    else if (e.code === 'KeyJ') this.handlers.selectTool('sun')
+    else if (e.code === 'KeyN') this.handlers.selectTool('drought')
     else if (e.code === 'Digit0' || e.code === 'Numpad0') this.handlers.selectTool('inspect')
     else if (TOOL_KEYS[e.code]) this.handlers.selectTool(TOOL_KEYS[e.code])
   }

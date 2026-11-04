@@ -1,0 +1,562 @@
+/* The 2D game's interface: the map fills the window, glass panels float over it. */
+
+.app2d {
+  position: fixed;
+  inset: 0;
+  user-select: none;
+  background: #0b1a2a;
+}
+
+.app2d .map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.app2d .glass {
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+
+.app2d .topbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 14px;
+  z-index: 20;
+}
+
+.app2d .topbar .spacer {
+  flex: 1;
+}
+
+.app2d .topbar .fps {
+  font-size: 0.75rem;
+  min-width: 46px;
+  text-align: right;
+}
+
+.app2d .speeds {
+  display: flex;
+  gap: 4px;
+}
+
+.app2d .speeds button,
+.app2d .topbar > button,
+.app2d .topbar .button {
+  padding: 5px 10px;
+  font-size: 0.85rem;
+  border-radius: 9px;
+  color: var(--text);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--control);
+  border: 1px solid var(--glass-border);
+}
+
+.app2d .speeds button.active,
+.app2d button.active {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.app2d .powers {
+  position: absolute;
+  left: 12px;
+  top: 66px;
+  width: 232px;
+  padding: 10px;
+  border-radius: 16px;
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.app2d .group {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 12px 4px 4px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.app2d .group-name {
+  position: absolute;
+  top: 0;
+  left: 8px;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.app2d .group-bencao .group-name {
+  color: #8fd6a4;
+}
+
+.app2d .group-praga .group-name {
+  color: #ff9a7a;
+}
+
+.app2d .tool {
+  position: relative;
+  width: 46px;
+  height: 42px;
+  padding: 0;
+  border-radius: 10px;
+  color: var(--text-soft);
+}
+
+.app2d .tool kbd {
+  position: absolute;
+  right: 4px;
+  bottom: 2px;
+  font-size: 0.55rem;
+  color: var(--muted);
+  font-family: inherit;
+}
+
+.app2d .tool.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+.app2d .tool-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 2px 0;
+  font-size: 0.85rem;
+}
+
+.app2d .mode-switch {
+  display: flex;
+  gap: 4px;
+}
+
+.app2d .mode-switch button {
+  width: 36px;
+  height: 28px;
+  padding: 0;
+  font-size: 1rem;
+}
+
+.app2d .mini-slider,
+.app2d .slider {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+
+.app2d .slider span {
+  display: flex;
+  justify-content: space-between;
+}
+
+.app2d .slider em {
+  font-style: normal;
+  color: var(--muted);
+}
+
+.app2d input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.app2d .hint {
+  margin: 0;
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.app2d .tabs {
+  position: absolute;
+  right: 12px;
+  top: 66px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 14px;
+  z-index: 16;
+}
+
+.app2d .tabs button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 56px;
+  padding: 8px 4px;
+  font-size: 0.7rem;
+  border-radius: 10px;
+}
+
+.app2d .panel {
+  position: absolute;
+  right: 80px;
+  top: 66px;
+  bottom: 16px;
+  width: 320px;
+  border-radius: 16px;
+  z-index: 15;
+  overflow-y: auto;
+}
+
+.app2d .panel-body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.app2d .panel-body h2 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+.app2d .toggle,
+.app2d .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.app2d .row span {
+  flex: 1;
+}
+
+.app2d .row input,
+.app2d .row select {
+  width: 120px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  background: var(--control);
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+}
+
+.app2d .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex: none;
+  display: inline-block;
+}
+
+.app2d .civs,
+.app2d .chronicle,
+.app2d .bars {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.8rem;
+}
+
+.app2d .civs li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: center;
+}
+
+.app2d .civs li .small {
+  grid-column: 2;
+  font-size: 0.72rem;
+}
+
+.app2d .civs.wars li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.app2d .chronicle {
+  max-height: 260px;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.app2d .chronicle li {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.app2d .chronicle li .swatch {
+  margin-top: 4px;
+}
+
+.app2d .chronicle li span:nth-child(2) {
+  flex: 1;
+}
+
+.app2d .chronicle li.major {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.app2d button.icon.tiny {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  flex: none;
+}
+
+.app2d .bars li {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.app2d .bar {
+  position: relative;
+  display: block;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--control);
+  overflow: hidden;
+}
+
+.app2d .bar .fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent-strong);
+  opacity: 0.6;
+}
+
+.app2d .bar .label {
+  position: absolute;
+  inset: 0;
+  font-size: 0.66rem;
+  line-height: 14px;
+  text-align: center;
+}
+
+.app2d .town-card {
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--control);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.app2d .town-card header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app2d .event-cards {
+  position: absolute;
+  left: 12px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+  width: min(340px, calc(100% - 24px));
+  z-index: 18;
+}
+
+.app2d .event-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+.app2d .event-card .swatch {
+  margin-top: 4px;
+}
+
+.app2d .event-card .text {
+  flex: 1;
+}
+
+.app2d .event-card.major {
+  border-color: rgba(255, 220, 140, 0.45);
+  font-weight: 600;
+}
+
+.app2d .event-card button.icon {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: none;
+}
+
+.app2d .tile-card {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  z-index: 17;
+  pointer-events: none;
+  max-width: min(560px, calc(100% - 400px));
+}
+
+.app2d .tile-card .town {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.app2d .toast {
+  position: absolute;
+  top: 66px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(520px, calc(100% - 24px));
+  padding: 8px 8px 8px 16px;
+  background: rgb(58 42 16 / 0.92);
+  border: 1px solid #8a6420;
+  border-radius: 14px;
+  z-index: 45;
+}
+
+.app2d .toast button.icon {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+
+.app2d .muted {
+  color: var(--muted);
+}
+
+.app2d [data-tip] {
+  position: relative;
+}
+
+.app2d [data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #0a0f16;
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+  font-size: 0.76rem;
+  font-weight: 450;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 60;
+}
+
+.app2d .topbar [data-tip]::after {
+  left: 50%;
+  top: calc(100% + 8px);
+  transform: translateX(-50%);
+}
+
+.app2d [data-tip]:hover::after {
+  opacity: 1;
+  transition-delay: 0.35s;
+}
+
+/* The map tab: the mode chips, the colour ramps and the legends. */
+.app2d .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.app2d .chips button {
+  padding: 5px 9px;
+  font-size: 0.78rem;
+  border-radius: 8px;
+}
+
+.app2d .ramp {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 2px 0;
+}
+
+.app2d .ramp .bar {
+  display: block;
+  height: 10px;
+  border-radius: 5px;
+  border: 1px solid var(--glass-border);
+}
+
+.app2d .ramp .ends {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.app2d .legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+  font-size: 0.78rem;
+}
+
+.app2d .legend.single {
+  grid-template-columns: 1fr;
+}
+
+.app2d .legend li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.app2d button.wide {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 9px;
+  font-size: 0.82rem;
+}

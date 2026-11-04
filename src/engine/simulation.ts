@@ -7,6 +7,7 @@ import {
   SIM_UNIFORM_SIZE,
   farShader,
   shiftShader,
+  shiftScalarShader,
   airShader,
   erodeShader,
   flowsShader,
@@ -17,20 +18,34 @@ import {
   changeShader,
   paintShader,
   pickShader,
+  platesShader,
+  quakeShader,
+  impactShader,
+  shockShader,
+  ventShader,
+  worksShader,
+  MAX_PLATE_OVERRIDES,
+  MAX_DUSTS,
+  MAX_HIGHS,
+  MAX_STORMS,
   sedimentShader,
   settleShader,
   shadowShader,
   waterCycleShader,
   waterDiffuseXShader,
   waterDiffuseYShader,
+  waterDepthShader,
   waterFlowShader,
+  waterFluxShader,
   waterMomentumShader,
   waterNormalsShader,
+  upperShader,
   windForceShader,
   windPressureShader,
   windProjectShader,
   WATER_FLOW_TILE,
 } from './shaders/sim'
+import { MAX_WORKS, type Work } from './life'
 
 export interface Brush {
   active: boolean
@@ -51,8 +66,82 @@ export interface Brush {
   volcano: number
   /** Pressure brush: raises the weather pressure (a high) or, negative, lowers it (a low). */
   pressure: number
-  /** Tectonic brush: marks zones that keep rising (negative: sinking). */
-  uplift: number
+  /** Air-mass brush: warms the air near the ground into a warm mass or, negative, cools it into a cold one. */
+  airMass: number
+  /** Fixed air-mass brush: paints a source that keeps the air warm or, negative, cold for good. */
+  airSource: number
+  /** Clears every fixed air-mass source in the window this frame. */
+  clearAirSources: boolean
+  /** Ocean-current brush: warms (or, negative, cools) the sea it paints, and the air over it. */
+  current: number
+}
+
+/** A meteor strike to run this frame (see impactShader). */
+export interface Impact {
+  uv: [number, number]
+  /** Crater radius in world units. */
+  radius: number
+  /** Crater depth in height units. */
+  depth: number
+}
+
+/** A storm (the storm tool): a deep low held open while it lives. */
+export interface Storm {
+  uv: [number, number]
+  /** 0–1: how deep the low is held right now. */
+  strength: number
+  /** Radius in window uv. */
+  radius: number
+}
+
+/** A dust cloud left by a strike: it shades and cools the region under it while it settles. */
+/** A natural volcano waking up or going quiet this frame (see ventShader). */
+export interface Vent {
+  uv: [number, number]
+  /** Radius in window uv. */
+  radius: number
+  /** Change of the vent's strength: + opens, − plugs. */
+  delta: number
+}
+
+export interface Dust {
+  uv: [number, number]
+  /** °C kept off the ground at its centre. */
+  cooling: number
+  /** Radius in window uv. */
+  radius: number
+}
+
+/** A fixed high (the drought power): no rain under it while it stands. */
+export interface High {
+  uv: [number, number]
+  /** 0–1: how hard it is held. */
+  strength: number
+  /** Radius in window uv. */
+  radius: number
+}
+
+/** A plate whose motion was changed: its grid cell (see plates.ts) and new velocity. */
+export interface PlateOverride {
+  cell: [number, number]
+  velocity: [number, number]
+  /** How far it had drifted when its motion was changed (world units), and the plate time then. */
+  from: [number, number]
+  at: number
+}
+
+/** An earthquake to run this frame (see quakeShader). */
+export interface Quake {
+  /** Epicentre in window uv. */
+  uv: [number, number]
+  /** Direction across the fault, in radians (world x/y). */
+  normal: number
+  /** Radius in world units. */
+  radius: number
+  /** Fault throw: positive raises the far side, negative drops a strip; 0 only shakes. */
+  slip: number
+  /** Rock shaken loose into rubble on steep slopes, at the epicentre. */
+  rubble: number
 }
 
 export interface Climate {
@@ -108,6 +197,19 @@ export interface SimParams {
   extent: number
   /** Geological time: multiplies erosion, weathering and tectonic uplift. */
   geologicTime: number
+  /** Plate time: how far a plate of unit speed has drifted (world units). */
+  plateTime: number
+  /** A meteor strike this frame. */
+  impact: Impact | null
+  /** The storms alive (at most MAX_STORMS are used). */
+  storms: Storm[]
+  /** Dust clouds from strikes (at most MAX_DUSTS are used). */
+  dusts: Dust[]
+  /** The fixed highs standing (at most MAX_HIGHS are used). */
+  highs: High[]
+  plates: PlateOverride[]
+  quake: Quake | null
+  vent: Vent | null
 }
 
 /** The persistent simulation state, as plain arrays (for files, undo and resampling). */
@@ -120,6 +222,8 @@ export interface SimState {
   climate: Float32Array
   air: Float32Array
   lava: Float32Array
+  /** Silt and clay in suspension, one float per cell; absent (clear water) in older files. */
+  fine?: Float32Array
 }
 
 const WG = 8
@@ -132,6 +236,24 @@ const WORLD_OFFSET = 208 // byte offsets of Sim.world and Sim.rect in the unifor
 const RECT_OFFSET = 224
 const SHAPE_OFFSET = 240
 const GEO_OFFSET = 256
+const PLATES_OFFSET = 272
+const QUAKE_OFFSET = PLATES_OFFSET + MAX_PLATE_OVERRIDES * 32
+const SOURCE_OFFSET = QUAKE_OFFSET + 32
+const IMPACT_OFFSET = SOURCE_OFFSET + 16
+const STORMS_OFFSET = IMPACT_OFFSET + 16
+const DUSTS_OFFSET = STORMS_OFFSET + MAX_STORMS * 16
+const HIGHS_OFFSET = DUSTS_OFFSET + MAX_DUSTS * 16
+const VENT_OFFSET = HIGHS_OFFSET + MAX_HIGHS * 16
+
+/**
+ * Geological time runs the ground passes (sediment, weathering, slumping, uplift) several
+ * times per step, each at a rate the slopes can still keep up with; multiplying the rates
+ * alone made erosion and deposition outrun the slumping that smooths them, and spikes and
+ * pits popped up everywhere.
+ */
+export function geologicSubsteps(geologicTime: number) {
+  return Math.max(1, Math.ceil(geologicTime / 3))
+}
 
 export class Simulation {
   readonly size: number
@@ -141,12 +263,37 @@ export class Simulation {
   derivedSlices: (typeof DERIVED_SLICES)[number] = 4
   /** Multirate: the atmosphere (air pass) runs once every climateEvery steps, scaled to cover them. */
   climateEvery = 1
+  /** Multirate: at 1× the ground passes (sediment, weathering, slumping) run every groundEvery steps, at that much the rate. */
+  groundEvery = 2
+  /** The ground passes' stride this frame (groundEvery at 1×, every step in geological time). */
+  private groundStride = 1
   /**
    * Runs the water flow as three plain passes instead of the fused workgroup-memory
    * kernel; much faster when the GPU is emulated on the CPU, slower on real GPUs.
    */
   splitFlow = false
+  /**
+   * How water flows: 'inertial' solves the local inertial shallow water equations on the
+   * cell faces; 'classic' is the original diffusion + momentum heuristic (kept to compare).
+   * The two keep different things in waterLast, so switching clears it.
+   */
+  get waterMethod() {
+    return this.method
+  }
+  set waterMethod(m: 'inertial' | 'classic') {
+    if (m === this.method) return
+    this.method = m
+    const enc = this.device.createCommandEncoder()
+    enc.clearBuffer(this.waterLast)
+    this.device.queue.submit([enc.finish()])
+  }
+  private method: 'inertial' | 'classic' = 'inertial'
   private steps = 0
+  /** Ground substeps per step (geological time), set with the params each frame. */
+  private geoSubsteps = 1
+  /** The plate uplift is worked out every few frames, or on the next one when this is set. */
+  platesDirty = true
+  private derivedFrames = 0
 
   readonly ground: GPUBuffer
   readonly water: GPUBuffer
@@ -156,9 +303,15 @@ export class Simulation {
   readonly air: GPUBuffer
   /** Wind field at flowSize² (see windForceShader). */
   readonly wind: GPUBuffer
+  /** Upper atmosphere at flowSize² (see upperShader), and its ping-pong copy. */
+  readonly upper: GPUBuffer
+  private readonly upperTmp: GPUBuffer
   readonly lava: GPUBuffer
   /** Heights of the distant terrain around the window (FAR_GRID², 32 texels per window). */
   readonly far: GPUBuffer
+  /** The peoples' works for this frame (see writeWorks). */
+  readonly works: GPUBuffer
+  private readonly worksData = new Float32Array(4 + MAX_WORKS * 8)
   readonly normals: GPUBuffer
   readonly wnormals: GPUBuffer
   readonly shadow: GPUBuffer
@@ -189,6 +342,7 @@ export class Simulation {
   private readonly shiftParams: GPUBuffer[]
   private readonly shiftGroups: { bindGroup: GPUBindGroup; scratch: GPUBuffer; target: GPUBuffer; low: boolean }[] = []
   private shiftPipeline!: GPUComputePipeline
+  private shiftFine!: { pipeline: GPUComputePipeline; bindGroup: GPUBindGroup }
   private readonly device: GPUDevice
 
   constructor(device: GPUDevice, size: number) {
@@ -213,6 +367,7 @@ export class Simulation {
     this.lava = vec4Buffer('lava')
     this.lavaTmp = vec4Buffer('lavaTmp')
     this.far = device.createBuffer({ label: 'far', size: FAR_GRID * FAR_GRID * 4, usage: storage })
+    this.works = device.createBuffer({ label: 'works', size: this.worksData.byteLength, usage: storage })
     this.shiftParams = [this.size, this.flowSize].map((n) => {
       const buffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
       device.queue.writeBuffer(buffer, 0, new Uint32Array([n, 0, 0, 0]))
@@ -222,6 +377,8 @@ export class Simulation {
       device.createBuffer({ label, size: this.flowSize * this.flowSize * 16, usage: storage })
     this.wind = windBuffer('wind')
     this.windTmp = windBuffer('windTmp')
+    this.upper = windBuffer('upper')
+    this.upperTmp = windBuffer('upperTmp')
     this.normals = vec4Buffer('normals')
     this.wnormals = vec4Buffer('waterNormals')
     // x terrain shadow, y water shadow, z height change since the reference terrain
@@ -262,6 +419,8 @@ export class Simulation {
     add('activity', activityShader, [this.water, this.lava, this.tilesRaw, this.fine])
     add('activityGrow', activityGrowShader, [this.tilesRaw, this.tiles])
     add('flow', waterFlowShader, [this.ground, this.water, this.waterLast, this.waterTmp, this.tiles])
+    add('waterFlux', waterFluxShader, [this.ground, this.water, this.waterLast, this.waterTmp, this.tiles])
+    add('waterDepth', waterDepthShader, [this.waterTmp, this.water, this.waterLast, this.tiles])
     // split flow: groundTmp and extraTmp are free until the erode pass, so they hold the intermediates
     add('diffuseY', waterDiffuseYShader, [this.ground, this.tiles, this.water, this.groundTmp])
     add('diffuseX', waterDiffuseXShader, [this.ground, this.tiles, this.groundTmp, this.extraTmp])
@@ -269,7 +428,8 @@ export class Simulation {
     add('windForce', windForceShader, [this.ground, this.wind, this.windTmp, this.water, this.air, this.climate])
     add('windPressureA', windPressureShader, [this.windTmp, this.wind])
     add('windPressureB', windPressureShader, [this.wind, this.windTmp])
-    add('windProject', windProjectShader, [this.windTmp, this.wind])
+    add('windProject', windProjectShader, [this.windTmp, this.wind, this.upper])
+    add('upper', upperShader, [this.ground, this.water, this.air, this.upper, this.upperTmp, this.wind, this.airTmp, this.shadow])
     add('air', airShader, [
       this.ground,
       this.water,
@@ -323,6 +483,12 @@ export class Simulation {
       this.lava,
     ])
     add('paint', paintShader, [this.ground, this.extra, this.water, this.climate, this.air, this.lava])
+    add('plates', platesShader, [this.ground, this.lava])
+    add('quake', quakeShader, [this.ground, this.groundTmp])
+    add('impact', impactShader, [this.ground, this.groundTmp, this.extra, this.water, this.lava, this.air])
+    add('shock', shockShader, [this.wind])
+    add('vent', ventShader, [this.lava])
+    add('works', worksShader, [this.ground, this.groundTmp, this.extra, this.water, this.climate, this.works, this.air])
     add('normals', normalsShader, [this.ground, this.normals])
     add('waterNormals', waterNormalsShader, [this.ground, this.water, this.wnormals])
     const shadowBuffers = [this.ground, this.water, this.normals, this.wnormals, this.shadow]
@@ -355,7 +521,20 @@ export class Simulation {
         }),
       })
     for (const key of STATE_KEYS) shifted(this[key], this.groundTmp, false)
+    const shiftFine = device.createComputePipeline({
+      label: 'shift fine',
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ label: 'shift fine', code: shiftScalarShader }), entryPoint: 'main' },
+    })
+    this.shiftFine = {
+      pipeline: shiftFine,
+      bindGroup: device.createBindGroup({
+        layout: shiftFine.getBindGroupLayout(0),
+        entries: [this.shiftParams[0], this.fine, this.fineTmp].map((buffer, binding) => ({ binding, resource: { buffer } })),
+      }),
+    }
     shifted(this.wind, this.windTmp, true)
+    shifted(this.upper, this.upperTmp, true)
   }
 
   writeParams(p: SimParams, frame: number) {
@@ -366,8 +545,11 @@ export class Simulation {
     u32[2] = frame
     f32[4] = p.rain ? 1 : 0
     f32[5] = p.evaporate ? 1 : 0
-    // erosion runs faster in geological time (weathering and transport scale with this)
-    f32[6] = p.erode ? p.geologicTime : 0
+    // in geological time each ground substep runs this much faster (see geologicSubsteps)
+    this.geoSubsteps = geologicSubsteps(p.geologicTime)
+    this.groundStride = p.geologicTime === 1 ? this.groundEvery : 1
+    const rate = (p.geologicTime * this.groundStride) / this.geoSubsteps
+    f32[6] = p.erode ? rate : 0
     f32[7] = p.vegetation ? 1 : 0
     f32[8] = p.brush.uv[0]
     f32[9] = p.brush.uv[1]
@@ -396,7 +578,28 @@ export class Simulation {
     f32.set([p.origin[0], p.origin[1], c.automatic ? 1 : 0, p.extent], WORLD_OFFSET / 4)
     f32.set([0, 0, this.size, this.size], RECT_OFFSET / 4)
     f32.set([p.shape.continents, p.shape.offset, p.shape.relief, p.shape.continentScale], SHAPE_OFFSET / 4)
-    f32.set([p.geologicTime, p.brush.uplift, 0, 0], GEO_OFFSET / 4)
+    const plates = p.plates.slice(0, MAX_PLATE_OVERRIDES)
+    f32.set([rate, p.plateTime, plates.length, p.brush.airMass], GEO_OFFSET / 4)
+    plates.forEach((o, k) => f32.set([...o.cell, ...o.velocity, ...o.from, o.at, 0], PLATES_OFFSET / 4 + k * 8))
+    const q = p.quake
+    f32.set(q ? [q.uv[0], q.uv[1], q.normal, q.radius, q.slip, q.rubble, 1, 0] : [0, 0, 0, 1, 0, 0, 0, 0], QUAKE_OFFSET / 4)
+    f32.set([p.brush.airSource, p.brush.clearAirSources ? 1 : 0, p.brush.current, 0], SOURCE_OFFSET / 4)
+    const m = p.impact
+    f32.set(m ? [m.uv[0], m.uv[1], m.radius, m.depth] : [0, 0, 0, 0], IMPACT_OFFSET / 4)
+    for (let k = 0; k < MAX_STORMS; k++) {
+      const st = p.storms[k]
+      f32.set(st ? [st.uv[0], st.uv[1], st.strength, st.radius] : [0, 0, 0, 0], STORMS_OFFSET / 4 + k * 4)
+    }
+    for (let k = 0; k < MAX_DUSTS; k++) {
+      const d = p.dusts[k]
+      f32.set(d ? [d.uv[0], d.uv[1], d.cooling, d.radius] : [0, 0, 0, 0], DUSTS_OFFSET / 4 + k * 4)
+    }
+    for (let k = 0; k < MAX_HIGHS; k++) {
+      const h = p.highs[k]
+      f32.set(h ? [h.uv[0], h.uv[1], h.strength, h.radius] : [0, 0, 0, 0], HIGHS_OFFSET / 4 + k * 4)
+    }
+    const v = p.vent
+    f32.set(v ? [v.uv[0], v.uv[1], v.radius, v.delta] : [0, 0, 0, 0], VENT_OFFSET / 4)
     this.device.queue.writeBuffer(this.uniform, 0, this.uniformData)
   }
 
@@ -421,6 +624,8 @@ export class Simulation {
       this.airTmp,
       this.wind,
       this.windTmp,
+      this.upper,
+      this.upperTmp,
       this.lava,
       this.lavaTmp,
       this.flows,
@@ -469,8 +674,13 @@ export class Simulation {
       pass.end()
       enc.copyBufferToBuffer(scratch, 0, target, 0, n * n * 16)
     }
+    const fine = enc.beginComputePass({ label: 'shift fine' })
+    fine.setPipeline(this.shiftFine.pipeline)
+    fine.setBindGroup(0, this.shiftFine.bindGroup)
+    fine.dispatchWorkgroups(Math.ceil(this.size / WG), Math.ceil(this.size / WG))
+    fine.end()
+    enc.copyBufferToBuffer(this.fineTmp, 0, this.fine, 0, this.cells * 4)
     enc.clearBuffer(this.flows)
-    enc.clearBuffer(this.fine)
     this.encodeResetBaseline(enc)
     this.encodeDerived(enc, true)
   }
@@ -499,7 +709,14 @@ export class Simulation {
     // sparse: mark the tiles with water or lava, then skip the rest in those passes
     this.dispatch(pass, 'activity', this.size, this.size, ACTIVITY_TILE)
     this.dispatch(pass, 'activityGrow', this.tilesPerRow)
-    if (this.splitFlow) {
+    if (this.method === 'inertial') {
+      // faces, then depths (written back to water); the water cycle reads waterTmp
+      this.dispatch(pass, 'waterFlux')
+      this.dispatch(pass, 'waterDepth')
+      pass.end()
+      enc.copyBufferToBuffer(this.water, 0, this.waterTmp, 0, this.cells * 16)
+      pass = enc.beginComputePass({ label: 'step (after water)' })
+    } else if (this.splitFlow) {
       this.dispatch(pass, 'diffuseY')
       this.dispatch(pass, 'diffuseX')
       this.dispatch(pass, 'momentum')
@@ -512,7 +729,12 @@ export class Simulation {
     this.dispatch(pass, 'windProject', this.flowSize)
     // multirate: the slow atmosphere runs every climateEvery steps; in between the
     // water cycle keeps using its last precipitation (it reads airTmp, so copy it there)
-    if (this.steps++ % this.climateEvery === 0) {
+    // (the upper layer first: it trades air with the layer below, which the air pass then moves)
+    const step = this.steps++
+    const climateStep = step % this.climateEvery === 0
+    const groundStep = step % this.groundStride === 0
+    if (climateStep) {
+      this.dispatch(pass, 'upper', this.flowSize)
       this.dispatch(pass, 'air')
     } else {
       pass.end()
@@ -522,17 +744,74 @@ export class Simulation {
     this.dispatch(pass, 'cycle')
     this.dispatch(pass, 'flows', this.flowSize)
     this.dispatch(pass, 'lava')
-    this.dispatch(pass, 'sediment')
     pass.end()
     // the lava and sediment passes gather from their neighbours, so they write copies
     enc.copyBufferToBuffer(this.lavaTmp, 0, this.lava, 0, this.cells * 16)
+    if (climateStep) enc.copyBufferToBuffer(this.upperTmp, 0, this.upper, 0, this.flowSize * this.flowSize * 16)
+    // the ground: once (every groundStride steps at 1×), or in geological time several
+    // substeps against the same water
+    for (let k = 0; k < this.geoSubsteps && groundStep; k++) {
+      pass = enc.beginComputePass({ label: 'step (sediment)' })
+      this.dispatch(pass, 'sediment')
+      pass.end()
+      enc.copyBufferToBuffer(this.groundTmp, 0, this.ground, 0, this.cells * 16)
+      enc.copyBufferToBuffer(this.waterTmp, 0, this.water, 0, this.cells * 16)
+      enc.copyBufferToBuffer(this.fineTmp, 0, this.fine, 0, this.cells * 4)
+      pass = enc.beginComputePass({ label: 'step (ground)' })
+      this.dispatch(pass, 'erode')
+      this.dispatch(pass, 'settle')
+      pass.end()
+    }
+    if (paint) this.encodePaint(enc)
+  }
+
+  /** Works out the plate uplift (lava.w) again, e.g. after a plate's motion changed. */
+  encodePlates(enc: GPUCommandEncoder) {
+    const pass = enc.beginComputePass({ label: 'plates' })
+    this.dispatch(pass, 'plates')
+    pass.end()
+    this.platesDirty = false
+  }
+
+  /** The earthquake in this frame's params: the fault slips and the slopes shake. */
+  encodeQuake(enc: GPUCommandEncoder) {
+    const pass = enc.beginComputePass({ label: 'quake' })
+    this.dispatch(pass, 'quake')
+    pass.end()
     enc.copyBufferToBuffer(this.groundTmp, 0, this.ground, 0, this.cells * 16)
-    enc.copyBufferToBuffer(this.waterTmp, 0, this.water, 0, this.cells * 16)
-    enc.copyBufferToBuffer(this.fineTmp, 0, this.fine, 0, this.cells * 4)
-    pass = enc.beginComputePass({ label: 'step (ground)' })
-    this.dispatch(pass, 'erode')
-    this.dispatch(pass, 'settle')
-    if (paint) this.dispatch(pass, 'paint')
+  }
+
+  /** Hands the simulation the peoples' works to apply (see encodeWorks). */
+  writeWorks(works: Work[]) {
+    const list = works.slice(0, MAX_WORKS)
+    const d = this.worksData
+    d.fill(0)
+    d[0] = list.length
+    list.forEach((w, k) => d.set([w.uv[0], w.uv[1], w.radius, w.kind, w.strength, w.size, w.crest ?? 0, 0], 4 + k * 8))
+    this.device.queue.writeBuffer(this.works, 0, d)
+  }
+
+  /** Applies the works handed over by writeWorks to the land (one frame's worth). */
+  encodeWorks(enc: GPUCommandEncoder) {
+    const pass = enc.beginComputePass({ label: 'works' })
+    this.dispatch(pass, 'works')
+    pass.end()
+    enc.copyBufferToBuffer(this.groundTmp, 0, this.ground, 0, this.cells * 16)
+  }
+
+  /** The meteor strike in this frame's params: the crater is dug and the ground copied back. */
+  encodeImpact(enc: GPUCommandEncoder) {
+    const pass = enc.beginComputePass({ label: 'impact' })
+    this.dispatch(pass, 'impact')
+    this.dispatch(pass, 'shock', this.flowSize)
+    pass.end()
+    enc.copyBufferToBuffer(this.groundTmp, 0, this.ground, 0, this.cells * 16)
+  }
+
+  /** The volcano in this frame's params wakes up or goes quiet (see ventShader). */
+  encodeVent(enc: GPUCommandEncoder) {
+    const pass = enc.beginComputePass({ label: 'vent' })
+    this.dispatch(pass, 'vent')
     pass.end()
   }
 
@@ -548,6 +827,8 @@ export class Simulation {
    * 1/derivedSlices of their rows refresh per frame; `full` redoes everything (after a reset).
    */
   encodeDerived(enc: GPUCommandEncoder, full: boolean) {
+    // the plates only follow the rock height slowly (who dives under whom); every 8 frames does
+    if (full || this.platesDirty || this.derivedFrames++ % 8 === 0) this.encodePlates(enc)
     const pass = enc.beginComputePass({ label: 'derived' })
     this.dispatch(pass, 'normals')
     this.dispatch(pass, 'waterNormals')
@@ -599,7 +880,7 @@ export class Simulation {
   // ---- state snapshots (undo) -------------------------------------------------
 
   get snapshotBytes() {
-    return this.cells * 16 * STATE_KEYS.length
+    return this.cells * (16 * STATE_KEYS.length + 4)
   }
 
   encodeSnapshot(enc: GPUCommandEncoder): GPUBuffer {
@@ -609,13 +890,14 @@ export class Simulation {
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     })
     STATE_KEYS.forEach((key, k) => enc.copyBufferToBuffer(this[key], 0, snap, k * this.cells * 16, this.cells * 16))
+    enc.copyBufferToBuffer(this.fine, 0, snap, STATE_KEYS.length * this.cells * 16, this.cells * 4)
     return snap
   }
 
   encodeRestore(enc: GPUCommandEncoder, snap: GPUBuffer) {
     STATE_KEYS.forEach((key, k) => enc.copyBufferToBuffer(snap, k * this.cells * 16, this[key], 0, this.cells * 16))
+    enc.copyBufferToBuffer(snap, STATE_KEYS.length * this.cells * 16, this.fine, 0, this.cells * 4)
     enc.clearBuffer(this.flows)
-    enc.clearBuffer(this.fine)
     this.encodeResetBaseline(enc)
     this.encodeDerived(enc, true)
   }
@@ -633,10 +915,11 @@ export class Simulation {
   encodeReadState(enc: GPUCommandEncoder): () => Promise<SimState> {
     const bytes = this.cells * 16
     const staging = this.device.createBuffer({
-      size: bytes * STATE_KEYS.length,
+      size: bytes * STATE_KEYS.length + this.cells * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     })
     STATE_KEYS.forEach((key, k) => enc.copyBufferToBuffer(this[key], 0, staging, k * bytes, bytes))
+    enc.copyBufferToBuffer(this.fine, 0, staging, bytes * STATE_KEYS.length, this.cells * 4)
     return async () => {
       await staging.mapAsync(GPUMapMode.READ)
       const all = new Float32Array(staging.getMappedRange().slice(0))
@@ -644,6 +927,8 @@ export class Simulation {
       staging.destroy()
       const state = { size: this.size } as SimState
       STATE_KEYS.forEach((key, k) => (state[key] = all.slice((k * bytes) / 4, ((k + 1) * bytes) / 4)))
+      const fineAt = (bytes * STATE_KEYS.length) / 4
+      state.fine = all.slice(fineAt, fineAt + this.cells)
       return state
     }
   }
@@ -653,8 +938,9 @@ export class Simulation {
     const q = this.device.queue
     for (const key of STATE_KEYS) q.writeBuffer(this[key], 0, state[key] as Float32Array<ArrayBuffer>)
     const enc = this.device.createCommandEncoder()
+    if (state.fine) q.writeBuffer(this.fine, 0, state.fine as Float32Array<ArrayBuffer>)
+    else enc.clearBuffer(this.fine)
     enc.clearBuffer(this.flows)
-    enc.clearBuffer(this.fine)
     this.encodeResetBaseline(enc)
     this.encodeDerived(enc, true)
     q.submit([enc.finish()])
@@ -674,6 +960,8 @@ export class Simulation {
       this.airTmp,
       this.wind,
       this.windTmp,
+      this.upper,
+      this.upperTmp,
       this.lava,
       this.lavaTmp,
       this.far,

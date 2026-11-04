@@ -1,5 +1,7 @@
+import type { BoundaryKind } from '../engine/plates'
 import type { Engine } from '../engine/engine'
 import { METERS_PER_HEIGHT, climateOf, type Probe, type Settings } from '../engine/settings'
+import { CIV_COLORS } from '../engine/life'
 import { BIOMES, compass } from './constants'
 import { useProbe, useSettings } from './useEngine'
 
@@ -30,6 +32,14 @@ function groundLabel(p: Probe) {
   if (p.soil > 0.0002) return 'solo fino'
   return 'rocha exposta'
 }
+
+const BOUNDARY_LABELS: Record<BoundaryKind, string> = {
+  convergent: 'borda convergente (colisão)',
+  divergent: 'borda divergente (rifte)',
+  transform: 'falha transformante',
+}
+
+const civCss = (k: number) => `rgb(${CIV_COLORS[k].map((v) => Math.round(v * 255)).join(', ')})`
 
 function pressureLabel(v: number) {
   if (v < -0.6) return 'baixa forte'
@@ -64,6 +74,48 @@ export function ProbeCard({ engine }: { engine: Engine }) {
         <strong>{p.lava > 0.0002 ? 'Lava' : water && p.water > 0.01 ? 'Água' : biome}</strong>
         <span className="muted">{altitude(p, s)}</span>
       </header>
+      {p.town && (
+        <div className="probe-town">
+          <header>
+            <span className="swatch" style={{ background: civCss(p.town.color) }} />
+            <strong>Cidade de {p.town.civ}</strong>
+            <span className="muted">{p.town.people} pessoas</span>
+          </header>
+          <dl>
+            <dt>Estado</dt>
+            <dd>{p.town.status}</dd>
+            <dt>Comida</dt>
+            <dd>
+              {percent(p.town.needs.food)}
+              <span className="muted"> · umidade {percent(p.town.needs.moist)}</span>
+            </dd>
+            <dt>Clima</dt>
+            <dd>
+              {p.town.needs.hardship > 0.03 ? 'duro demais' : p.town.needs.demand > 0.05 ? 'exigente, aguentam' : 'ameno'}
+              <span className="muted">
+                {' '}
+                · tec. {percent(p.town.tech)} · adapt. {percent(p.town.adapt)}
+              </span>
+            </dd>
+            {(p.town.works.farms || p.town.works.dam || p.town.works.terraces || p.town.works.industry) && (
+              <>
+                <dt>Obras</dt>
+                <dd>
+                  {[
+                    p.town.works.farms && 'fazendas',
+                    p.town.works.dam && 'represa',
+                    p.town.works.terraces && 'terraplenagem',
+                    p.town.works.industry && 'indústria',
+                  ]
+                    .filter(Boolean)
+                    .join(', ')}
+                </dd>
+              </>
+            )}
+          </dl>
+          <p className="muted small">Clique para acompanhar na aba Vida.</p>
+        </div>
+      )}
       <dl>
         <dt>Temperatura</dt>
         <dd>{number(p.temperature, 1)} °C</dd>
@@ -92,16 +144,35 @@ export function ProbeCard({ engine }: { engine: Engine }) {
             </dd>
           </>
         )}
-        {Math.abs(p.tectonic) > 0.05 && (
+        <dt>Placa</dt>
+        <dd>
+          {compass(p.plate.direction)}
+          <span className="muted"> · {number(p.plate.speed * 100)}%</span>
+        </dd>
+        {(p.plate.boundary || Math.abs(p.tectonic) > 0.05) && (
           <>
             <dt>Tectônica</dt>
-            <dd>{p.tectonic > 0 ? 'soerguendo' : 'afundando'}</dd>
+            <dd>
+              {p.plate.boundary ? BOUNDARY_LABELS[p.plate.boundary] : 'perto de uma borda'}
+              {Math.abs(p.tectonic) > 0.05 && (
+                <span className="muted"> · {p.tectonic > 0 ? 'soerguendo' : 'afundando'}</span>
+              )}
+            </dd>
           </>
         )}
         {(p.lava > 0.0002 || p.vent > 0.05) && (
           <>
             <dt>Vulcão</dt>
             <dd>{p.lava > 0.0002 ? 'lava escorrendo' : 'cratera'}</dd>
+          </>
+        )}
+        {Math.abs(p.airSource) >= 0.05 && (
+          <>
+            <dt>Massa de ar</dt>
+            <dd>
+              fixa, {p.airSource > 0 ? 'quente' : 'fria'}
+              <span className="muted"> · {number(Math.abs(p.airSource) * 100)}%</span>
+            </dd>
           </>
         )}
       </dl>

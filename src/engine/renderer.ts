@@ -1,22 +1,33 @@
 import { mat4, type Mat4, type Vec3 } from './math'
 import {
   CAMERA_UNIFORM_SIZE,
-  CLOUD_SLICES,
+  MAX_PLATE_ARROWS,
+  LIFE_VERTICES,
+  MAX_LIFE,
+  ROAD_VERTICES,
+  lifeShader,
+  roadShader,
+  territoryShader,
   WIND_ARROW_GRID,
   cloudShader,
   farTerrainShader,
+  plateArrowShader,
   skyShader,
   terrainShader,
   waterShader,
   windArrowShader,
 } from './shaders/render'
-import { FAR_GRID } from './shaders/sim'
+import { FAR_GRID, MAX_PLATE_OVERRIDES } from './shaders/sim'
+import type { PlateField } from './plates'
+import { MAX_ROADS, TERRITORY_N, type LifeMarker, type RoadSegment } from './life'
 import type { SkyState } from './sky'
 import type { Overlay } from './settings'
 import type { Simulation } from './simulation'
 import { loadTexture } from './textures'
 
 const CHUNK_CELLS = 64
+/** Marker kinds in the order the life shader numbers them. */
+const LIFE_KINDS: LifeMarker['kind'][] = ['herd', 'village', 'battle', 'ruin', 'boat', 'party', 'dam']
 const LOD_LEVELS = 4 // vertex strides 1, 2, 4, 8
 const OVERLAYS: Overlay[] = [
   'none',
@@ -28,6 +39,10 @@ const OVERLAYS: Overlay[] = [
   'erosion',
   'change',
   'rivers',
+  'plates',
+  'airmass',
+  'civilization',
+  'current',
 ]
 
 export interface View {
@@ -37,9 +52,24 @@ export interface View {
   fovY: number
 }
 
+/** A plate's drift arrow: its site in window uv and its velocity (world units, speed ≤ ~1). */
+export interface PlateArrow {
+  uv: [number, number]
+  velocity: [number, number]
+  selected: boolean
+}
+
 export interface SceneOptions {
   overlay: Overlay
   arrows: boolean
+  /** Plate drift arrows to draw (empty: none). */
+  plateArrows: PlateArrow[]
+  /** Herds, towns and battles to draw (empty: none). */
+  life: LifeMarker[]
+  /** Roads and routes between towns, in window uv. */
+  roads: RoadSegment[]
+  /** The political map over the window (TERRITORY_N² owner cells), or null for none. */
+  territory: Uint32Array<ArrayBuffer> | null
   clouds: boolean
   sky: SkyState
   /** How far the cloud pattern has drifted, in terrain units. */
@@ -53,6 +83,10 @@ export interface SceneOptions {
   extent: number
   /** Terrain seed (the rock strata depend on it). */
   seed: number
+  /** Point of the year, 0–1 from the start of spring; −1 without seasons. */
+  seasonPhase: number
+  /** The plates as they are now (for the plate map). */
+  plates: PlateField
   /** For colouring the distant terrain: sea level (or null without a sea), temperature at height 0, °C per height, °C north–south per window. */
   farClimate: { seaLevel: number | null; baseTemperature: number; lapseRate: number; latitude: number }
 }
@@ -68,13 +102,18 @@ interface LodRange {
   indexCount: number
 }
 
+interface ChunkMesh {
+  buffer: GPUBuffer
+  lods: LodRange[]
+}
+
 export class Renderer {
   private readonly device: GPUDevice
   private readonly context: GPUCanvasContext
   private readonly uniform: GPUBuffer
   private readonly uniformData = new Float32Array(CAMERA_UNIFORM_SIZE / 4)
-  private readonly indexBuffer: GPUBuffer
-  private readonly lods: LodRange[] = []
+  /** Index buffers per chunk size (see chunkCells), one range per LOD. */
+  private readonly chunkMeshes = new Map<number, ChunkMesh>()
   private readonly chunkList: GPUBuffer
   private readonly terrainLayout: GPUBindGroupLayout
   private readonly waterLayout: GPUBindGroupLayout
@@ -85,6 +124,21 @@ export class Renderer {
   private readonly skyBindGroup: GPUBindGroup
   private readonly arrowPipeline: GPURenderPipeline
   private arrowBindGroup: GPUBindGroup | null = null
+  private readonly plateArrowPipeline: GPURenderPipeline
+  private plateArrowBindGroup: GPUBindGroup | null = null
+  private readonly plateArrowBuffer: GPUBuffer
+  private readonly plateArrowData = new Float32Array(MAX_PLATE_ARROWS * 8)
+  private readonly lifePipeline: GPURenderPipeline
+  private lifeBindGroup: GPUBindGroup | null = null
+  private readonly lifeBuffer: GPUBuffer
+  private readonly lifeData = new Float32Array(MAX_LIFE * 8)
+  private readonly territoryPipeline: GPURenderPipeline
+  private territoryBindGroup: GPUBindGroup | null = null
+  private readonly territoryBuffer: GPUBuffer
+  private readonly roadPipeline: GPURenderPipeline
+  private roadBindGroup: GPUBindGroup | null = null
+  private readonly roadBuffer: GPUBuffer
+  private readonly roadData = new Float32Array(MAX_ROADS * 8)
   private readonly farPipeline: GPURenderPipeline
   /** Distant terrain index buffers: every vertex, and every other one. */
   private readonly farMeshes: { buffer: GPUBuffer; count: number }[]
@@ -119,7 +173,7 @@ export class Renderer {
       size: 4 * 16 * 16 * LOD_LEVELS,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
-    this.indexBuffer = this.buildIndices()
+    for (const cells of [CHUNK_CELLS, CHUNK_CELLS * 2]) this.chunkMeshes.set(cells, this.buildIndices(cells))
 
     const V = GPUShaderStage.VERTEX
     const F = GPUShaderStage.FRAGMENT
@@ -191,26 +245,53 @@ export class Renderer {
       fragment: { module: skyModule, entryPoint: 'fs', targets: [{ format }] },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
     })
-    const arrowModule = device.createShaderModule({ label: 'windArrows', code: windArrowShader })
-    this.arrowPipeline = device.createRenderPipeline({
-      label: 'windArrows',
-      layout: 'auto',
-      vertex: { module: arrowModule, entryPoint: 'vs' },
-      fragment: {
-        module: arrowModule,
-        entryPoint: 'fs',
-        targets: [
-          {
-            format,
-            blend: {
-              color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    const arrows = (label: string, code: string, solid = false) => {
+      const module = device.createShaderModule({ label, code })
+      return device.createRenderPipeline({
+        label,
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs' },
+        fragment: {
+          module,
+          entryPoint: 'fs',
+          targets: [
+            {
+              format,
+              blend: {
+                color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+                alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+              },
             },
-          },
-        ],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less-equal' },
+          ],
+        },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+        depthStencil: { format: 'depth24plus', depthWriteEnabled: solid, depthCompare: 'less-equal' },
+      })
+    }
+    this.arrowPipeline = arrows('windArrows', windArrowShader)
+    this.plateArrowPipeline = arrows('plateArrows', plateArrowShader)
+    this.plateArrowBuffer = device.createBuffer({
+      label: 'plateArrows',
+      size: this.plateArrowData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.lifePipeline = arrows('life', lifeShader, true)
+    this.territoryPipeline = arrows('territory', territoryShader)
+    this.territoryBuffer = device.createBuffer({
+      label: 'territory',
+      size: TERRITORY_N * TERRITORY_N * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.lifeBuffer = device.createBuffer({
+      label: 'life',
+      size: this.lifeData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    })
+    this.roadPipeline = arrows('roads', roadShader)
+    this.roadBuffer = device.createBuffer({
+      label: 'roads',
+      size: this.roadData.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     })
     const farModule = device.createShaderModule({ label: 'far terrain', code: farTerrainShader })
     this.farPipeline = device.createRenderPipeline({
@@ -315,7 +396,7 @@ export class Renderer {
       sim.climate,
       sim.fine,
     ])
-    this.cloudBindGroup = group(this.cloudPipeline.getBindGroupLayout(0), [sim.climate, sim.air])
+    this.cloudBindGroup = group(this.cloudPipeline.getBindGroupLayout(0), [sim.climate, sim.air, sim.ground, sim.water])
     this.farBindGroup = group(this.farPipeline.getBindGroupLayout(0), [sim.far, sim.ground])
     this.arrowBindGroup = this.device.createBindGroup({
       layout: this.arrowPipeline.getBindGroupLayout(0),
@@ -324,15 +405,27 @@ export class Renderer {
         resource: { buffer },
       })),
     })
+    this.plateArrowBindGroup = group(this.plateArrowPipeline.getBindGroupLayout(0), [
+      sim.ground,
+      sim.water,
+      this.plateArrowBuffer,
+    ])
+    this.lifeBindGroup = group(this.lifePipeline.getBindGroupLayout(0), [sim.ground, sim.water, this.lifeBuffer])
+    this.roadBindGroup = group(this.roadPipeline.getBindGroupLayout(0), [sim.ground, sim.water, this.roadBuffer])
+    this.territoryBindGroup = group(this.territoryPipeline.getBindGroupLayout(0), [
+      sim.ground,
+      sim.water,
+      this.territoryBuffer,
+    ])
   }
 
   // One index range per LOD: the (C+1)² vertex grid of a chunk at stride s.
   // Cracks between chunks of different LOD are closed in the vertex shader, which
   // snaps edge vertices onto the coarser neighbour's edge.
-  private buildIndices(): GPUBuffer {
-    const C = CHUNK_CELLS
+  private buildIndices(C: number): ChunkMesh {
     const side = C + 1
     const indices: number[] = []
+    const lods: LodRange[] = []
     for (let level = 0; level < LOD_LEVELS; level++) {
       const s = 1 << level
       const firstIndex = indices.length
@@ -345,7 +438,7 @@ export class Renderer {
           indices.push(v00, v10, v01, v10, v11, v01)
         }
       }
-      this.lods.push({ firstIndex, indexCount: indices.length - firstIndex })
+      lods.push({ firstIndex, indexCount: indices.length - firstIndex })
     }
     const data = new Uint16Array(indices.length + (indices.length % 2))
     data.set(indices)
@@ -355,7 +448,15 @@ export class Renderer {
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
     })
     this.device.queue.writeBuffer(buffer, 0, data)
-    return buffer
+    return { buffer, lods }
+  }
+
+  /**
+   * Cells per chunk side: 64, doubled past 1024² (1536², 2048²) so there are never more
+   * than 16×16 chunks (the chunk id gets 8 bits in a chunk-list entry).
+   */
+  private get chunkCells() {
+    return this.sim!.size > 1024 ? CHUNK_CELLS * 2 : CHUNK_CELLS
   }
 
   resize(width: number, height: number) {
@@ -372,7 +473,7 @@ export class Renderer {
 
   /**
    * Frustum-culls chunks and buckets the visible ones by LOD. Each entry packs the
-   * chunk id (bits 0-7), its LOD (8-9) and the LODs of its bottom/top/left/right
+   * chunk id (bits 0-7: at most 16×16 chunks, see chunkCells), its LOD (8-9) and the LODs of its bottom/top/left/right
    * neighbours (10-17) so the vertex shader can stitch shared edges.
    */
   private selectChunks(view: View, origin: [number, number], extent: number): number[][] {
@@ -388,7 +489,7 @@ export class Renderer {
       r2,
       r3.map((v, k) => v - r2[k]),
     ]
-    const perRow = sim.size / CHUNK_CELLS
+    const perRow = sim.size / this.chunkCells
     const chunkSize = 1 / perRow // in window widths
     const k = (this.pixelsPerVertex * 2 * Math.tan(view.fovY / 2)) / this.height
     const lodOf = new Int8Array(perRow * perRow).fill(-1)
@@ -455,14 +556,16 @@ export class Renderer {
     u.set([...scene.sky.dir, 0], 52)
     u.set([brush.uv[0], brush.uv[1], brush.radius, brush.visible ? 1 : 0], 56)
     u.set([sim.size, sim.flowSize, OVERLAYS.indexOf(scene.overlay), time], 60)
-    u.set([CHUNK_CELLS, sim.size / CHUNK_CELLS, 0, 1 - Math.min(Math.max(0.0035 / brush.radius, 0.03), 0.5)], 64)
+    u.set([this.chunkCells, sim.size / this.chunkCells, scene.seasonPhase, 1 - Math.min(Math.max(0.0035 / brush.radius, 0.03), 0.5)], 64)
     u.set([this.width, this.height, 0, 0], 68)
     u.set([...scene.sky.sun, scene.sky.daylight], 72)
     u.set([...scene.cloudDrift, scene.simTime, 0], 76)
     const fc = scene.farClimate
     u.set([...scene.origin, scene.horizon ? 1 : 0, scene.extent], 80)
     u.set([fc.seaLevel ?? 0, fc.seaLevel === null ? 0 : 1, fc.baseTemperature, fc.lapseRate], 84)
-    u.set([fc.latitude, scene.seed, 0, 0], 88)
+    const overrides = scene.plates.overrides.slice(0, MAX_PLATE_OVERRIDES)
+    u.set([fc.latitude, scene.seed, scene.plates.time, overrides.length], 88)
+    overrides.forEach((o, k) => u.set([...o.cell, ...o.velocity, ...o.from, o.at, 0], 92 + k * 8))
     device.queue.writeBuffer(this.uniform, 0, u)
 
     const buckets = this.selectChunks(view, scene.origin, scene.extent)
@@ -492,6 +595,7 @@ export class Renderer {
     pass.draw(3)
 
     let triangles = 0
+    const mesh = this.chunkMeshes.get(this.chunkCells)!
     const surfaces: [GPURenderPipeline, GPUBindGroup][] = [
       [this.terrainPipeline, this.terrainBindGroup],
       [this.waterPipeline, this.waterBindGroup],
@@ -500,16 +604,22 @@ export class Renderer {
       pass.setPipeline(pipeline)
       pass.setBindGroup(0, bindGroup)
       pass.setBindGroup(1, this.textureBindGroup)
-      pass.setIndexBuffer(this.indexBuffer, 'uint16')
+      pass.setIndexBuffer(mesh.buffer, 'uint16')
       let first = 0
       buckets.forEach((chunks, level) => {
         if (chunks.length) {
-          const { firstIndex, indexCount } = this.lods[level]
+          const { firstIndex, indexCount } = mesh.lods[level]
           pass.drawIndexed(indexCount, chunks.length, firstIndex, 0, first)
           triangles += (indexCount / 3) * chunks.length
         }
         first += chunks.length
       })
+    }
+    if (scene.territory && this.territoryBindGroup) {
+      device.queue.writeBuffer(this.territoryBuffer, 0, scene.territory)
+      pass.setPipeline(this.territoryPipeline)
+      pass.setBindGroup(0, this.territoryBindGroup)
+      pass.draw(6, TERRITORY_N * TERRITORY_N)
     }
     if (scene.horizon && this.farBindGroup) {
       pass.setPipeline(this.farPipeline)
@@ -521,12 +631,41 @@ export class Renderer {
     if (scene.clouds && this.cloudBindGroup) {
       pass.setPipeline(this.cloudPipeline)
       pass.setBindGroup(0, this.cloudBindGroup)
-      pass.draw(6, CLOUD_SLICES)
+      pass.draw(36)
     }
     if (scene.arrows && this.arrowBindGroup) {
       pass.setPipeline(this.arrowPipeline)
       pass.setBindGroup(0, this.arrowBindGroup)
       pass.draw(9, WIND_ARROW_GRID * WIND_ARROW_GRID)
+    }
+    const plates = scene.plateArrows.slice(0, MAX_PLATE_ARROWS)
+    if (plates.length && this.plateArrowBindGroup) {
+      plates.forEach((a, k) => this.plateArrowData.set([...a.uv, ...a.velocity, a.selected ? 1 : 0, 0, 0, 0], k * 8))
+      device.queue.writeBuffer(this.plateArrowBuffer, 0, this.plateArrowData, 0, plates.length * 8)
+      pass.setPipeline(this.plateArrowPipeline)
+      pass.setBindGroup(0, this.plateArrowBindGroup)
+      pass.draw(9, plates.length)
+    }
+    const roads = scene.roads.slice(0, MAX_ROADS)
+    if (roads.length && this.roadBindGroup) {
+      roads.forEach((r, k) => this.roadData.set([...r.a, ...r.b, r.kind, 0, 0, 0], k * 8))
+      device.queue.writeBuffer(this.roadBuffer, 0, this.roadData, 0, roads.length * 8)
+      pass.setPipeline(this.roadPipeline)
+      pass.setBindGroup(0, this.roadBindGroup)
+      pass.draw(ROAD_VERTICES, roads.length)
+    }
+    const life = scene.life.slice(0, MAX_LIFE)
+    if (life.length && this.lifeBindGroup) {
+      life.forEach((m, k) =>
+        this.lifeData.set(
+          [...m.uv, LIFE_KINDS.indexOf(m.kind), m.size, m.health, m.color, m.tech, m.flag],
+          k * 8,
+        ),
+      )
+      device.queue.writeBuffer(this.lifeBuffer, 0, this.lifeData, 0, life.length * 8)
+      pass.setPipeline(this.lifePipeline)
+      pass.setBindGroup(0, this.lifeBindGroup)
+      pass.draw(LIFE_VERTICES, life.length)
     }
     pass.end()
     device.queue.submit([enc.finish()])

@@ -93,6 +93,53 @@ export const Icon = {
       <path d="M7 19h10" />
     </Svg>
   ),
+  airmass: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M3 8h9a2.5 2.5 0 1 0-2.5-2.5" />
+      <path d="M3 12.5h14a3 3 0 1 1-3 3" />
+      <path d="M3 17h6" />
+      <path d="M18 7l3 3-3 3" />
+    </Svg>
+  ),
+  current: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M3 8c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 4 0" />
+      <path d="M3 13c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 4 0" />
+      <path d="M3 18c2.5-2 4.5-2 7 0s4.5 2 7 0 4.5-2 4 0" />
+    </Svg>
+  ),
+  storm: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M12 12a3 3 0 1 0 3-3 6 6 0 1 0 6 6 9 9 0 1 1-9-9" />
+      <circle cx="12" cy="12" r="0.8" fill="currentColor" stroke="none" />
+    </Svg>
+  ),
+  meteor: (p: IconProps) => (
+    <Svg {...p}>
+      <circle cx="15.5" cy="15.5" r="4.5" />
+      <path d="M11 11 4 4M9 14.5 3 10M14.5 9 10 3" />
+    </Svg>
+  ),
+  rewind: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M11 6v12l-8-6Z" />
+      <path d="M21 6v12l-8-6Z" />
+    </Svg>
+  ),
+  life: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M4 20V11l5-4 5 4v9" />
+      <path d="M9 20v-5h0" />
+      <circle cx="18" cy="8" r="2.5" />
+      <path d="M15.5 20v-6a2.5 2.5 0 0 1 5 0v6" />
+    </Svg>
+  ),
+  flag: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M5 21V4" />
+      <path d="M5 4h11l-2 4 2 4H5" />
+    </Svg>
+  ),
   uplift: (p: IconProps) => (
     <Svg {...p}>
       <path d="M2 20 8 12l3 3 4-7 7 12Z" />
@@ -225,6 +272,37 @@ export const Icon = {
       <path d="M20 20v-4h-4" />
     </Svg>
   ),
+  drought: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M7 15a4 4 0 0 1-.5-8A6 6 0 0 1 18 8.5a3.5 3.5 0 0 1 .5 6.5" />
+      <path d="M4 20l16-16" />
+      <path d="M9 19h.01M13 19h.01M17 19h.01" />
+    </Svg>
+  ),
+  fire: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M12 3c1 3 4 4.5 4 8.5a4 4 0 0 1-8 0c0-1.5.6-2.6 1.4-3.5.3 1.2 1 2 2.1 2.3C12 8 11 5.5 12 3Z" />
+      <path d="M8.5 14.5a3.5 3.5 0 0 0 7 0" />
+      <path d="M5 21h14" />
+    </Svg>
+  ),
+  tree: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M12 3l5 7h-3l4 5h-5v6h-2v-6H6l4-5H7l5-7Z" />
+    </Svg>
+  ),
+  map: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2V6Z" />
+      <path d="M9 4v14M15 6v14" />
+    </Svg>
+  ),
+  eye: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M3 12c0-2 4-7 9-7s9 5 9 7-4 7-9 7-9-5-9-7Z" />
+      <circle cx="12" cy="12" r="3" />
+    </Svg>
+  ),
   eyeOff: (p: IconProps) => (
     <Svg {...p}>
       <path d="M3 3l18 18" />
@@ -245,5 +323,11 @@ export const TOOL_ICONS: Record<Tool, (p: IconProps) => ReactNode> = {
   humidity: Icon.humidity,
   volcano: Icon.volcano,
   pressure: Icon.pressure,
-  uplift: Icon.uplift,
+  airmass: Icon.airmass,
+  plates: Icon.uplift,
+  current: Icon.current,
+  storm: Icon.storm,
+  meteor: Icon.meteor,
+  sun: Icon.sun,
+  drought: Icon.drought,
 }
