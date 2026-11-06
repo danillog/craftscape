@@ -2,7 +2,8 @@ import { useRef, type ReactNode } from 'react'
 import type { Engine } from '../engine/engine'
 import { scenarioById } from '../engine/scenarios'
 import { CHALLENGES } from '../engine/challenges'
-import { CIV_COLORS, type HistoryPoint } from '../engine/life'
+import { CIV_COLORS, ERAS, FAITHS, type HistoryPoint } from '../engine/life'
+import { CALM, CATEGORICAL, ERA_RAMP, FAMINE_COLOR, HUMAN_MARKS, PEACE_COLOR, PLAGUE_COLOR, WAR_COLOR, rgbCss } from '../engine/palettes'
 import {
   TEMPERATURE_MAX,
   TEMPERATURE_MIN,
@@ -17,14 +18,18 @@ import { BIOMES, EROSION_LEGEND, FPS_LIMITS, OVERLAYS, QUALITIES, QUALITY_NAMES,
 import { ClimateAnalysis, Section, Segmented, Slider, Toggle } from './controls'
 import { Icon } from './icons'
 import { useSettings, useStats } from './useEngine'
+import { HistoryBook } from './History'
+import { Charts } from '../tiles/Charts'
 
-export type PanelTab = 'climate' | 'map' | 'world' | 'life' | 'challenges'
+export type PanelTab = 'climate' | 'map' | 'world' | 'life' | 'history' | 'data' | 'challenges'
 
 const TABS: { id: PanelTab; label: string; icon: (p: { size?: number }) => ReactNode }[] = [
   { id: 'climate', label: 'Clima', icon: Icon.climate },
   { id: 'map', label: 'Mapa', icon: Icon.layers },
   { id: 'world', label: 'Mundo', icon: Icon.globe },
   { id: 'life', label: 'Vida', icon: Icon.life },
+  { id: 'history', label: 'História', icon: Icon.book },
+  { id: 'data', label: 'Dados', icon: Icon.chart },
   { id: 'challenges', label: 'Desafios', icon: Icon.flag },
 ]
 
@@ -326,11 +331,38 @@ export function SidePanel({
                 </Section>
               </>
             )}
+            {tab === 'history' && (
+              <Section title="Livro da história">
+                <HistoryBook engine={engine} />
+              </Section>
+            )}
+            {tab === 'data' && (
+              <>
+                <Section title="O mundo em números">
+                  <Charts history={stats.record} />
+                  <p className="hint">
+                    Um ponto por ano (dez segundos simulados). O CO₂ sobe com a indústria dos povos e o mar sobe com
+                    o aquecimento, quando há oceano nas bordas.
+                  </p>
+                </Section>
+                <Section title="Agora">
+                  <p className="hint">
+                    {stats.powers.fires > 0 ? `${stats.powers.fires} focos de incêndio. ` : 'Nenhum incêndio. '}
+                    {stats.powers.hurricanes.length > 0
+                      ? `${stats.powers.hurricanes.map((h) => `Furacão ${h.name} (categoria ${h.category})`).join(', ')}. `
+                      : 'Nenhum furacão. '}
+                    {stats.powers.fallout > 0 && `${stats.powers.fallout} ${stats.powers.fallout === 1 ? 'área radioativa' : 'áreas radioativas'}. `}
+                    {stats.powers.cataclysm > 0 && `Cataclismo: o planeta ainda está ${stats.powers.cataclysm.toFixed(0)} °C mais quente. `}
+                    CO₂: {stats.co2.toFixed(0)} ppm.
+                  </p>
+                </Section>
+              </>
+            )}
             {tab === 'challenges' && (
               <Section title="Desafios">
                 <p className="hint">
-                  Metas lidas da análise do clima, atualizada a cada poucos segundos. Escolha uma, mude o mundo e
-                  veja a barra subir.
+                  Metas lidas da análise do clima e da vida dos povos, atualizadas a cada poucos segundos. Escolha
+                  uma, mude o mundo e veja a barra subir. As concluídas ganham um troféu.
                 </p>
                 {CHALLENGES.map((c) => {
                   const active = stats.challenge?.id === c.id ? stats.challenge : null
@@ -338,7 +370,9 @@ export function SidePanel({
                     <div key={c.id} className={`challenge ${active ? 'active' : ''} ${active?.done ? 'done' : ''}`}>
                       <div className="challenge-head">
                         <div>
-                          <strong>{c.name}</strong>
+                          <strong>
+                            {stats.trophies.includes(c.id) && <Icon.trophy size={14} />} {c.name}
+                          </strong>
                           <div className="challenge-goal">{c.goal}</div>
                         </div>
                         <button
@@ -396,7 +430,9 @@ export function SidePanel({
                       meio, ventos polares no norte), estações do ano e pressão vinda do aquecimento. Os controles e
                       pincéis de temperatura e umidade ficam desligados.
                       {stats.season &&
-                        ` Agora: ${stats.season.name}, ${stats.season.anomaly >= 0 ? '+' : ''}${stats.season.anomaly.toFixed(1)} °C.`}
+                        ` Agora: ${stats.season.name}, ${stats.season.anomaly >= 0 ? '+' : ''}${stats.season.anomaly.toFixed(1)} °C. Latitude ${stats.season.latitude.toFixed(0)}° N: o sol fica ${
+                          stats.season.dayHours >= 23.9 ? 'no céu o dia inteiro (sol da meia-noite)' : stats.season.dayHours <= 0.1 ? 'abaixo do horizonte o dia inteiro (noite polar)' : `${stats.season.dayHours.toFixed(1).replace('.', ',')} h no céu por dia`
+                        }.`}
                     </p>
                   ) : (
                     <>
@@ -693,6 +729,82 @@ export function SidePanel({
                       )}
                     </>
                   )}
+                  {s.overlay === 'relief' && (
+                    <p className="hint">
+                      Relevo: o mar do azul claro (raso) ao escuro (fundo); a terra verde nas baixadas, bege nos
+                      morros, marrom nas montanhas e branca nos picos. Uma curva de nível a cada 230 m.
+                    </p>
+                  )}
+                  {s.overlay === 'human' && (
+                    <>
+                      <ul className="legend">
+                        {HUMAN_MARKS.map((m) => (
+                          <li key={m.name}>
+                            <span className="swatch" style={{ background: rgbCss(m.color) }} />
+                            {m.name}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="hint">
+                        O que os povos fizeram da terra em volta das cidades.
+                        {!s.life && ' Ligue a vida na aba Mundo para ver os povos.'}
+                      </p>
+                    </>
+                  )}
+                  {s.overlay === 'eras' && (
+                    <>
+                      <ul className="legend">
+                        {ERAS.map((e, k) => (
+                          <li key={e.name}>
+                            <span className="swatch" style={{ background: rgbCss(ERA_RAMP[k]) }} />
+                            {e.name}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="hint">As terras de cada povo pela era em que ele está: quanto mais escuro, mais avançado.</p>
+                    </>
+                  )}
+                  {s.overlay === 'faith' && (
+                    <ul className="legend">
+                      {FAITHS.map((f, k) => (
+                        <li key={f}>
+                          <span className="swatch" style={{ background: rgbCss(CATEGORICAL[k % CATEGORICAL.length]) }} />
+                          {f}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {s.overlay === 'language' && (
+                    <>
+                      <ul className="legend single">
+                        {[...new Map((stats.life?.civs ?? []).map((c) => [c.family, c.familyName])).entries()].map(([family, name]) => (
+                          <li key={family}>
+                            <span className="swatch" style={{ background: rgbCss(CATEGORICAL[family % CATEGORICAL.length]) }} />
+                            família {name}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="hint">
+                        Povos vizinhos em paz pegam palavras um do outro; quando uma língua pega palavras demais, entra
+                        na família da outra.
+                      </p>
+                    </>
+                  )}
+                  {(s.overlay === 'plague' || s.overlay === 'famine' || s.overlay === 'war') && (
+                    <ul className="legend">
+                      <li>
+                        <span className="swatch" style={{ background: rgbCss(s.overlay === 'war' ? PEACE_COLOR : CALM) }} />
+                        {s.overlay === 'plague' ? 'Sem peste' : s.overlay === 'famine' ? 'Sem fome' : 'Em paz'}
+                      </li>
+                      <li>
+                        <span
+                          className="swatch"
+                          style={{ background: rgbCss(s.overlay === 'plague' ? PLAGUE_COLOR : s.overlay === 'famine' ? FAMINE_COLOR : WAR_COLOR) }}
+                        />
+                        {s.overlay === 'plague' ? 'Peste em todas as cidades' : s.overlay === 'famine' ? 'Fome em todas as cidades' : 'Em guerra'}
+                      </li>
+                    </ul>
+                  )}
                 </Section>
                 <button type="button" className={`wide ${section ? 'active' : ''}`} onClick={() => onSection(!section)}>
                   {section ? 'Esconder corte transversal' : 'Mostrar corte transversal'}
@@ -756,6 +868,7 @@ export function SidePanel({
                     onChange={(earthquakes) => engine.set({ earthquakes })}
                   />
                   <Toggle label="Vulcões" checked={s.volcanoes} onChange={(volcanoes) => engine.set({ volcanoes })} />
+                  <Toggle label="Sons" checked={s.sound} onChange={(sound) => engine.set({ sound })} />
                   {stats.volcanoes.length > 0 && (
                     <p className="hint">
                       Vulcões:{' '}
@@ -777,6 +890,20 @@ export function SidePanel({
                     cordilheiras ficam para trás de onde a fronteira passou. Veja no mapa Placas (tecla U para
                     arrastar uma placa).
                   </p>
+                  <Toggle
+                    label="Deriva continental (experimental)"
+                    checked={s.continentalDrift}
+                    onChange={(continentalDrift) => engine.set({ continentalDrift })}
+                  />
+                  {s.continentalDrift && (
+                    <p className="hint">
+                      As placas carregam a terra com elas, célula a célula, com rios, florestas e cidades. Onde
+                      duas se encontram a crosta da frente é engolida; atrás de uma placa que se afasta a terra
+                      afunda num rifte com lava, que com o tempo vira fundo de mar. Aparece melhor no tempo
+                      geológico (10× ou 30×). Só a área simulada se move: com o mundo infinito ligado, o horizonte
+                      e as regiões já visitadas ficam onde estavam.
+                    </p>
+                  )}
                 </Section>
                 <Section title="Terreno">
                   <Toggle

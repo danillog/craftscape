@@ -13,6 +13,8 @@ export const MODE_LABELS: Partial<Record<Tool, [string, string]>> = {
   pressure: ['Alta pressão', 'Baixa pressão'],
   airmass: ['Ar quente', 'Ar frio'],
   current: ['Corrente quente', 'Corrente fria'],
+  forest: ['Plantar', 'Desmatar'],
+  fire: ['Acender', 'Apagar o fogo'],
 }
 
 /** The air-mass brush's modes while its masses are fixed in place. */
@@ -32,6 +34,14 @@ export const OVERLAYS: { id: Overlay; label: string }[] = [
   { id: 'airmass', label: 'Frentes' },
   { id: 'civilization', label: 'Povos' },
   { id: 'current', label: 'Correntes' },
+  { id: 'relief', label: 'Relevo' },
+  { id: 'human', label: 'Humano' },
+  { id: 'eras', label: 'Eras' },
+  { id: 'faith', label: 'Religião' },
+  { id: 'language', label: 'Idiomas' },
+  { id: 'plague', label: 'Peste' },
+  { id: 'famine', label: 'Fome' },
+  { id: 'war', label: 'Guerras' },
 ]
 
 // same colours as biomeColor() in the render shader

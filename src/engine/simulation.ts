@@ -24,6 +24,13 @@ import {
   shockShader,
   ventShader,
   worksShader,
+  actsShader,
+  MAX_ACTS,
+  driftGatherScalarShader,
+  driftGatherShader,
+  driftMapShader,
+  driftRiftShader,
+  MAX_PLATE_MOVES,
   MAX_PLATE_OVERRIDES,
   MAX_DUSTS,
   MAX_HIGHS,
@@ -74,6 +81,25 @@ export interface Brush {
   clearAirSources: boolean
   /** Ocean-current brush: warms (or, negative, cools) the sea it paints, and the air over it. */
   current: number
+  /** Forest brush: plants take where it paints (negative clears them). */
+  forest: number
+}
+
+/** Something a power does to the land at a place this frame (see actsShader for each kind's numbers). */
+export interface Act {
+  /** Centre in window uv. */
+  uv: [number, number]
+  /** Radius in window uv. */
+  radius: number
+  kind: 'fire' | 'tsunami' | 'blast' | 'cataclysm'
+  values: [number, number, number, number]
+}
+const ACT_KINDS: Record<Act['kind'], number> = { fire: 1, tsunami: 2, blast: 3, cataclysm: 4 }
+
+/** A plate whose land moves this frame (continental drift): its grid cell and the shift, in cells. */
+export interface PlateMove {
+  cell: [number, number]
+  shift: [number, number]
 }
 
 /** A meteor strike to run this frame (see impactShader). */
@@ -312,6 +338,15 @@ export class Simulation {
   /** The peoples' works for this frame (see writeWorks). */
   readonly works: GPUBuffer
   private readonly worksData = new Float32Array(4 + MAX_WORKS * 8)
+  /** Continental drift: the plates that move this frame, and where each cell's land comes from (see driftMapShader). */
+  private readonly plateMoves: GPUBuffer
+  private readonly plateMovesData = new Float32Array(4 + MAX_PLATE_MOVES * 4)
+  private readonly driftMap: GPUBuffer
+  private readonly driftGroups: { bindGroup: GPUBindGroup; target: GPUBuffer }[] = []
+  private driftPipeline!: GPUComputePipeline
+  /** The powers' acts on the land for this frame (see writeActs). */
+  readonly acts: GPUBuffer
+  private readonly actsData = new Float32Array(4 + MAX_ACTS * 8)
   readonly normals: GPUBuffer
   readonly wnormals: GPUBuffer
   readonly shadow: GPUBuffer
@@ -368,6 +403,9 @@ export class Simulation {
     this.lavaTmp = vec4Buffer('lavaTmp')
     this.far = device.createBuffer({ label: 'far', size: FAR_GRID * FAR_GRID * 4, usage: storage })
     this.works = device.createBuffer({ label: 'works', size: this.worksData.byteLength, usage: storage })
+    this.acts = device.createBuffer({ label: 'acts', size: this.actsData.byteLength, usage: storage })
+    this.plateMoves = device.createBuffer({ label: 'plateMoves', size: this.plateMovesData.byteLength, usage: storage })
+    this.driftMap = device.createBuffer({ label: 'driftMap', size: this.cells * 4, usage: storage })
     this.shiftParams = [this.size, this.flowSize].map((n) => {
       const buffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
       device.queue.writeBuffer(buffer, 0, new Uint32Array([n, 0, 0, 0]))
@@ -489,6 +527,25 @@ export class Simulation {
     add('shock', shockShader, [this.wind])
     add('vent', ventShader, [this.lava])
     add('works', worksShader, [this.ground, this.groundTmp, this.extra, this.water, this.climate, this.works, this.air])
+    add('acts', actsShader, [this.ground, this.extra, this.water, this.air, this.lava, this.acts])
+    add('driftMap', driftMapShader, [this.plateMoves, this.driftMap])
+    add('driftRift', driftRiftShader, [this.driftMap, this.ground, this.extra, this.lava])
+    add('driftFine', driftGatherScalarShader, [this.driftMap, this.fine, this.fineTmp])
+    // the vec4 buffers the land carries with it, each gathered into groundTmp and copied back
+    this.driftPipeline = device.createComputePipeline({
+      label: 'drift gather',
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ label: 'drift gather', code: driftGatherShader }), entryPoint: 'main' },
+    })
+    for (const target of [this.ground, this.water, this.waterLast, this.extra, this.climate, this.lava]) {
+      this.driftGroups.push({
+        target,
+        bindGroup: device.createBindGroup({
+          layout: this.driftPipeline.getBindGroupLayout(0),
+          entries: [this.uniform, this.driftMap, target, this.groundTmp].map((buffer, binding) => ({ binding, resource: { buffer } })),
+        }),
+      })
+    }
     add('normals', normalsShader, [this.ground, this.normals])
     add('waterNormals', waterNormalsShader, [this.ground, this.water, this.wnormals])
     const shadowBuffers = [this.ground, this.water, this.normals, this.wnormals, this.shadow]
@@ -583,7 +640,7 @@ export class Simulation {
     plates.forEach((o, k) => f32.set([...o.cell, ...o.velocity, ...o.from, o.at, 0], PLATES_OFFSET / 4 + k * 8))
     const q = p.quake
     f32.set(q ? [q.uv[0], q.uv[1], q.normal, q.radius, q.slip, q.rubble, 1, 0] : [0, 0, 0, 1, 0, 0, 0, 0], QUAKE_OFFSET / 4)
-    f32.set([p.brush.airSource, p.brush.clearAirSources ? 1 : 0, p.brush.current, 0], SOURCE_OFFSET / 4)
+    f32.set([p.brush.airSource, p.brush.clearAirSources ? 1 : 0, p.brush.current, p.brush.forest], SOURCE_OFFSET / 4)
     const m = p.impact
     f32.set(m ? [m.uv[0], m.uv[1], m.radius, m.depth] : [0, 0, 0, 0], IMPACT_OFFSET / 4)
     for (let k = 0; k < MAX_STORMS; k++) {
@@ -799,6 +856,51 @@ export class Simulation {
     enc.copyBufferToBuffer(this.groundTmp, 0, this.ground, 0, this.cells * 16)
   }
 
+  /**
+   * Continental drift: the land of these plates moves by their shifts (a cell at most each),
+   * with everything on it; the rifts opened at the trailing edges sink (see driftMapShader).
+   */
+  encodeDrift(enc: GPUCommandEncoder, moves: PlateMove[]) {
+    const list = moves.slice(0, MAX_PLATE_MOVES)
+    const d = this.plateMovesData
+    d.fill(0)
+    d[0] = list.length
+    list.forEach((m, k) => d.set([m.cell[0], m.cell[1], m.shift[0], m.shift[1]], 4 + k * 4))
+    this.device.queue.writeBuffer(this.plateMoves, 0, d)
+    let pass = enc.beginComputePass({ label: 'drift map' })
+    this.dispatch(pass, 'driftMap')
+    pass.end()
+    for (const { bindGroup, target } of this.driftGroups) {
+      pass = enc.beginComputePass({ label: 'drift gather' })
+      pass.setPipeline(this.driftPipeline)
+      pass.setBindGroup(0, bindGroup)
+      pass.dispatchWorkgroups(Math.ceil(this.size / WG), Math.ceil(this.size / WG))
+      pass.end()
+      enc.copyBufferToBuffer(this.groundTmp, 0, target, 0, this.cells * 16)
+    }
+    pass = enc.beginComputePass({ label: 'drift fine and rifts' })
+    this.dispatch(pass, 'driftFine')
+    pass.end()
+    enc.copyBufferToBuffer(this.fineTmp, 0, this.fine, 0, this.cells * 4)
+    pass = enc.beginComputePass({ label: 'drift rifts' })
+    this.dispatch(pass, 'driftRift')
+    pass.end()
+    this.platesDirty = true
+  }
+
+  /** Hands the simulation the powers' acts on the land and applies them (one frame's worth). */
+  encodeActs(enc: GPUCommandEncoder, acts: Act[]) {
+    const list = acts.slice(0, MAX_ACTS)
+    const d = this.actsData
+    d.fill(0)
+    d[0] = list.length
+    list.forEach((a, k) => d.set([a.uv[0], a.uv[1], a.radius, ACT_KINDS[a.kind], ...a.values], 4 + k * 8))
+    this.device.queue.writeBuffer(this.acts, 0, d)
+    const pass = enc.beginComputePass({ label: 'acts' })
+    this.dispatch(pass, 'acts')
+    pass.end()
+  }
+
   /** The meteor strike in this frame's params: the crater is dug and the ground copied back. */
   encodeImpact(enc: GPUCommandEncoder) {
     const pass = enc.beginComputePass({ label: 'impact' })
@@ -972,6 +1074,9 @@ export class Simulation {
       this.flows,
       this.fine,
       this.fineTmp,
+      this.acts,
+      this.plateMoves,
+      this.driftMap,
       this.baseline,
       this.pickResult,
       this.tilesRaw,

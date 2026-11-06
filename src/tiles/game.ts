@@ -6,9 +6,13 @@ import { Renderer2D, type Overlay2d, type View, OVERLAYS_2D } from './render'
 import { challengeById, type Metrics } from './goals'
 import { CATEGORICAL, ERA_RAMP, PEOPLE_MAPS, type Effect } from './render'
 import { fromFile, toFile } from './save'
-import { Sound, type SoundKind } from './sound'
+import type { SoundKind } from './sound'
+import { context2d, type Canvas, type Ctx } from './canvas'
+import type { GameHost, KeyInput, PointerInput, WheelInput } from './host'
 import { BOUNDARY_NAMES } from './tectonics'
 import { DEFAULT_WORLD, LIVE_OPTIONS, METERS_PER_HEIGHT, PB, TICK, TileWorld, capacity, type WorldOptions, type WorldSnapshot } from './world'
+import { wrap, wrapDelta } from './wrap'
+import { GLOBE_TILT, Globe, globePick, globePlace, type GlobeView } from './globe'
 
 export type Tool2d =
   | 'inspect' | 'terrain' | 'water' | 'forest' | 'rain' | 'heat' | 'pressure' | 'sun' | 'people'
@@ -31,6 +35,8 @@ export interface Settings2d {
   windArrows: boolean
   /** Satellite (as seen from orbit, towns as lights, a km grid) or the illustrated map (trees, mountains, houses). */
   look: 'satellite' | 'illustrated'
+  /** The planet drawn as a globe instead of the flat map (needs WebGL). */
+  globe: boolean
   /** Satellite: the day and the night sweep over the map. */
   dayNight: boolean
   /** Sounds for the powers and the big moments. */
@@ -127,6 +133,9 @@ const RECORD_YEARS = 600
 export interface Stats2d {
   fps: number
   simTime: number
+  /** The season, −1 (northern winter) … 1 (northern summer), and the tiles a side of the map. */
+  season: number
+  n: number
   sun: number
   dust: number
   droughts: number
@@ -171,6 +180,7 @@ export const DEFAULT_SETTINGS: Settings2d = {
   overlay: 'none',
   windArrows: false,
   look: 'satellite',
+  globe: false,
   dayNight: true,
   sound: true,
   challenge: null,
@@ -179,6 +189,12 @@ export const DEFAULT_SETTINGS: Settings2d = {
 
 const TICKS_PER_SECOND = 20
 const MAX_TICKS_PER_FRAME = 24
+/**
+ * Milliseconds of a frame the simulation may take: a big map at a high speed runs as many
+ * of the ticks due as fit in this (one at least), so it goes a little slower than asked
+ * instead of freezing the picture.
+ */
+const TICK_BUDGET_MS = 40
 /** The brushes: they act every frame while held. */
 const BRUSH_TOOLS: Tool2d[] = ['terrain', 'water', 'forest', 'rain', 'heat', 'pressure']
 /**
@@ -218,14 +234,10 @@ const MAX_UNDO = 6
 const MAX_REWIND = 12
 const REWIND_YEARS = 10
 const MAX_ANNALS = 800
-const COMPLETED_KEY = 'craftscape2d.completed'
-const readCompleted = (): string[] => {
-  try {
-    return JSON.parse(localStorage.getItem(COMPLETED_KEY) ?? '[]') as string[]
-  } catch {
-    return []
-  }
-}
+/** The next frame, on the page or in a worker (a timer where there are no animation frames). */
+const nextFrame = (fn: (now: number) => void): number =>
+  typeof requestAnimationFrame === 'function' ? requestAnimationFrame(fn) : (setTimeout(() => fn(performance.now()), 16) as unknown as number)
+const cancelFrame = (id: number) => (typeof cancelAnimationFrame === 'function' ? cancelAnimationFrame(id) : clearTimeout(id))
 const MAX_NEWS = 40
 /** The keys that move the map, and where to. */
 const PAN_KEYS: Record<string, [number, number]> = {
@@ -236,10 +248,17 @@ const PAN_KEYS: Record<string, [number, number]> = {
 type Listener = () => void
 
 export class Game {
-  readonly canvas: HTMLCanvasElement
-  private readonly ctx: CanvasRenderingContext2D
+  readonly canvas: Canvas
+  private readonly ctx: Ctx
+  /** Where the game runs (the page or a worker): its size on screen, its sounds, its files. */
+  private readonly host: GameHost
   world: TileWorld
-  readonly life = new Life()
+  readonly life = (() => {
+    // the tile world is round east to west: the peoples' distances, roads and voyages cross the map's edge
+    const life = new Life()
+    life.wrapWidth = 1
+    return life
+  })()
   private renderer: Renderer2D
   view: View = { cx: 96, cy: 96, zoom: 6 }
   private goal: View | null = null
@@ -273,9 +292,8 @@ export class Game {
   private effects: Effect[] = []
   /** Screen shake left (pixels), easing off. */
   private shake = 0
-  readonly sound = new Sound()
   private challenge: ChallengeState | null = null
-  private completed = readCompleted()
+  private completed: string[] = []
   private metricsClock = 0
   private peaceYears = 0
   private eraLog: Record<number, [number, number][]> = {}
@@ -299,16 +317,22 @@ export class Game {
   private message: string | null = null
   private messageTimer = 0
   private disposed = false
+  /** The globe (made the first time it is asked for), where it is seen from, where it is gliding to, and the drag that turns it. */
+  private globe: Globe | null = null
+  private globeView: GlobeView = { lon: 0, lat: 0.35, zoom: 1 }
+  private globeGoal: { lon: number; lat: number } | null = null
+  private globeDrag: { x: number; y: number; lon: number; lat: number } | null = null
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: Canvas, host: GameHost) {
     this.canvas = canvas
-    this.ctx = canvas.getContext('2d')!
+    this.host = host
+    this.ctx = context2d(canvas)
+    this.completed = host.completed()
     this.world = new TileWorld(this.settings.world)
     this.world.onDrift = this.carryLife
     this.renderer = new Renderer2D(this.world)
     this.view = { cx: this.world.n / 2, cy: this.world.n / 2, zoom: 5 }
     this.stats = this.makeStats(0)
-    this.bind()
     this.fit()
   }
 
@@ -326,7 +350,21 @@ export class Game {
 
   set(partial: Partial<Settings2d>) {
     this.settings = { ...this.settings, ...partial }
-    this.sound.enabled = this.settings.sound
+    if (partial.globe !== undefined) {
+      if (partial.globe) {
+        this.globe ??= new Globe(this.host.globeCanvas())
+        if (!this.globe.ok) {
+          this.settings = { ...this.settings, globe: false }
+          this.toast('Este navegador não oferece WebGL: o globo não pode ser desenhado aqui')
+        } else {
+          // it opens looking at the middle of the flat view
+          const [lon] = globePlace(wrap(this.view.cx, this.world.n) / this.world.n, 0.5)
+          this.globeView = { ...this.globeView, lon }
+        }
+      }
+      this.host.showGlobe(this.settings.globe)
+      this.cursor = null
+    }
     if (partial.challenge !== undefined) {
       if (partial.challenge) this.startChallenge(partial.challenge)
       else this.challenge = null
@@ -378,8 +416,11 @@ export class Game {
 
   /** The view framing the whole world. */
   fit() {
-    const w = this.canvas.clientWidth || 800
-    const h = this.canvas.clientHeight || 600
+    this.globeView = { ...this.globeView, lat: 0.35, zoom: 1 }
+    this.globeGoal = null
+    const size = this.host.size()
+    const w = size.width || 800
+    const h = size.height || 600
     this.view = { cx: this.world.n / 2, cy: this.world.n / 2, zoom: Math.max(1, Math.min(w, h) / this.world.n) }
     this.goal = null
   }
@@ -402,6 +443,13 @@ export class Game {
   /** Glides the view over a place (world units 0–1) at a close zoom. */
   flyTo(pos: [number, number], zoom = 10) {
     this.goal = { cx: pos[0] * this.world.n, cy: pos[1] * this.world.n, zoom }
+    const [lon, lat] = globePlace(pos[0], pos[1])
+    this.globeGoal = { lon, lat: Math.max(-GLOBE_TILT, Math.min(GLOBE_TILT, lat)) }
+  }
+
+  /** A sound for something that happened, when the sounds are on. */
+  private play(kind: SoundKind) {
+    if (this.settings.sound) this.host.sound(kind)
   }
 
   notice(text: string | null) {
@@ -411,8 +459,8 @@ export class Game {
   }
   private toast(text: string) {
     this.notice(text)
-    window.clearTimeout(this.messageTimer)
-    this.messageTimer = window.setTimeout(() => {
+    clearTimeout(this.messageTimer)
+    this.messageTimer = setTimeout(() => {
       if (this.message === text) this.notice(null)
     }, 5000)
   }
@@ -424,15 +472,14 @@ export class Game {
     const frame = (now: number) => {
       if (this.disposed) return
       this.tick(now)
-      this.raf = requestAnimationFrame(frame)
+      this.raf = nextFrame(frame)
     }
-    this.raf = requestAnimationFrame(frame)
+    this.raf = nextFrame(frame)
   }
 
   dispose() {
     this.disposed = true
-    cancelAnimationFrame(this.raf)
-    this.unbind()
+    cancelFrame(this.raf)
   }
 
   private tick(now: number) {
@@ -444,9 +491,13 @@ export class Game {
     let ticks = 0
     if (!s.paused) {
       this.accumulator += dt * s.speed * TICKS_PER_SECOND
-      ticks = Math.min(Math.floor(this.accumulator), MAX_TICKS_PER_FRAME)
+      const due = Math.min(Math.floor(this.accumulator), MAX_TICKS_PER_FRAME)
+      const until = performance.now() + TICK_BUDGET_MS
+      while (ticks < due && (ticks === 0 || performance.now() < until)) {
+        this.world.tick()
+        ticks++
+      }
       this.accumulator = Math.min(this.accumulator - ticks, 2)
-      for (let k = 0; k < ticks; k++) this.world.tick()
       if (s.life && ticks) {
         this.life.update(ticks * TICK, this.world.field, 1)
         this.worksClock += ticks
@@ -486,7 +537,7 @@ export class Game {
         if (b.god && this.settings.life) this.life.blast([b.x / this.world.n, b.y / this.world.n])
         else if (b.god) this.chronicle('☢ Uma bomba atômica explode.', true, [b.x / this.world.n, b.y / this.world.n])
         this.shake = Math.max(this.shake, 22)
-        this.sound.play('boom')
+        this.play('boom')
       }
       this.blasts = this.blasts.filter((b) => b.at > now)
     }
@@ -507,10 +558,22 @@ export class Game {
       const g = this.goal
       const v = this.view
       const k = 1 - Math.exp(-dt * 6)
-      v.cx += (g.cx - v.cx) * k
+      // (east–west the short way round the world)
+      const dx = wrapDelta(g.cx, v.cx, this.world.n)
+      v.cx += dx * k
       v.cy += (g.cy - v.cy) * k
       v.zoom += (g.zoom - v.zoom) * k
-      if (Math.abs(g.cx - v.cx) < 0.05 && Math.abs(g.zoom - v.zoom) < 0.02) this.goal = null
+      if (Math.abs(dx) < 0.05 && Math.abs(g.zoom - v.zoom) < 0.02) this.goal = null
+    }
+    // the globe turns to its goal the short way round
+    if (this.globeGoal) {
+      const g = this.globeGoal
+      const v = this.globeView
+      const k = 1 - Math.exp(-dt * 6)
+      const turn = Math.atan2(Math.sin(g.lon - v.lon), Math.cos(g.lon - v.lon))
+      v.lon += turn * k
+      v.lat += (g.lat - v.lat) * k
+      if (Math.abs(turn) < 0.002 && Math.abs(g.lat - v.lat) < 0.002) this.globeGoal = null
     }
     this.clampView()
     // drawing (the colours follow the map mode)
@@ -677,9 +740,9 @@ export class Game {
         }
         if (e.fx === 'quake') {
           this.shake = Math.max(this.shake, Math.min(14, (e.size ?? 6) * 0.6))
-          this.sound.play('rumble')
-        } else if (e.fx === 'eruption') this.sound.play('rumble')
-        else this.sound.play('rumble')
+          this.play('rumble')
+        } else if (e.fx === 'eruption') this.play('rumble')
+        else this.play('rumble')
       }
       fresh.push({ id: ++this.newsId, year, text: e.text, color: null, major: !!e.major, pos })
       // with the peoples on, the world's news goes into their chronicle too
@@ -719,17 +782,26 @@ export class Game {
     const v = this.view
     const n = this.world.n
     v.zoom = Math.max(1, Math.min(40, v.zoom))
-    const w = this.canvas.clientWidth / v.zoom
-    const h = this.canvas.clientHeight / v.zoom
-    v.cx = Math.max(Math.min(w / 2, n / 2), Math.min(n - w / 2, v.cx))
+    const h = this.host.size().height / v.zoom
+    // east and west the world goes round: the view may go on for ever that way. Between
+    // gestures it is brought back onto the map (the same place, a whole world over), and
+    // the pointer's place with it
+    if (!this.dragging && !this.painting && !this.repeat && !this.plateDrag && !this.goal) {
+      const cx = wrap(v.cx, n)
+      if (cx !== v.cx) {
+        if (this.cursor) this.cursor = [this.cursor[0] + cx - v.cx, this.cursor[1]]
+        v.cx = cx
+      }
+    }
     v.cy = Math.max(Math.min(h / 2, n / 2), Math.min(n - h / 2, v.cy))
   }
 
   private draw() {
     const c = this.canvas
-    const dpr = Math.min(window.devicePixelRatio || 1, 2)
-    const width = Math.round(c.clientWidth * dpr)
-    const height = Math.round(c.clientHeight * dpr)
+    const size = this.host.size()
+    const dpr = Math.min(size.dpr || 1, 2)
+    const width = Math.round(size.width * dpr)
+    const height = Math.round(size.height * dpr)
     if (!width || !height) return
     if (c.width !== width || c.height !== height) {
       c.width = width
@@ -737,13 +809,24 @@ export class Game {
     }
     const s = this.settings
     const n = this.world.n
-    const ctx = this.ctx
-    ctx.save()
-    ctx.scale(dpr, dpr)
-    if (this.shake > 0) ctx.translate((Math.random() - 0.5) * this.shake, (Math.random() - 0.5) * this.shake)
     const brush = this.cursor && s.tool !== 'inspect' && s.tool !== 'sun' && s.tool !== 'plates' ? { x: this.cursor[0], y: this.cursor[1], r: this.brushRadius() } : null
     const selected = this.selectedTown !== null ? this.life.reportOf(this.selectedTown)?.pos ?? null : null
-    this.renderer.draw(ctx, c.clientWidth, c.clientHeight, this.view, {
+    // the globe: the whole map drawn flat off screen, then wrapped on the sphere
+    const globe = s.globe && this.globe?.ok ? this.globe : null
+    const side = Globe.mapSize(n)
+    if (globe && (globe.map.width !== side || globe.map.height !== side)) {
+      globe.map.width = side
+      globe.map.height = side
+    }
+    const ctx = globe ? context2d(globe.map) : this.ctx
+    ctx.save()
+    if (!globe) {
+      ctx.scale(dpr, dpr)
+      if (this.shake > 0) ctx.translate((Math.random() - 0.5) * this.shake, (Math.random() - 0.5) * this.shake)
+    }
+    const view = globe ? { cx: n / 2, cy: n / 2, zoom: side / n } : this.view
+    this.renderer.draw(ctx, globe ? side : size.width, globe ? side : size.height, view, {
+      globe: !!globe,
       // no planes fly through volcanic ash
       markers: s.life ? this.life.markers([0, 0], n, 1).filter((m) => m.kind !== 'plane' || !this.world.inAsh(m.uv[0] * n, m.uv[1] * n)) : [],
       roads: s.life ? this.life.roads([0, 0], n, 1) : [],
@@ -762,6 +845,7 @@ export class Game {
       selected,
     })
     ctx.restore()
+    if (globe) globe.render(this.globeView, size.width, size.height, dpr)
   }
 
   private makeStats(fps: number): Stats2d {
@@ -769,6 +853,8 @@ export class Game {
     return {
       fps,
       simTime: w.time,
+      season: w.season,
+      n: w.n,
       sun: w.sun,
       dust: w.dust,
       droughts: w.droughts.length,
@@ -803,10 +889,12 @@ export class Game {
     return { ...stats, selected: this.life.reportOf(this.selectedTown) }
   }
 
-  tileInfo(x: number, y: number): TileInfo | null {
+  tileInfo(tx: number, y: number): TileInfo | null {
     const w = this.world
     const n = w.n
-    if (x < 0 || y < 0 || x >= n || y >= n) return null
+    // (east–west the column is the one round the world)
+    const x = wrap(tx, n)
+    if (y < 0 || y >= n) return null
     const i = (y * n + x) * 4
     const t = w.climate[i + 3]
     const v = w.extra[i]
@@ -874,12 +962,26 @@ export class Game {
 
   // ---- input -------------------------------------------------------------------------
 
-  private onPointerDown = (e: PointerEvent) => {
-    if (e.target !== this.canvas) return
-    this.canvas.setPointerCapture(e.pointerId)
-    const tile = this.tileAt(e)
+  // (the player's input comes in plain values, from the page: see dom.ts)
+
+  pointerDown = (e: PointerInput) => {
+    if (!e.onMap) return
+    const tile = this.pointerTile(e)
     this.cursor = tile
     const s = this.settings
+    // on the globe a drag with the Look power (or the other buttons, or from the space round it) turns it
+    if (s.globe && (e.button === 1 || e.button === 2 || s.tool === 'inspect' || !tile)) {
+      this.globeDrag = { x: e.clientX, y: e.clientY, lon: this.globeView.lon, lat: this.globeView.lat }
+      this.globeGoal = null
+      if (tile && s.tool === 'inspect' && e.button === 0 && s.life) {
+        const town = this.life.townAt([tile[0] / this.world.n, tile[1] / this.world.n], 2.5 / this.world.n)
+        this.selectedTown = town ? town.id : null
+        this.stats = this.makeStats(this.stats.fps)
+        this.emit()
+      }
+      return
+    }
+    if (!tile) return
     if (e.button === 1 || e.button === 2 || s.tool === 'inspect') {
       this.dragging = { x: e.clientX, y: e.clientY, cx: this.view.cx, cy: this.view.cy }
       this.goal = null
@@ -903,18 +1005,27 @@ export class Game {
       this.repeat = { x: tile[0], y: tile[1], t: performance.now() / 1000 }
     }
   }
-  private onPointerMove = (e: PointerEvent) => {
+  pointerMove = (e: PointerInput) => {
+    if (this.globeDrag) {
+      const d = this.globeDrag
+      const size = this.host.size()
+      const r = Globe.radius(this.globeView, size.width, size.height)
+      this.globeView.lon = d.lon - (e.clientX - d.x) / r
+      this.globeView.lat = Math.max(-GLOBE_TILT, Math.min(GLOBE_TILT, d.lat + (e.clientY - d.y) / r))
+      return
+    }
     if (this.dragging) {
       const d = this.dragging
       this.view.cx = d.cx - (e.clientX - d.x) / this.view.zoom
       this.view.cy = d.cy - (e.clientY - d.y) / this.view.zoom
       return
     }
-    this.cursor = e.target === this.canvas || this.painting || this.repeat || this.plateDrag ? this.tileAt(e) : null
+    this.cursor = e.onMap || this.painting || this.repeat || this.plateDrag ? this.pointerTile(e) : null
     if (this.repeat && this.cursor) this.repeatPower()
     if (this.plateDrag && this.cursor) this.steerPlate()
   }
-  private onPointerUp = (e: PointerEvent) => {
+  pointerUp = () => {
+    this.globeDrag = null
     this.dragging = null
     this.painting = false
     this.repeat = null
@@ -928,17 +1039,19 @@ export class Game {
         this.gatherNews()
       }
     }
-    if (this.canvas.hasPointerCapture(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId)
   }
-  private onWheel = (e: WheelEvent) => {
-    if (e.target !== this.canvas) return
-    e.preventDefault()
+  wheel = (e: WheelInput) => {
+    if (!e.onMap) return
     if (e.shiftKey) {
       this.set({ brushSize: Math.max(1, Math.min(40, this.settings.brushSize * (e.deltaY < 0 ? 1.2 : 1 / 1.2))) })
       return
     }
     const v = this.view
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15
+    if (this.settings.globe) {
+      this.globeView.zoom = Math.max(0.5, Math.min(8, this.globeView.zoom * factor))
+      return
+    }
     const before = this.tileAt(e)
     v.zoom = Math.max(1, Math.min(40, v.zoom * factor))
     this.goal = null
@@ -946,16 +1059,13 @@ export class Game {
     v.cx += before[0] - after[0]
     v.cy += before[1] - after[1]
   }
-  private onKey = (e: KeyboardEvent) => {
-    const t = e.target as HTMLElement | null
-    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return
+  keyDown = (e: KeyInput) => {
     const tools: Record<string, Tool2d> = {
       Digit0: 'inspect', Digit1: 'terrain', Digit2: 'water', Digit3: 'forest', Digit4: 'rain', Digit5: 'heat', Digit6: 'sun',
       Digit7: 'people', Digit8: 'drought', Digit9: 'storm', KeyF: 'fire', KeyV: 'volcano', KeyM: 'meteor', KeyB: 'pressure', KeyG: 'plates',
       KeyJ: 'bless', KeyK: 'inspire', KeyL: 'plague', KeyN: 'prophet', KeyQ: 'discord', KeyE: 'peace', KeyU: 'nuke', KeyH: 'quake', KeyY: 'hurricane',
     }
     if ((e.ctrlKey || e.metaKey) && e.code === 'KeyZ') {
-      e.preventDefault()
       this.undo()
       return
     }
@@ -964,7 +1074,6 @@ export class Game {
     else if (e.code === 'Escape') this.set({ tool: 'inspect' })
     else if (e.code === 'KeyX') this.set({ mode: this.settings.mode === 'add' ? 'remove' : 'add' })
     else if (e.code === 'KeyP' || e.code === 'Space') {
-      e.preventDefault()
       this.set({ paused: !this.settings.paused })
     } else if (e.key === '[') this.set({ brushSize: Math.max(1, this.settings.brushSize / 1.25) })
     else if (e.key === ']') this.set({ brushSize: Math.min(40, this.settings.brushSize * 1.25) })
@@ -973,15 +1082,14 @@ export class Game {
     else if (e.code === 'KeyT') this.set({ windArrows: !this.settings.windArrows })
     else if (e.code === 'KeyI') this.set({ look: this.settings.look === 'satellite' ? 'illustrated' : 'satellite' })
     else if (PAN_KEYS[e.code]) {
-      e.preventDefault()
       this.held.add(e.code)
       this.goal = null
     }
   }
-  private onKeyUp = (e: KeyboardEvent) => {
+  keyUp = (e: KeyInput) => {
     this.held.delete(e.code)
   }
-  private onBlur = () => this.held.clear()
+  blur = () => this.held.clear()
 
   /** WASD and the arrows glide the map while held (Shift: faster), the same speed on screen at any zoom. */
   private pan(dt: number) {
@@ -995,44 +1103,34 @@ export class Game {
     }
     if (!dx && !dy) return
     const len = Math.hypot(dx, dy)
+    if (this.settings.globe) {
+      // the keys turn the globe: the same pace on screen at any zoom
+      const turn = ((this.held.has('ShiftLeft') || this.held.has('ShiftRight') ? 2.4 : 1) / this.globeView.zoom) * dt
+      this.globeGoal = null
+      this.globeView.lon += (dx / len) * turn
+      this.globeView.lat = Math.max(-GLOBE_TILT, Math.min(GLOBE_TILT, this.globeView.lat - (dy / len) * turn))
+      return
+    }
     const speed = (this.held.has('ShiftLeft') || this.held.has('ShiftRight') ? 1400 : 600) / this.view.zoom
     this.view.cx += (dx / len) * speed * dt
     this.view.cy += (dy / len) * speed * dt
   }
-  private onLeave = () => {
+  leave = () => {
     if (!this.painting && !this.dragging && !this.repeat && !this.plateDrag) this.cursor = null
   }
-  private onContext = (e: Event) => e.preventDefault()
 
-  private bind() {
-    const c = this.canvas
-    c.addEventListener('pointerdown', this.onPointerDown)
-    window.addEventListener('pointermove', this.onPointerMove)
-    window.addEventListener('pointerup', this.onPointerUp)
-    c.addEventListener('wheel', this.onWheel, { passive: false })
-    c.addEventListener('pointerleave', this.onLeave)
-    c.addEventListener('contextmenu', this.onContext)
-    window.addEventListener('keydown', this.onKey)
-    window.addEventListener('keyup', this.onKeyUp)
-    window.addEventListener('blur', this.onBlur)
-  }
-  private unbind() {
-    const c = this.canvas
-    c.removeEventListener('pointerdown', this.onPointerDown)
-    window.removeEventListener('pointermove', this.onPointerMove)
-    window.removeEventListener('pointerup', this.onPointerUp)
-    c.removeEventListener('wheel', this.onWheel)
-    c.removeEventListener('pointerleave', this.onLeave)
-    c.removeEventListener('contextmenu', this.onContext)
-    window.removeEventListener('keydown', this.onKey)
-    window.removeEventListener('keyup', this.onKeyUp)
-    window.removeEventListener('blur', this.onBlur)
+  /** The tile under the pointer (its place from the map's top left corner): on the flat map always one; on the globe none when the pointer is off it. */
+  private pointerTile(e: { clientX: number; clientY: number }): [number, number] | null {
+    if (!this.settings.globe) return this.tileAt(e)
+    const r = this.host.size()
+    const place = globePick(e.clientX - r.width / 2, e.clientY - r.height / 2, Globe.radius(this.globeView, r.width, r.height), this.globeView)
+    return place ? [place[0] * this.world.n, place[1] * this.world.n] : null
   }
 
   private tileAt(e: { clientX: number; clientY: number }): [number, number] {
-    const r = this.canvas.getBoundingClientRect()
+    const r = this.host.size()
     const v = this.view
-    return [v.cx + (e.clientX - r.left - r.width / 2) / v.zoom, v.cy + (e.clientY - r.top - r.height / 2) / v.zoom]
+    return [v.cx + (e.clientX - r.width / 2) / v.zoom, v.cy + (e.clientY - r.height / 2) / v.zoom]
   }
 
   private brushRadius() {
@@ -1145,12 +1243,12 @@ export class Game {
         const fx = { bless: 'sparkle', inspire: 'inspire', plague: 'plague', prophet: 'prophet', discord: 'war', peace: 'peace' } as const
         this.effect(fx[s.tool], x, y, 4, 2.2)
         const snd: Record<string, SoundKind> = { bless: 'chime', inspire: 'chime', plague: 'plague', prophet: 'whoosh', discord: 'war', peace: 'chime' }
-        this.sound.play(snd[s.tool])
+        this.play(snd[s.tool])
         break
       }
       case 'hurricane': {
         w.hurricane(x, y)
-        this.sound.play('thunder')
+        this.play('thunder')
         this.toast('Um furacão nasce: cresce sobre mar quente, morre em terra ou mar frio')
         break
       }
@@ -1196,7 +1294,7 @@ export class Game {
       }
       case 'sun': {
         this.effect('flare', x, y, remove ? -1 : 1, 1.2)
-        this.sound.play('whoosh')
+        this.play('whoosh')
         w.sun = Math.max(-10, Math.min(10, w.sun + (remove ? -1 : 1)))
         const shown = `${w.sun > 0 ? '+' : ''}${w.sun.toFixed(0)} °C`
         this.toast(remove ? `O sol enfraquece: o planeta esfria 1 °C (${shown})` : `O sol se fortalece: o planeta esquenta 1 °C (${shown})`)
@@ -1208,7 +1306,7 @@ export class Game {
         if (this.life.seedCiv(pos, 1)) {
           this.toast('Um povo novo desperta aqui')
           this.effect('sparkle', x, y, 3, 2)
-          this.sound.play('chime')
+          this.play('chime')
         }
         else if (!again) this.toast('Ninguém vive aqui: precisa de terra firme, sem gelo nem lava, longe de outra cidade')
         break
@@ -1230,7 +1328,7 @@ export class Game {
       case 'storm': {
         w.storm(x, y, this.brushRadius())
         this.effect('lightning', x, y, this.brushRadius(), 6)
-        this.sound.play('thunder')
+        this.play('thunder')
         this.toast('Tempestade: uma baixa que o vento leva, chovendo por onde passa')
         if (!again) this.chronicle('Uma tempestade desaba sobre a terra.', false, pos)
         break
@@ -1245,7 +1343,7 @@ export class Game {
         w.erupt(x, y, 0.6 + Math.random() * 0.4)
         this.effect('eruption', x, y, 5, 6)
         this.shake = Math.max(this.shake, 6)
-        this.sound.play('rumble')
+        this.play('rumble')
         if (s.life && this.life.airRoutes().length) this.chronicle('As cinzas do vulcão fecham o céu: voos cancelados por onde a nuvem passa.', false, pos)
         this.toast('Um vulcão abre: a lava desce e vira rocha nova')
         this.chronicle('A terra se abre: um vulcão entra em erupção.', true, pos)
@@ -1261,7 +1359,7 @@ export class Game {
         }
         this.effect('impact', x, y, r, 2.5)
         this.shake = Math.max(this.shake, 16)
-        this.sound.play('boom')
+        this.play('boom')
         this.toast(`Impacto! Cratera, fogo e poeira que esfria o planeta ${w.dust.toFixed(1).replace('.', ',')} °C até baixar`)
         this.chronicle('Uma estrela cai do céu: fogo, cratera e dias de poeira.', true, pos)
         break
@@ -1282,7 +1380,7 @@ export class Game {
     const strikes = this.life.takeStrikes()
     if (!strikes.length) return
     const n = this.world.n
-    this.sound.play('siren')
+    this.play('siren')
     strikes.forEach((s, k) => {
       const x0 = s.from[0] * n
       const y0 = s.from[1] * n
@@ -1305,8 +1403,8 @@ export class Game {
     this.renderer.refresh()
     this.shake = 40
     this.effect('impact', this.world.n / 2, this.world.n / 2, this.world.n * 0.4, 4)
-    this.sound.play('boom')
-    this.sound.play('rumble')
+    this.play('boom')
+    this.play('rumble')
     this.toast('CATACLISMO: o planeta se refaz')
   }
 
@@ -1324,7 +1422,7 @@ export class Game {
     const [x0, y0] = edges.sort((a, b) => Math.hypot(a[0] - x, a[1] - y) - Math.hypot(b[0] - x, b[1] - y))[0]
     const flight = 1.8
     const start = this.realTime
-    this.sound.play('siren')
+    this.play('siren')
     this.effects = [
       ...this.effects,
       { kind: 'missile' as const, x: x0, y: y0, tx: x, ty: y, r: 1, t0: start, dur: flight },
@@ -1413,18 +1511,14 @@ export class Game {
     this.ring = this.ring.slice(0, k + 1)
     this.restoreSnap(s)
     this.toast(`De volta ao ano ${s.year}`)
-    this.sound.play('whoosh')
+    this.play('whoosh')
   }
 
   /** The world as a file to keep (downloaded by the browser). */
   async save() {
     try {
       const blob = await toFile({ format: 'craftscape-2d', version: 1, snap: this.snap() })
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = `craftscape-2d-ano-${Math.floor(this.world.time / 10)}.json${blob.type === 'application/json' ? '' : '.gz'}`
-      a.click()
-      setTimeout(() => URL.revokeObjectURL(a.href), 10000)
+      this.host.download(blob, `craftscape-2d-ano-${Math.floor(this.world.time / 10)}.json${blob.type === 'application/json' ? '' : '.gz'}`)
       this.toast('Mundo salvo no seu computador')
     } catch (err) {
       this.toast(`Não foi possível salvar: ${(err as Error).message}`)
@@ -1432,7 +1526,7 @@ export class Game {
   }
 
   /** A world saved before, back from its file. */
-  async load(file: File) {
+  async load(file: Blob) {
     try {
       const data = (await fromFile(file)) as { format?: string; snap?: Snap }
       if (data.format !== 'craftscape-2d' || !data.snap) throw new Error('não é um mundo do Craftscape 2D')
@@ -1516,14 +1610,10 @@ export class Game {
       st.done = true
       if (!this.completed.includes(c.id)) {
         this.completed = [...this.completed, c.id]
-        try {
-          localStorage.setItem(COMPLETED_KEY, JSON.stringify(this.completed))
-        } catch {
-          // storage unavailable: the badge just lasts this session
-        }
+        this.host.keepCompleted(this.completed)
       }
       this.effect('fireworks', 0, 0, 1, 4)
-      this.sound.play('fanfare')
+      this.play('fanfare')
       this.chronicle(`Desafio cumprido: ${c.name}! ${c.goal}.`, true)
       this.toast(`Desafio cumprido: ${c.name}!`)
     }

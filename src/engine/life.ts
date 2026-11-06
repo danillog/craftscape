@@ -10,7 +10,8 @@
 
 import type { Field } from './engine'
 
-export type LifeKind = 'herd' | 'village' | 'battle' | 'ruin' | 'boat' | 'party' | 'dam' | 'plane'
+/** fire, blast and cyclone are the 3D engine's own markers (a wildfire, a nuclear blast, a hurricane). */
+export type LifeKind = 'herd' | 'village' | 'battle' | 'ruin' | 'boat' | 'party' | 'dam' | 'plane' | 'fire' | 'blast' | 'cyclone'
 
 /** What a party on the road is: traders, soldiers, people fleeing, people going to found a town. */
 export type PartyKind = 'caravan' | 'army' | 'migrants' | 'settlers' | 'ship'
@@ -645,8 +646,26 @@ function saturate(x: number): number {
   return x / (1 + x / 3)
 }
 
+/**
+ * The width (world units) of a world that is round east to west, as the 2D game's planet
+ * is; 0 for a flat world with edges (the 3D game's). The life in play sets it (see
+ * Life.wrapWidth).
+ */
+let WRAP = 0
+/** How far east of b the place a lies: on a round world the short way round. */
+const eastOf = (a: number, b: number) => {
+  const d = a - b
+  return WRAP ? d - WRAP * Math.round(d / WRAP) : d
+}
 function dist(a: [number, number], b: [number, number]): number {
-  return Math.hypot(a[0] - b[0], a[1] - b[1])
+  return Math.hypot(eastOf(a[0], b[0]), a[1] - b[1])
+}
+/** b as seen from a: on a round world the copy of it that is nearest (it may lie past the map's edge). */
+const nearest = (a: [number, number], b: [number, number]): [number, number] => (WRAP ? [a[0] + eastOf(b[0], a[0]), b[1]] : b)
+/** A place brought back onto the map (east–west, on a round world). */
+const onMap = (p: [number, number]): [number, number] => {
+  if (WRAP) p[0] = ((p[0] % WRAP) + WRAP) % WRAP
+  return p
 }
 
 export class Life {
@@ -766,8 +785,23 @@ export class Life {
     return out
   }
 
+  /**
+   * The width (world units) of a world that is round east to west, 0 for a flat one. The 2D
+   * game sets it to its map's width: distances, roads, voyages and lands then go the short
+   * way round, across the map's edge.
+   */
+  get wrapWidth() {
+    return this.wrap
+  }
+  set wrapWidth(width: number) {
+    this.wrap = width
+    WRAP = width
+  }
+  private wrap = 0
+
   /** Advances the life by dt simulated seconds, reading the world from the field. */
   update(dt: number, field: Field | null, extent: number) {
+    WRAP = this.wrap
     if (!field || dt <= 0) return
     this.field = field
     // at a low frame rate a frame covers seconds: step through it, the rates are per second
@@ -855,7 +889,7 @@ export class Life {
     }
     const danger = here.lava > 0.0002 || here.water > 0.01
     const speed = HERD_SPEED * (danger ? 2 : 1) * (0.7 + 0.6 * (1 - sp.size))
-    c.pos = [c.pos[0] + c.dir[0] * speed * dt, c.pos[1] + c.dir[1] * speed * dt]
+    c.pos = onMap([c.pos[0] + c.dir[0] * speed * dt, c.pos[1] + c.dir[1] * speed * dt])
     // grazing feeds it; bare ground, cold, heat, floods and lava wear it down
     const fed = here.vegetation > sp.veg && here.water < 0.001 && here.ice < 0.0005
     const harsh = here.temperature < sp.tMin - 3 || here.temperature > sp.tMax + 3
@@ -1245,7 +1279,9 @@ export class Life {
   /** Sends a party walking from one place to another; too many on the roads and the oldest gives way. */
   private send(kind: PartyKind, from: [number, number], to: [number, number], color: number, size = 0.5) {
     if (dist(from, to) < 1e-6) return
-    this.parties.push({ kind, from: [from[0], from[1]], to: [to[0], to[1]], t: 0, speed: kind === 'army' ? MARCH_SPEED : kind === 'ship' ? SHIP_SPEED : WALK_SPEED, color, size })
+    // (on a round world it goes the short way: its end is the copy nearest its start)
+    const end = nearest(from, to)
+    this.parties.push({ kind, from: [from[0], from[1]], to: [end[0], end[1]], t: 0, speed: kind === 'army' ? MARCH_SPEED : kind === 'ship' ? SHIP_SPEED : WALK_SPEED, color, size })
     if (this.parties.length > MAX_PARTIES) this.parties.shift()
   }
 
@@ -1638,7 +1674,7 @@ export class Life {
     return {
       id: this.nextTown++,
       name: placeName(),
-      pos,
+      pos: onMap([pos[0], pos[1]]),
       age: 0,
       needs: {
         food: 0,
@@ -1971,8 +2007,9 @@ export class Life {
   /** The field's cell under a world position, or null outside the window it was read from. */
   private cellAt(field: Field, pos: [number, number], extent: number): Cell | null {
     const n = field.size
-    const u = pos[0] / extent - field.origin[0] / n
+    let u = pos[0] / extent - field.origin[0] / n
     const v = pos[1] / extent - field.origin[1] / n
+    if (WRAP) u = (((u * extent) % WRAP) + WRAP) % WRAP / extent
     if (u < 0 || v < 0 || u >= 1 || v >= 1) return null
     const i = Math.floor(v * n) * n + Math.floor(u * n)
     return {
@@ -1991,6 +2028,7 @@ export class Life {
 
   private inWindow(pos: [number, number], origin: [number, number], n: number, extent: number): [number, number] | null {
     const uv: [number, number] = [pos[0] / extent - origin[0] / n, pos[1] / extent - origin[1] / n]
+    if (WRAP) uv[0] = (((uv[0] * extent) % WRAP) + WRAP) % WRAP / extent
     return uv[0] < 0 || uv[1] < 0 || uv[0] > 1 || uv[1] > 1 ? null : uv
   }
 
@@ -2087,14 +2125,14 @@ export class Life {
         .filter((t) => t.civ === c.id && t.id !== cap.id && dist(t.pos, cap.pos) > 0.15)
         .sort((a, b) => dist(b.pos, cap.pos) - dist(a.pos, cap.pos))
         .slice(0, 3)
-      for (const t of far) out.push({ a: cap.pos, b: t.pos, kind: 4, from: cap.id, to: t.id, color: c.color })
+      for (const t of far) out.push({ a: cap.pos, b: nearest(cap.pos, t.pos), kind: 4, from: cap.id, to: t.id, color: c.color })
     }
     for (let i = 0; i < modern.length; i++) {
       for (let j = i + 1; j < modern.length; j++) {
         const a = capitals.get(modern[i].id)
         const b = capitals.get(modern[j].id)
         if (!a || !b || this.warBetween(modern[i].id, modern[j].id)) continue
-        out.push({ a: a.pos, b: b.pos, kind: 4, from: a.id, to: b.id, color: modern[i].color })
+        out.push({ a: a.pos, b: nearest(a.pos, b.pos), kind: 4, from: a.id, to: b.id, color: modern[i].color })
       }
     }
     return out.slice(0, 24)
@@ -2141,14 +2179,16 @@ export class Life {
           if (d > CONTACT || this.warBetween(ta.civ, tb.civ)) continue
           kind = 2
         }
-        const wet = waterBetween(ta.pos, tb.pos)
+        // (on a round world the road goes the short way: its far end is the nearest copy)
+        const far = nearest(ta.pos, tb.pos)
+        const wet = waterBetween(ta.pos, far)
         // a road fords a stream; across open water only sailors keep the link, and then by sea
         const ford = wet < 2 && kind !== 2
         if (wet > 0 && !ford) {
           if (ca.tech >= TECH_SAILING && cb.tech >= TECH_SAILING) kind = 3
           else continue
         }
-        out.push({ a: ta.pos, b: tb.pos, kind, from: ta.id, to: tb.id, color: ca.color })
+        out.push({ a: ta.pos, b: far, kind, from: ta.id, to: tb.id, color: ca.color })
       }
     }
     // the shortest first when there are too many
@@ -2162,6 +2202,12 @@ export class Life {
     const out: RoadSegment[] = []
     for (const r of this.routes()) {
       const a = this.inWindow(r.a, origin, n, extent)
+      if (WRAP) {
+        // on a round world the far end is drawn the short way from the near one: it may lie
+        // past the map's edge, where the map repeats
+        if (a) out.push({ a, b: [a[0] + (r.b[0] - r.a[0]) / extent, r.b[1] / extent - origin[1] / n], kind: r.kind })
+        continue
+      }
       const b = this.inWindow(r.b, origin, n, extent)
       if (a && b) out.push({ a, b, kind: r.kind })
     }
@@ -2193,7 +2239,8 @@ export class Life {
         for (const t of towns) {
           if (!this.inWindow(t.pos, origin, n, extent)) continue
           const w = 0.3 + t.pop
-          wx += t.pos[0] * w
+          // (counted from the capital, so a land that lies across a round world's edge has its middle there)
+          wx += (capital.pos[0] + eastOf(t.pos[0], capital.pos[0])) * w
           wy += t.pos[1] * w
           sum += w
         }
@@ -2308,8 +2355,9 @@ export class Life {
       const cx = (t.pos[0] / extent - origin[0] / n) * T
       const cy = (t.pos[1] / extent - origin[1] / n) * T
       const r = land * cellsPerUnit
-      const x0 = Math.max(0, Math.floor(cx - r))
-      const x1 = Math.min(T - 1, Math.ceil(cx + r))
+      // (on a round world a land near the map's edge goes on at the other side: the columns wrap)
+      const x0 = WRAP ? Math.floor(cx - r) : Math.max(0, Math.floor(cx - r))
+      const x1 = WRAP ? Math.ceil(cx + r) : Math.min(T - 1, Math.ceil(cx + r))
       const y0 = Math.max(0, Math.floor(cy - r))
       const y1 = Math.min(T - 1, Math.ceil(cy + r))
       const weight = (0.3 + t.pop) * (1 + civ.tech)
@@ -2321,7 +2369,7 @@ export class Life {
           const d2 = dx * dx + dy * dy
           if (d2 > 1) continue
           const s = weight * (1 - d2)
-          const i = y * T + x
+          const i = y * T + (WRAP ? ((x % T) + T) % T : x)
           if (s <= strength[i]) continue
           strength[i] = s
           map[i] = value
@@ -2434,20 +2482,23 @@ export class Life {
         p[0] += d[0]
         p[1] += d[1]
       }
+      return p
     }
     for (const t of this.towns) {
       const d = move(t.pos)
       if (!d) continue
       t.pos[0] += d[0]
       t.pos[1] += d[1]
+      onMap(t.pos)
       if (t.dam) {
         t.dam[0] += d[0]
         t.dam[1] += d[1]
+        onMap(t.dam)
       }
     }
-    for (const c of this.creatures) shift(c.pos)
-    for (const r of this.ruins) shift(r.pos)
-    for (const b of this.battles) shift(b.pos)
+    for (const c of this.creatures) onMap(shift(c.pos))
+    for (const r of this.ruins) onMap(shift(r.pos))
+    for (const b of this.battles) onMap(shift(b.pos))
     for (const p of this.parties) {
       shift(p.from)
       shift(p.to)
@@ -2560,7 +2611,8 @@ export class Life {
         .sort((x, y) => y.pop - x.pop)
         .slice(0, 1 + Math.round(att.tech * 3))
       for (const t of targets) {
-        out.push({ from: [from[0], from[1]], to: [t.pos[0], t.pos[1]], town: t.name })
+        const target = nearest(from, t.pos)
+        out.push({ from: [from[0], from[1]], to: [target[0], target[1]], town: t.name })
         t.pop *= 0.12
         t.granary = 0
         t.strain = 1

@@ -15,6 +15,7 @@
 
 import type { BoundaryKind } from '../engine/plates'
 import { fbm, hash2 } from './noise'
+import { centreOf, wrap, wrapDelta } from './wrap'
 
 /** World units across the map: the uplift's widths (from the 3D game) are in world units. */
 export const WORLD_UNITS = 3
@@ -160,6 +161,9 @@ export class Tectonics {
   private readonly crushed: Uint8Array
   private readonly liftMoved: Float32Array
   private scratch = new Float32Array(0)
+  /** The cosine and the sine of every column's longitude (for the plates' centres round the world). */
+  private cosX = new Float64Array(0)
+  private sinX = new Float64Array(0)
   private readonly edgeBand: Float32Array
   /** Mountains to raise after a move: front tile, direction into the winning side, volume, where the crest is and how wide. */
   private orogens: { j: number; dir: [number, number]; volume: number; peak: number; width: number }[] = []
@@ -175,9 +179,9 @@ export class Tectonics {
     this.n = n
     this.seed = seed
     const cells = n * n
-    // the width of the sea band along the map's edge, winding: 4 to 10 tiles
+    // the width of the sea band along the top and the bottom of the map, winding: 4 to 10 tiles
     this.edgeBand = new Float32Array(cells)
-    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) this.edgeBand[y * n + x] = 4 + 6 * fbm((x / n) * 6, (y / n) * 6, seed + 57, 3)
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) this.edgeBand[y * n + x] = 4 + 6 * fbm((x / n) * 6, (y / n) * 6, seed + 57, 3, 0.5, 2, 6)
     this.plate = new Int16Array(cells)
     this.other = new Int16Array(cells)
     this.dist = new Float32Array(cells)
@@ -250,7 +254,7 @@ export class Tectonics {
     const measures: ((x: number, y: number, i: number) => number)[] = []
     // the land each continental plate owns whole (no stretch of coast left on the ocean's plate)
     const owned: number[][] = []
-    const centre = (t: number[]) => t.reduce((c, i) => [c[0] + (i % n) / t.length, c[1] + Math.floor(i / n) / t.length], [0, 0])
+    const centre = (t: number[]) => centreOf(t, n)
     const addContinent = (tiles: number[], angle?: number) => {
       const k = this.plates.length
       owned.push(tiles)
@@ -269,7 +273,7 @@ export class Tectonics {
         const [a, b] = this.wavySplit(tiles)
         const [ax, ay] = centre(a)
         const [bx, by] = centre(b)
-        const apart = Math.atan2(by - ay, bx - ax)
+        const apart = Math.atan2(by - ay, wrapDelta(bx, ax, n))
         const turn = (this.rand(this.plates.length, 8) - 0.5) * 0.8
         addContinent(a, apart + Math.PI + turn)
         addContinent(b, apart + turn)
@@ -288,7 +292,7 @@ export class Tectonics {
         const y = Math.floor(i / n)
         let d = Infinity
         for (const m of measures) d = Math.min(d, m(x, y, i))
-        d = Math.min(d, 2 * Math.min(x, y, n - 1 - x, n - 1 - y) + n * 0.1)
+        d = Math.min(d, 2 * Math.min(y, n - 1 - y) + n * 0.1)
         if (d > bestD) [best, bestD] = [i, d]
       }
       const kk = this.plates.length
@@ -296,16 +300,16 @@ export class Tectonics {
       this.newPlate(false, this.rand(kk, 1) * Math.PI * 2, 0.6 + 0.4 * this.rand(kk, 2))
       const cx = best % n
       const cy = Math.floor(best / n)
-      measures.push((x, y) => Math.hypot(x - cx, y - cy))
+      measures.push((x, y) => Math.hypot(wrapDelta(x, cx, n), y - cy))
     }
     // every tile to the nearest plate, through a noise warp so the boundaries wander
     const amp = WARP * n
     for (let y = 0; y < n; y++) {
       for (let x = 0; x < n; x++) {
         const i = y * n + x
-        const wx = x + (fbm((x / n) * 3, (y / n) * 3, this.seed + 41, 4) - 0.5) * 2 * amp
-        const wy = y + (fbm((x / n) * 3 + 7.3, (y / n) * 3 + 2.1, this.seed + 43, 4) - 0.5) * 2 * amp
-        const j = Math.min(Math.max(Math.round(wy), 0), n - 1) * n + Math.min(Math.max(Math.round(wx), 0), n - 1)
+        const wx = x + (fbm((x / n) * 3, (y / n) * 3, this.seed + 41, 4, 0.5, 2, 3) - 0.5) * 2 * amp
+        const wy = y + (fbm((x / n) * 3 + 7.3, (y / n) * 3 + 2.1, this.seed + 43, 4, 0.5, 2, 3) - 0.5) * 2 * amp
+        const j = Math.min(Math.max(Math.round(wy), 0), n - 1) * n + wrap(Math.round(wx), n)
         let best = 0
         let bd = Infinity
         for (let k = 0; k < measures.length; k++) {
@@ -408,10 +412,11 @@ export class Tectonics {
       dest[i] = -1
       const [dx, dy] = steps[L[i]]
       if (!dx && !dy) continue
-      const x = (i % n) + dx
+      // (east–west it goes round the world)
+      const x = wrap((i % n) + dx, n)
       const y = Math.floor(i / n) + dy
-      // off the map: gone (it slides under the map's edge)
-      if (x >= 0 && y >= 0 && x < n && y < n) dest[i] = y * n + x
+      // off the top or the bottom of the map: gone (it slides under the map's edge)
+      if (y >= 0 && y < n) dest[i] = y * n + x
     }
     // where two plates meet head-on, or a plate runs into one standing still, the crusts
     // contest the tile: the loser dives (it is gone), the winner takes the tile and the land
@@ -527,7 +532,7 @@ export class Tectonics {
     this.smoothCoasts(ground, sea)
     // the peoples and the herds ride along
     carry((x, y) => {
-      const xx = Math.min(Math.max(Math.floor(x), 0), n - 1)
+      const xx = wrap(Math.floor(x), n)
       const yy = Math.min(Math.max(Math.floor(y), 0), n - 1)
       const [dx, dy] = steps[L[yy * n + xx]]
       return dx || dy ? [dx, dy] : null
@@ -550,21 +555,21 @@ export class Tectonics {
     for (let pass = 0; pass < 2; pass++) {
       old.set(lab)
       for (let y = 1; y < n - 1; y++) {
-        for (let x = 1; x < n - 1; x++) {
+        for (let x = 0; x < n; x++) {
           const i = y * n + x
           const own = old[i]
           let best = -1
           for (let dy = -1; dy <= 1; dy++) {
             for (let dx = -1; dx <= 1; dx++) {
               if (!dx && !dy) continue
-              const k = old[i + dy * n + dx]
+              const k = old[beside(i, x, dx, dy, n)]
               if (k === own) continue
               counts[k]++
               if (best < 0 || counts[k] > counts[best]) best = k
             }
           }
           if (best >= 0 && counts[best] >= 5) lab[i] = best
-          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) counts[old[i + dy * n + dx]] = 0
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) counts[old[beside(i, x, dx, dy, n)]] = 0
         }
       }
     }
@@ -587,9 +592,9 @@ export class Tectonics {
       for (let t = 0; t <= R; t++) {
         // the ridge spreads a tile to either side too, so it is a band, not a line
         for (let side = -1; side <= 1; side++) {
-          const x = x0 + o.dir[0] * t + (o.dir[1] !== 0 ? side : 0)
+          const x = wrap(x0 + o.dir[0] * t + (o.dir[1] !== 0 ? side : 0), n)
           const y = y0 + o.dir[1] * t + (o.dir[0] !== 0 && o.dir[1] === 0 ? side : 0)
-          if (x < 0 || y < 0 || x >= n || y >= n) continue
+          if (y < 0 || y >= n) continue
           const i = y * n + x
           const dh = (o.volume * Math.exp(-(((t - o.peak) / o.width) ** 2))) / total / 3
           ground[i * 4] += dh
@@ -611,11 +616,11 @@ export class Tectonics {
     const old = this.liftMoved
     for (let i = 0; i < n * n; i++) old[i] = ground[i * 4]
     for (let y = 1; y < n - 1; y++) {
-      for (let x = 1; x < n - 1; x++) {
+      for (let x = 0; x < n; x++) {
         const i = y * n + x
         const h = old[i]
         if (h < sea + 0.06) continue
-        for (const j of [i - 1, i + 1, i - n, i + n]) {
+        for (const j of [beside(i, x, -1, 0, n), beside(i, x, 1, 0, n), i - n, i + n]) {
           const d = h - old[j]
           if (d <= 0.004) continue
           const f = Math.min((d - 0.004) * WEAR, 0.004)
@@ -629,8 +634,9 @@ export class Tectonics {
   }
 
   /**
-   * The map's edge is open sea: land pushed against it subsides into a band of winding width
-   * (the coast there follows a noise, not the straight edge of the map).
+   * The top and the bottom of the map are open sea: land pushed against them subsides into
+   * a band of winding width (the coast there follows a noise, not the straight edge of the
+   * map). East and west there is no edge.
    */
   private edgeSea(ground: Float32Array, sea: number) {
     const n = this.n
@@ -638,7 +644,7 @@ export class Tectonics {
     for (let y = 0; y < n; y++) {
       for (let x = 0; x < n; x++) {
         const i = y * n + x
-        const e = Math.min(x, y, n - 1 - x, n - 1 - y)
+        const e = Math.min(y, n - 1 - y)
         if (e >= band[i] || ground[i * 4] < sea - 0.01) continue
         const dh = Math.min(0.004, ground[i * 4] - (sea - 0.01))
         ground[i * 4] -= dh
@@ -657,7 +663,7 @@ export class Tectonics {
     const old = this.liftMoved
     for (let i = 0; i < n * n; i++) old[i] = ground[i * 4]
     for (let y = 1; y < n - 1; y++) {
-      for (let x = 1; x < n - 1; x++) {
+      for (let x = 0; x < n; x++) {
         const i = y * n + x
         if (this.dist[i] * sc > 4 && !this.opened[i]) continue
         let land = 0
@@ -665,7 +671,7 @@ export class Tectonics {
         for (let dy = -1; dy <= 1; dy++) {
           for (let dx = -1; dx <= 1; dx++) {
             if (!dx && !dy) continue
-            const h = old[i + dy * n + dx]
+            const h = old[beside(i, x, dx, dy, n)]
             sum += h
             if (h >= sea) land++
           }
@@ -694,12 +700,10 @@ export class Tectonics {
       if (!p.alive || count[k] >= SWALLOWED * cells) continue
       // the neighbour it touches most takes what is left
       const touch = new Int32Array(this.plates.length)
-      let sx = 0
-      let sy = 0
+      const last: number[] = []
       for (let i = 0; i < cells; i++) {
         if (this.plate[i] !== k) continue
-        sx += i % n
-        sy += Math.floor(i / n)
+        last.push(i)
         for (const j of neighbours(i, n)) if (j >= 0 && this.plate[j] !== k) touch[this.plate[j]]++
       }
       let heir = -1
@@ -713,13 +717,14 @@ export class Tectonics {
       count[k] = 0
       // where it went under: the centre of its last tiles
       if (left > 0) {
+        const [x, y] = centreOf(last, n)
         this.news.push({
           text: p.continental ? 'Uma placa continental foi engolida: a colisão a soldou à vizinha.' : 'Uma placa oceânica foi engolida inteira, mergulhando sob a vizinha.',
-          x: sx / left,
-          y: sy / left,
+          x,
+          y,
           major: true,
         })
-      } else this.news.push({ text: 'Uma placa saiu do mapa, mergulhando sob a borda do mundo.' })
+      } else this.news.push({ text: 'Uma placa saiu do mapa, mergulhando sob a borda polar do mundo.' })
     }
     const alive = this.plates.filter((p) => p.alive).length
     if (alive < MIN_PLATES) this.rift(ground, sea, count)
@@ -744,15 +749,14 @@ export class Tectonics {
     for (let i = 0; i < n * n; i++) if (this.plate[i] === big) tiles.push(i)
     if (tiles.length < 50) return
     const [a, b] = this.wavySplit(tiles)
-    const centre = (t: number[]) => t.reduce((s, i) => [s[0] + (i % n) / t.length, s[1] + Math.floor(i / n) / t.length], [0, 0])
-    const [ax, ay] = centre(a)
-    const [bx, by] = centre(b)
+    const [ax, ay] = centreOf(a, n)
+    const [bx, by] = centreOf(b, n)
     let land = 0
     for (const i of b) if (ground[i * 4] >= sea) land++
     const old = this.plates[big]
     const k = this.plates.length
     // the new half drifts away from the old one
-    const away = Math.atan2(by - ay, bx - ax)
+    const away = Math.atan2(by - ay, wrapDelta(bx, ax, n))
     const p = this.newPlate(land > b.length * 0.3, away + (this.rand(k, 6) - 0.5) * 0.6, 0.4 + 0.4 * this.rand(k, 7))
     old.vx = -p.vx * 0.6
     old.vy = -p.vy * 0.6
@@ -774,7 +778,7 @@ export class Tectonics {
     }
     this.news.push({
       text: old.continental ? 'Um rifte parte o continente em dois: o vale afunda e um novo oceano começa a se abrir.' : 'Um rifte parte uma placa em duas: um novo oceano começa a se abrir.',
-      x: (ax + bx) / 2,
+      x: wrap(ax + wrapDelta(bx, ax, n) / 2, n),
       y: (ay + by) / 2,
       major: true,
       fx: 'rift',
@@ -789,9 +793,11 @@ export class Tectonics {
   private wavySplit(tiles: number[]): [number[], number[]] {
     const n = this.n
     const [a0, b0] = split(tiles, n)
-    const centre = (t: number[]) => t.reduce((c, i) => [c[0] + (i % n) / t.length, c[1] + Math.floor(i / n) / t.length], [0, 0])
-    const [ax, ay] = centre(a0)
-    const [bx, by] = centre(b0)
+    // (the columns are counted from the first half's middle, round the world, so a plate
+    // that lies across the map's edge is split as the one piece it is)
+    const [ax, ay] = centreOf(a0, n)
+    const [cx, by] = centreOf(b0, n)
+    const bx = ax + wrapDelta(cx, ax, n)
     const len = Math.hypot(bx - ax, by - ay) || 1
     const ux = (bx - ax) / len
     const uy = (by - ay) / len
@@ -803,8 +809,8 @@ export class Tectonics {
     for (const i of tiles) {
       const x = i % n
       const y = Math.floor(i / n)
-      const bend = (fbm((x / n) * 3, (y / n) * 3, salt, 4) - 0.5) * 2 * len * 0.45
-      if ((x - mx) * ux + (y - my) * uy + bend < 0) a.push(i)
+      const bend = (fbm((x / n) * 3, (y / n) * 3, salt, 4, 0.5, 2, 3) - 0.5) * 2 * len * 0.45
+      if (wrapDelta(x, mx, n) * ux + (y - my) * uy + bend < 0) a.push(i)
       else b.push(i)
     }
     return a.length && b.length ? [a, b] : [a0, b0]
@@ -839,20 +845,21 @@ export class Tectonics {
     // propagate the nearest seed of the same plate (squared distance to it, in chamfer
     // order: forwards, then backwards)
     const pass = (forward: boolean) => {
-      const offs = forward ? [-1, -n, -n - 1, -n + 1] : [1, n, n + 1, n - 1]
+      const dys = forward ? [0, -1, -1, -1] : [0, 1, 1, 1]
       const dxs = forward ? [-1, 0, -1, 1] : [1, 0, 1, -1]
       for (let t = 0; t < cells; t++) {
         const i = forward ? t : cells - 1 - t
         const x = i % n
+        const y = (i - x) / n
         const k = lab[i]
         for (let c = 0; c < 4; c++) {
-          const xx = x + dxs[c]
-          const j = i + offs[c]
-          if (xx < 0 || xx >= n || j < 0 || j >= cells) continue
+          const yy = y + dys[c]
+          if (yy < 0 || yy >= n) continue
+          const j = yy * n + wrap(x + dxs[c], n)
           const s = near[j]
           if (s < 0 || lab[s] !== k) continue
-          const ddx = x - (s % n)
-          const ddy = (i - x) / n - (s - (s % n)) / n
+          const ddx = wrapDelta(x, s % n, n)
+          const ddy = y - (s - (s % n)) / n
           const d = ddx * ddx + ddy * ddy
           if (d < dist[i]) {
             dist[i] = d
@@ -864,57 +871,67 @@ export class Tectonics {
     }
     pass(true)
     pass(false)
+    pass(true)
+    pass(false)
     for (let i = 0; i < cells; i++) if (near[i] >= 0) dist[i] = Math.sqrt(dist[i])
-    // the plates' centres (the arrows); a plate heading off the map turns back
+    // the plates' centres (the arrows): east–west the mean on the circle, so a plate lying
+    // across the map's edge has its centre there (sum: cosine, sine, row, count)
     const P = this.plates
-    const sum = new Float64Array(P.length * 3)
+    const sum = new Float64Array(P.length * 4)
+    if (this.cosX.length !== n) {
+      this.cosX = new Float64Array(n)
+      this.sinX = new Float64Array(n)
+      for (let x = 0; x < n; x++) {
+        this.cosX[x] = Math.cos((x / n) * Math.PI * 2)
+        this.sinX[x] = Math.sin((x / n) * Math.PI * 2)
+      }
+    }
     for (let i = 0; i < cells; i++) {
       const k = lab[i]
-      sum[k * 3] += i % n
-      sum[k * 3 + 1] += Math.floor(i / n)
-      sum[k * 3 + 2]++
+      const x = i % n
+      sum[k * 4] += this.cosX[x]
+      sum[k * 4 + 1] += this.sinX[x]
+      sum[k * 4 + 2] += (i - x) / n
+      sum[k * 4 + 3]++
     }
-    // which plates carry land close to each edge of the map (left, right, top, bottom)
+    // which plates carry land close to the top or the bottom of the map
     const edge = new Uint8Array(P.length)
     // (past the sea band along the edge, see edgeSea: a continent stops before it wears into it)
     const margin = 11
     for (let i = 0; i < cells; i++) {
       if (ground[i * 4] < sea) continue
-      const x = i % n
       const y = Math.floor(i / n)
       const k = lab[i]
-      if (x < margin) edge[k] |= 1
-      if (x >= n - margin) edge[k] |= 2
       if (y < margin) edge[k] |= 4
       if (y >= n - margin) edge[k] |= 8
     }
     for (let k = 0; k < P.length; k++) {
       const p = P[k]
-      const c = sum[k * 3 + 2]
+      const c = sum[k * 4 + 3]
       if (!p.alive || !c) continue
-      // a continent against the map's edge is held there that way (it keeps pushing, so the
-      // boundaries still feel it: a rift keeps opening, a range keeps rising; it slides
-      // along the edge). Ocean floor just runs on and dives under the edge (plates do not
-      // bounce back: that would close every sea that opens)
-      p.heldX = (p.vx < 0 && (edge[k] & 1) > 0) || (p.vx > 0 && (edge[k] & 2) > 0)
+      // a continent against the top or the bottom of the map is held there that way (it
+      // keeps pushing, so the boundaries still feel it: a rift keeps opening, a range keeps
+      // rising; it slides along the edge). Ocean floor just runs on and dives under the edge
+      // (plates do not bounce back: that would close every sea that opens). East and west
+      // nothing holds a plate: it goes round the world
+      p.heldX = false
       p.heldY = (p.vy < 0 && (edge[k] & 4) > 0) || (p.vy > 0 && (edge[k] & 8) > 0)
-
     }
     this.sites = P.map((p, k) => {
-      const c = sum[k * 3 + 2]
+      const c = sum[k * 4 + 3]
       return {
         cell: [p.id, p.continental ? 1 : 0] as [number, number],
         continental: p.continental,
         alive: p.alive && c > 0,
-        x: c ? sum[k * 3] / c + 0.5 : -1e4,
-        y: c ? sum[k * 3 + 1] / c + 0.5 : -1e4,
+        x: c ? wrap((Math.atan2(sum[k * 4 + 1], sum[k * 4]) / (Math.PI * 2)) * n + 0.5, n) : -1e4,
+        y: c ? sum[k * 4 + 2] / c + 0.5 : -1e4,
         vx: p.vx,
         vy: p.vy,
       }
     })
     const sc = this.scale
     const rockAt = (x: number, y: number) => {
-      const xx = Math.min(Math.max(Math.round(x), 0), n - 1)
+      const xx = wrap(Math.round(x), n)
       const yy = Math.min(Math.max(Math.round(y), 0), n - 1)
       return ground[(yy * n + xx) * 4 + 1]
     }
@@ -932,12 +949,12 @@ export class Tectonics {
         continue
       }
       // the normal: towards the boundary; on the boundary itself, towards the other plate's neighbour
-      let nx = (s % n) - x
+      let nx = wrapDelta(s % n, x, n)
       let ny = Math.floor(s / n) - y
       if (!nx && !ny) {
         const o = this.other[i]
-        if (x < n - 1 && lab[i + 1] === o) nx = 1
-        else if (x > 0 && lab[i - 1] === o) nx = -1
+        if (lab[beside(i, x, 1, 0, n)] === o) nx = 1
+        else if (lab[beside(i, x, -1, 0, n)] === o) nx = -1
         else if (i < cells - n && lab[i + n] === o) ny = 1
         else ny = -1
       }
@@ -983,7 +1000,7 @@ export class Tectonics {
   /** The plate under a tile, its boundary nearby and how the two move. */
   boundaryAt(x: number, y: number): BoundarySpot {
     const n = this.n
-    const i = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + Math.min(Math.max(Math.floor(x), 0), n - 1)
+    const i = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + wrap(Math.floor(x), n)
     const a = this.plates[this.plate[i]]
     const b = this.plates[this.other[i]] ?? a
     const nx = this.normX[i]
@@ -991,7 +1008,7 @@ export class Tectonics {
     const rx = a.vx - b.vx
     const ry = a.vy - b.vy
     const d = this.dist[i] * this.scale
-    return { x: x + nx * d, y: y + ny * d, kind: KINDS[this.kind[i]], closing: rx * nx + ry * ny, shear: -rx * ny + ry * nx, nx, ny }
+    return { x: wrap(x + nx * d, n), y: y + ny * d, kind: KINDS[this.kind[i]], closing: rx * nx + ry * ny, shear: -rx * ny + ry * nx, nx, ny }
   }
 
   /** A random spot on a busy boundary in the map (for quakes and volcanoes), or null. */
@@ -1000,12 +1017,12 @@ export class Tectonics {
     let best: BoundarySpot | null = null
     let bestScore = 0
     for (let k = 0; k < 24; k++) {
-      const x = n * (0.06 + 0.88 * Math.random())
+      const x = n * Math.random() * 0.9999
       const y = n * (0.06 + 0.88 * Math.random())
       const i = Math.floor(y) * n + Math.floor(x)
       if (this.dist[i] > near) continue
       const b = this.boundaryAt(x, y)
-      if (b.x < 2 || b.y < 2 || b.x > n - 2 || b.y > n - 2) continue
+      if (b.y < 2 || b.y > n - 2) continue
       const s = score(b) * Math.random()
       if (s > bestScore) [best, bestScore] = [b, s]
     }
@@ -1020,7 +1037,7 @@ export class Tectonics {
    */
   crack(x: number, y: number): boolean {
     const n = this.n
-    const i0 = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + Math.min(Math.max(Math.floor(x), 0), n - 1)
+    const i0 = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + wrap(Math.floor(x), n)
     const k = this.plate[i0]
     const old = this.plates[k]
     if (!old?.alive) return false
@@ -1036,8 +1053,8 @@ export class Tectonics {
     for (const i of tiles) {
       const tx = i % n
       const ty = Math.floor(i / n)
-      const bend = (fbm((tx / n) * 3, (ty / n) * 3, salt, 4) - 0.5) * 2 * n * 0.12
-      if ((tx - x) * nx + (ty - y) * ny + bend < 0) a.push(i)
+      const bend = (fbm((tx / n) * 3, (ty / n) * 3, salt, 4, 0.5, 2, 3) - 0.5) * 2 * n * 0.12
+      if (wrapDelta(tx, x, n) * nx + (ty - y) * ny + bend < 0) a.push(i)
       else b.push(i)
     }
     if (a.length < 80 || b.length < 80) return false
@@ -1061,7 +1078,7 @@ export class Tectonics {
   /** Points the plate under a tile the way given (map directions, speed 0–1). */
   steer(x: number, y: number, vx: number, vy: number) {
     const n = this.n
-    const i = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + Math.min(Math.max(Math.floor(x), 0), n - 1)
+    const i = Math.min(Math.max(Math.floor(y), 0), n - 1) * n + wrap(Math.floor(x), n)
     const p = this.plates[this.plate[i]]
     if (!p || !p.alive) return
     p.vx = vx
@@ -1093,10 +1110,15 @@ export class Tectonics {
   }
 }
 
-/** The four neighbours of a tile (−1 off the map). */
+/** The four neighbours of a tile: west and east round the world, north and south −1 off the map. */
 function neighbours(i: number, n: number): [number, number, number, number] {
   const x = i % n
-  return [x > 0 ? i - 1 : -1, x < n - 1 ? i + 1 : -1, i >= n ? i - n : -1, i < n * n - n ? i + n : -1]
+  return [x > 0 ? i - 1 : i + n - 1, x < n - 1 ? i + 1 : i - (n - 1), i >= n ? i - n : -1, i < n * n - n ? i + n : -1]
+}
+
+/** The tile dx columns (−1, 0, 1; round the world) and dy rows from tile i in column x (the row must be on the map). */
+function beside(i: number, x: number, dx: number, dy: number, n: number): number {
+  return i + dy * n + (dx < 0 ? (x > 0 ? -1 : n - 1) : dx > 0 ? (x < n - 1 ? 1 : -(n - 1)) : 0)
 }
 
 /** Distance in tiles from a set of tiles, everywhere (a two-pass chamfer transform). */
@@ -1104,30 +1126,27 @@ function distanceFrom(tiles: number[], n: number): Float32Array {
   const d = new Float32Array(n * n).fill(1e9)
   for (const i of tiles) d[i] = 0
   const D = Math.SQRT2
-  for (let y = 0; y < n; y++) {
-    for (let x = 0; x < n; x++) {
-      const i = y * n + x
-      let v = d[i]
-      if (x > 0) v = Math.min(v, d[i - 1] + 1)
-      if (y > 0) {
-        v = Math.min(v, d[i - n] + 1)
-        if (x > 0) v = Math.min(v, d[i - n - 1] + D)
-        if (x < n - 1) v = Math.min(v, d[i - n + 1] + D)
+  // (twice over: the second time carries the distances across the map's edge, round the world)
+  for (let round = 0; round < 2; round++) {
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        const i = y * n + x
+        const w = beside(i, x, -1, 0, n)
+        const e = beside(i, x, 1, 0, n)
+        let v = Math.min(d[i], d[w] + 1)
+        if (y > 0) v = Math.min(v, d[i - n] + 1, d[w - n] + D, d[e - n] + D)
+        d[i] = v
       }
-      d[i] = v
     }
-  }
-  for (let y = n - 1; y >= 0; y--) {
-    for (let x = n - 1; x >= 0; x--) {
-      const i = y * n + x
-      let v = d[i]
-      if (x < n - 1) v = Math.min(v, d[i + 1] + 1)
-      if (y < n - 1) {
-        v = Math.min(v, d[i + n] + 1)
-        if (x < n - 1) v = Math.min(v, d[i + n + 1] + D)
-        if (x > 0) v = Math.min(v, d[i + n - 1] + D)
+    for (let y = n - 1; y >= 0; y--) {
+      for (let x = n - 1; x >= 0; x--) {
+        const i = y * n + x
+        const w = beside(i, x, -1, 0, n)
+        const e = beside(i, x, 1, 0, n)
+        let v = Math.min(d[i], d[e] + 1)
+        if (y < n - 1) v = Math.min(v, d[i + n] + 1, d[e + n] + D, d[w + n] + D)
+        d[i] = v
       }
-      d[i] = v
     }
   }
   return d
@@ -1135,7 +1154,10 @@ function distanceFrom(tiles: number[], n: number): Float32Array {
 
 /** A set of tiles in two halves (two-means from its two farthest-apart tiles). */
 function split(tiles: number[], n: number): [number[], number[]] {
-  const xy = (i: number) => [i % n, Math.floor(i / n)]
+  // (the columns are counted from the first tile's, round the world: a set that lies across
+  // the map's edge is one piece)
+  const x0 = tiles[0] % n
+  const xy = (i: number) => [x0 + wrapDelta(i % n, x0, n), Math.floor(i / n)]
   let [ax, ay] = xy(tiles[0])
   let far = 0
   for (const i of tiles) {
@@ -1161,7 +1183,7 @@ function split(tiles: number[], n: number): [number[], number[]] {
       if ((x - ax) ** 2 + (y - ay) ** 2 <= (x - bx) ** 2 + (y - by) ** 2) a.push(i)
       else b.push(i)
     }
-    const mean = (t: number[]) => t.reduce((s, i) => [s[0] + (i % n) / t.length, s[1] + Math.floor(i / n) / t.length], [0, 0])
+    const mean = (t: number[]) => t.reduce((s, i) => [s[0] + xy(i)[0] / t.length, s[1] + xy(i)[1] / t.length], [0, 0])
     ;[ax, ay] = mean(a)
     ;[bx, by] = mean(b)
   }

@@ -239,6 +239,10 @@ export class Input {
     else if (e.code === 'KeyI') this.handlers.selectTool('meteor')
     else if (e.code === 'KeyJ') this.handlers.selectTool('sun')
     else if (e.code === 'KeyN') this.handlers.selectTool('drought')
+    else if (e.code === 'KeyG') this.handlers.selectTool('quake')
+    else if (e.code === 'KeyY') this.handlers.selectTool('hurricane')
+    else if (e.code === 'KeyV') this.handlers.selectTool('fire')
+    else if (e.code === 'KeyL') this.handlers.selectTool('people')
     else if (e.code === 'Digit0' || e.code === 'Numpad0') this.handlers.selectTool('inspect')
     else if (TOOL_KEYS[e.code]) this.handlers.selectTool(TOOL_KEYS[e.code])
   }

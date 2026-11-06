@@ -25,6 +25,7 @@ npm install
 npm run dev      # http://localhost:5173 (3D) e http://localhost:5173/2d.html (2D)
 npm run build    # gera dist/ (site estático, as duas páginas)
 npm run lint
+npm test         # roda as simulações sem tela (o mundo 2D, os povos, os poderes do 3D)
 ```
 
 O 3D precisa de um navegador com WebGPU. No **Chrome para Linux** ele vem desligado: ative
@@ -47,8 +48,10 @@ apaga o que sobra no destino.
 ## Craftscape 2D
 
 Código em `src/tiles/`. O mapa é o **planeta inteiro**, em projeção equiretangular: polo norte
-em cima, equador no meio, polo sul embaixo, 360° de longitude de ponta a ponta. Os tamanhos
-vão de 128² a 384² tiles; acima de 256² fica pesado.
+em cima, equador no meio, polo sul embaixo, 360° de longitude de ponta a ponta. De leste a
+oeste ele dá a volta: a terra, o vento, as placas, as tempestades e os povos cruzam a borda
+do mapa, e o mapa se repete para os lados quando você arrasta. Os tamanhos vão de 128² a
+384² tiles; acima de 256² fica pesado.
 
 **Clima.** A temperatura vem da latitude (cerca de 27 °C no equador e −23 °C nos polos) e da
 altitude (−6,5 °C por km). Também esquentam o ar o calor de lava, fogo e cidades, as
@@ -104,8 +107,15 @@ os oceanos fervem, tudo esfria de novo com continentes novos e a vida recomeça.
   momentos), aba de dados (temperatura, CO₂, nível do mar, população) e notificações de
   tudo que acontece.
 - **Visão:** Satélite (cores reais, cidades como luzes à noite, grade de latitude e longitude) ou
-  Ilustrado (árvores, montanhas, casas).
-- **Mapas:** biomas, temperatura, chuva, umidade, pressão, relevo, rios, mudança do terreno,
+  Ilustrado (árvores, montanhas, casas); e **Globo**, o mesmo mapa numa esfera (WebGL comum):
+  arraste para girar, a roda aproxima, e todos os poderes funcionam nele.
+- **Primeiros passos:** um cartão guiado curto para quem acabou de chegar (dá para rever pela
+  tela de atalhos).
+- **Correntes marinhas:** cada oceano gira com os cinturões de vento, então uma corrente
+  quente sobe pela costa leste dos continentes e uma fria desce pela costa oeste (perto dos
+  polos é o contrário); o mar quente dá mais vapor ao ar, o frio menos, e a chuva das costas
+  acompanha.
+- **Mapas:** biomas, temperatura, chuva, umidade, pressão, correntes marinhas, relevo, rios, mudança do terreno,
   placas, impacto humano, povos, eras, religião, idiomas, peste, fome e guerras, com paletas
   científicas (coolwarm, YlGnBu, viridis, PuOr) e unidades reais (°C, mm/ano, hPa, m, km).
 
@@ -143,9 +153,18 @@ jogo, ele cede, e as concessões estão anotadas no código:
   e medindo floresta, terra nua, neve e temperatura por latitude. O planeta resultante tem
   ~14 °C de média e ~20–30% de terra nua.
 - **O mapa é quadrado.** A projeção é achatada: cada tile cobre o dobro de graus na horizontal.
-  O mundo não dá a volta nas bordas, então os continentes param antes delas.
-- **O 3D é outra coisa.** Os povos são o mesmo código nas duas versões, mas o 2D tem física
-  própria (CPU, tiles) e não tenta reproduzir o 3D.
+  O mundo dá a volta de leste a oeste, mas não pelos polos: o topo e a base do mapa são mar
+  aberto, e os tiles ali valem muito menos chão do que parecem (no globo eles se espremem).
+- **As correntes são lidas do mapa, não simuladas.** Vêm do formato dos mares e da latitude e
+  são refeitas quando as costas mudam; a água em si não corre.
+- **Roda num worker quando dá.** O jogo inteiro (a simulação e o desenho, num OffscreenCanvas)
+  roda fora da thread da página, então a interface não trava; num navegador sem
+  OffscreenCanvas, ou com `?sem-worker` no endereço, roda na página como antes. Nos dois
+  casos a simulação usa no máximo 40 ms de cada quadro: um mapa grande em 8× anda um pouco
+  mais devagar do que o pedido em vez de congelar a imagem.
+- **O 3D é outra coisa.** Os povos são o mesmo código nas duas versões, e o 3D tem os mesmos
+  poderes de deus, mapas e desafios (veja abaixo), mas o 2D tem física própria (CPU, tiles) e
+  não tenta reproduzir o 3D.
 
 ## Craftscape 3D
 
@@ -159,6 +178,7 @@ jogo, ele cede, e as concessões estão anotadas no código:
 | Zoom | roda do mouse | pinça |
 | Tamanho do pincel | Shift + roda, **[** e **]** | slider |
 | Ferramenta | **1** rocha, **2** solo, **3** areia, **4** água | painel |
+| Poderes | **V** fogo, **Y** furacão, **G** terremoto, **L** povo; os outros na barra | barra |
 | Desfazer | **Ctrl + Z** | botão Desfazer |
 | Pausar · câmera órbita/voo | **P** · **C** | painel |
 
@@ -180,6 +200,25 @@ jogo, ele cede, e as concessões estão anotadas no código:
   visitadas.
 - **Povos e placas**: civilizações (`life.ts`) e placas tectônicas (`plates.ts`), desafios e
   cenários prontos.
+- **Os poderes de deus do 2D** (`powers.ts`): pincel de floresta; fogo que corre com o vento
+  e a chuva apaga; furacões que nascem no mar quente, com nome e categoria; o poder terremoto
+  (o pincel dá a magnitude, com réplicas, tsunami no mar, uma fenda a partir de 8,5 e um
+  cataclismo depois de três de 9 ou mais em seguida); guerra nuclear (cratera, terra
+  queimada, radiação, fuligem que esfria o planeta); um povo novo onde você clicar; e os seis
+  poderes sobre uma cidade: bênção, inspiração, peste, profeta, discórdia e paz.
+- **Mais formas de ler o mundo**: mapas de relevo, impacto humano, eras, religião, idiomas,
+  peste, fome e guerras; aba Dados (temperatura, CO₂, nível do mar, população); livro da
+  história (a vida e as eras de cada povo e os grandes momentos); sons; aviões e navios a
+  vapor e cargueiros quando os povos chegam lá.
+- **Mais para jogar**: os cenários Pangeia e Terra jovem, sete desafios sobre os povos (da
+  pedra ao avião, paz mundial, colônias além-mar e outros) e troféus para os desafios
+  concluídos.
+- **O sol pela latitude e pela estação** (clima automático): dias longos e sol alto no verão,
+  curtos e baixo no inverno, sol da meia-noite e noite polar bem ao norte.
+- **Deriva continental (experimental, desligada por padrão)**: as placas carregam a terra com
+  elas, célula a célula, com rios, florestas e cidades; atrás de uma placa que se afasta a
+  terra afunda num rifte com lava. Só a janela simulada se move: o horizonte e as regiões já
+  visitadas ficam onde estavam.
 - **Salvar/carregar** o terreno (`.craftscape`, gzip), **importar heightmap** (PNG/JPG) e
   **desfazer**.
 - **Desempenho**: malha em chunks com LOD por distância, culling por frustum e costura entre
@@ -197,6 +236,8 @@ src/engine/
   renderer.ts     terreno, água e céu; LOD por chunks
   life.ts         povos e civilizações (usado pelo 3D e pelo 2D)
   plates.ts       placas tectônicas do 3D
+  powers.ts       poderes de deus do 3D: fogo, furacões, terremotos, bombas, cataclismo
+  palettes.ts     cores dos mapas dos povos (usado pelo 3D e pelo 2D)
   camera.ts, input.ts, io.ts, settings.ts, ...
   shaders/sim.ts     WGSL da simulação (água, erosão, areia, vegetação, clima, sombras, picking)
   shaders/render.ts  WGSL de renderização
@@ -204,12 +245,16 @@ src/ui/           interface do 3D em React (fallback.ts: a ida para o 2D)
 src/tiles/        Craftscape 2D
   world.ts        a simulação: clima, estações, pressão, água, rios, vegetação, desastres
   tectonics.ts    placas que andam, colisões, riftes, rachaduras
-  game.ts         laço, entrada, poderes, desfazer/voltar no tempo, desafios
+  game.ts         laço, poderes, desfazer/voltar no tempo, desafios (não toca na página: veja host.ts)
+  host.ts, dom.ts, start.ts, worker.ts   o jogo na página ou num worker, e o lado da página
   render.ts       canvas 2D: visão satélite/ilustrada, mapas, sombra da Terra, efeitos
+  globe.ts        o mapa numa esfera (WebGL)
+  wrap.ts         as contas de um mundo que dá a volta de leste a oeste
   goals.ts        cenários e desafios
   save.ts         mundos salvos (JSON gzip)
   sound.ts        sons gerados com Web Audio
-  App.tsx, Extras.tsx, Charts.tsx   interface
+  App.tsx, Extras.tsx, Charts.tsx, Tour.tsx   interface
+tests/            testes sem tela (vitest): o mundo 2D, a emenda, as correntes, os povos, o globo, os poderes do 3D
 ```
 
 No 3D, o estado da simulação são buffers `N×N` de `vec4f`:

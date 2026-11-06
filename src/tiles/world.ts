@@ -8,6 +8,7 @@
 import type { Field } from '../engine/engine'
 import type { Work } from '../engine/life'
 import { fbm, hash2 } from './noise'
+import { wrap, wrapDelta } from './wrap'
 import { BOUNDARY_NAMES, Tectonics, type DriftLayer } from './tectonics'
 
 export interface WorldOptions {
@@ -40,6 +41,8 @@ export interface WorldOptions {
   planetWinds: boolean
   /** The sea rises as the planet warms (and falls as it cools), flooding the coasts. */
   seaRise: boolean
+  /** The oceans turn: warm and cold currents along the shores change the climate of the coasts. */
+  currents: boolean
   /** The temperature keeps rising while the world runs. */
   warming: boolean
   /** °C per simulated minute while warming is on. */
@@ -62,6 +65,7 @@ export const DEFAULT_WORLD: WorldOptions = {
   earthquakes: true,
   volcanoes: true,
   seaRise: true,
+  currents: true,
   warming: false,
   warmingRate: 1,
 }
@@ -69,7 +73,7 @@ export const DEFAULT_WORLD: WorldOptions = {
 /** The options that apply to a running world (the rest make a new one). */
 export const LIVE_OPTIONS = [
   'temperature', 'windDirection', 'windSpeed', 'windHumidity', 'pressureSystems', 'pressureStrength',
-  'plateDrift', 'earthquakes', 'volcanoes', 'seaRise', 'warming', 'warmingRate', 'planetWinds',
+  'plateDrift', 'earthquakes', 'volcanoes', 'seaRise', 'warming', 'warmingRate', 'planetWinds', 'currents',
 ] as const
 
 /** A cataclysm: °C it adds at first, ticks the surface stays molten, the heat kept per tick
@@ -82,6 +86,18 @@ const OCEANS_RETURN = 70
 /** Fallout kept per 10 ticks (half gone in ~25 years), and the °C of cooling the soot of one blast adds. */
 const FALLOUT_DECAY = 0.9986
 const NUCLEAR_SOOT = 1.2
+/**
+ * The ocean currents: °C a warm and a cold one add at the shore, how far out they reach
+ * (a share of the map's width), how wide a sea must be to turn (the same), the share of
+ * their warmth or chill that reaches the land beside them, and the ticks between working
+ * them out again (the coasts move slowly).
+ */
+const CURRENT_WARM = 4
+const CURRENT_COLD = 5
+const CURRENT_REACH = 0.05
+const CURRENT_BASIN = 0.12
+const CURRENT_INLAND = 0.6
+const CURRENTS_EVERY = 200
 /** Simulated seconds in a day: the sun crosses the map (east to west) once in this. */
 export const DAY_SIM = 20
 /** The warmest hour comes this share of a day after noon (about 2½ hours). */
@@ -269,6 +285,7 @@ export interface Drought {
 /** How much vapour air at t °C holds before it rains (1 at 15 °C). */
 export const capacity = (t: number) => Math.exp(0.065 * (Math.min(Math.max(t, -40), 50) - 15))
 const clamp = (v: number, a: number, b: number) => (v < a ? a : v > b ? b : v)
+export { wrap, wrapDelta }
 const smooth = (v: number, a: number, b: number) => {
   const t = clamp((v - a) / (b - a), 0, 1)
   return t * t * (3 - 2 * t)
@@ -373,6 +390,11 @@ export class TileWorld {
   readonly irrigated: Float32Array
   /** Per tile, 0–1: radioactive fallout from nuclear blasts; it kills the plants and fades over decades. */
   readonly fallout: Float32Array
+  /** Per tile: °C the ocean currents add to (or take from) the sea there, and a share of it on the coast beside (see currents). */
+  readonly current: Float32Array
+  private readonly currentTmp: Float32Array
+  /** Whether the currents in `current` were worked out with the option on. */
+  private currentsOn = false
   private readonly humanTarget: Float32Array
   /** The most of the land the forest has covered (for the forest lost). */
   forestPeak = 0
@@ -411,7 +433,7 @@ export class TileWorld {
     for (const v of this.vents) {
       const d = moved(v.x + 0.5, v.y + 0.5)
       if (!d) continue
-      v.x = clamp(v.x + d[0], 0, this.n - 1)
+      v.x = wrap(v.x + d[0], this.n)
       v.y = clamp(v.y + d[1], 0, this.n - 1)
     }
     this.onDrift?.(moved)
@@ -478,6 +500,8 @@ export class TileWorld {
     this.built = new Float32Array(cells)
     this.irrigated = new Float32Array(cells)
     this.fallout = new Float32Array(cells)
+    this.current = new Float32Array(cells)
+    this.currentTmp = new Float32Array(cells)
     this.humanTarget = new Float32Array(cells * 6)
     this.tectonics = new Tectonics(n, opts.seed)
     this.tectonics.continentalTile = (i) => this.ground[i * 4] >= this.sea - 0.02
@@ -527,12 +551,14 @@ export class TileWorld {
       for (let x = 0; x < n; x++) {
         const nx = x / n
         const ny = y / n
-        const cont = fbm(nx * 1.6 + 0.3, ny * 1.6 + 0.7, seed + 1, 4)
-        const detail = fbm(nx * 5, ny * 5, seed + 2, 6)
-        const ridge = 1 - Math.abs(2 * fbm(nx * 3.5 + 9, ny * 3.5 + 4, seed + 3, 5) - 1)
-        // the sea always rings the map (a continent is never cut straight by the map's edge);
-        // with islands it reaches further in and the land breaks up
-        const edge = Math.min(nx, 1 - nx, ny, 1 - ny)
+        // (the noise repeats east–west once round the world, so the land joins up across the map's edge)
+        const cont = fbm(nx * 2 + 0.3, ny * 1.6 + 0.7, seed + 1, 4, 0.5, 2, 2)
+        const detail = fbm(nx * 5, ny * 5, seed + 2, 6, 0.5, 2, 5)
+        const ridge = 1 - Math.abs(2 * fbm(nx * 4 + 9, ny * 3.5 + 4, seed + 3, 5, 0.5, 2, 4) - 1)
+        // the sea always lies along the top and the bottom of the map (the poles; a continent
+        // is never cut straight by them); with islands it reaches further in and the land
+        // breaks up. East and west there is no edge: the world goes round
+        const edge = Math.min(ny, 1 - ny)
         const rim = (1 - smooth(edge, 0, 0.12)) * 0.5 + o.islands * (1 - smooth(edge, 0.02, 0.2)) * 0.3
         const land = (cont - 0.5) * 0.9 + (detail - 0.5) * 0.4 + 0.17 - o.islands * 0.25 - rim
         out[y * n + x] = land * 0.18 + Math.max(0, land) * ridge * ridge * 0.22
@@ -588,13 +614,14 @@ export class TileWorld {
     this.layersCache = null
     this.time = 0
     this.ticks = 0
+    this.currents()
     this.temperatures()
     this.pressure(2)
     // the land starts green where it is warm enough, moister towards the coasts
     for (let i = 0; i < n * n; i++) {
       const h = g[i * 4]
       const t = this.climate[i * 4 + 3]
-      const moist = fbm((i % n) / n * 4, Math.floor(i / n) / n * 4, s + 5, 4)
+      const moist = fbm((i % n) / n * 4, Math.floor(i / n) / n * 4, s + 5, 4, 0.5, 2, 4)
       const v = h > 0 && h < 0.2 ? smooth(t, 2, 10) * (1 - smooth(t, 32, 40)) * (0.25 + 0.6 * moist) : 0
       this.extra[i * 4] = v
       this.extra[i * 4 + 1] = v * 0.6
@@ -621,6 +648,7 @@ export class TileWorld {
 
   /** One tick of TICK simulated seconds. */
   tick() {
+    if (this.ticks % CURRENTS_EVERY === 0 || this.currentsOn !== this.opts.currents) this.currents()
     this.temperatures()
     // the weather's pressure is slow: every other tick, two ticks' worth
     if (this.ticks % 2 === 0) this.pressure(2)
@@ -733,7 +761,7 @@ export class TileWorld {
         // little above it, scorching)
         const lava = this.lava[i * 4]
         const hot = (lava > 0.0002 ? 40 + 160 * smooth(lava, 0.0002, 0.003) : 0) + (this.fire[i] > 0 ? 25 : 0)
-        const mean = base + lat + seasonal - LAPSE * surface + c[i * 4] + this.smog[i] + hot
+        const mean = base + lat + seasonal - LAPSE * surface + c[i * 4] + this.smog[i] + hot + this.current[i]
         c[i * 4 + 3] = mean
         let swing: number
         if (h < this.sea || this.water[i * 4] > 0.002) swing = 0.4
@@ -747,6 +775,85 @@ export class TileWorld {
         // mean sunlight: hot at a high noon sun, cool at night, no daily swing in the polar night
         const height = Math.max(0, sinPart + cosPart * this.hourCos[x])
         this.airT[i] = mean + swing * clamp((height - qDay) * 2.2, -1, 1)
+      }
+    }
+  }
+
+  /**
+   * The ocean currents, read off the shape of the seas. In the subtropics every ocean
+   * turns with the wind belts: a warm current runs towards the pole along its western
+   * shore (the east coast of a continent) and a cold one comes back along its eastern
+   * shore (a west coast, with its fogs and its deserts). Nearer the poles it is the other
+   * way round: a warm drift keeps the west coasts mild and a cold current runs down the
+   * east coasts. Only a sea wide enough to turn has them. A share of the warmth or the
+   * chill reaches the land beside the sea. The warmer sea gives the air more vapour and
+   * the colder one less, so the rain on the coasts follows.
+   */
+  private currents() {
+    const n = this.n
+    const cur = this.current
+    this.currentsOn = this.opts.currents
+    if (!this.opts.currents) {
+      cur.fill(0)
+      return
+    }
+    const g = this.ground
+    const sea = this.sea
+    const reach = Math.max(2, CURRENT_REACH * n)
+    const wide = CURRENT_BASIN * n
+    const west = this.currentTmp
+    const bell = (v: number, at: number, width: number) => Math.exp(-(((v - at) / width) ** 2))
+    for (let y = 0; y < n; y++) {
+      const lat = Math.abs(latitudeOf(y, n))
+      const subtropics = bell(lat, 28, 14)
+      const subpolar = bell(lat, 58, 12)
+      const row = y * n
+      // how far the land to the west is: twice round the world, so a sea that crosses the
+      // map's edge finds its shore on the other side (a row with no land has none: far)
+      let d = Infinity
+      for (let k = 0; k < 2 * n; k++) {
+        const x = k % n
+        d = g[(row + x) * 4] >= sea ? 0 : d + 1
+        west[row + x] = d
+      }
+      // and the land to the east, the same way back (the first lap only measures)
+      d = Infinity
+      for (let k = 2 * n - 1; k >= 0; k--) {
+        const i = row + (k % n)
+        if (g[i * 4] >= sea) {
+          d = 0
+          cur[i] = 0
+          continue
+        }
+        d++
+        if (k >= n) continue
+        const open = smooth(Math.min(west[i] + d, 1e6), wide * 0.5, wide)
+        const w = Math.exp(-west[i] / reach)
+        const e = Math.exp(-d / reach)
+        cur[i] = open * (subtropics * (CURRENT_WARM * w - CURRENT_COLD * e) + subpolar * (CURRENT_WARM * e - 0.6 * CURRENT_COLD * w))
+      }
+    }
+    // the coast: the land next to the sea takes a share of what the sea beside it has,
+    // and the land behind it a share of that
+    for (let pass = 0; pass < 2; pass++) {
+      west.set(cur)
+      for (let y = 0; y < n; y++) {
+        for (let x = 0; x < n; x++) {
+          const i = y * n + x
+          if (g[i * 4] < sea || west[i] !== 0) continue
+          let sum = 0
+          let count = 0
+          const take = (j: number) => {
+            if (west[j] === 0) return
+            sum += west[j]
+            count++
+          }
+          take(x > 0 ? i - 1 : i + n - 1)
+          take(x < n - 1 ? i + 1 : i - (n - 1))
+          if (y > 0) take(i - n)
+          if (y < n - 1) take(i + n)
+          if (count) cur[i] = (sum / count) * CURRENT_INLAND
+        }
       }
     }
   }
@@ -805,13 +912,15 @@ export class TileWorld {
       for (let y = 0; y < m; y++) {
         for (let x = 0; x < m; x++) {
           const b = y * m + x
-          const sx = clamp(x - (sign * this.steerU[b] * STEERING * dt) / PB, 0, m - 1)
+          // (east–west the air comes round the world)
+          const sx = x - (sign * this.steerU[b] * STEERING * dt) / PB
           const sy = clamp(y - (sign * this.steerV[b] * STEERING * dt) / PB, 0, m - 1)
-          const x0 = Math.floor(sx)
+          const xf = Math.floor(sx)
           const y0 = Math.floor(sy)
-          const x1 = Math.min(x0 + 1, m - 1)
+          const x0 = wrap(xf, m)
+          const x1 = wrap(xf + 1, m)
           const y1 = Math.min(y0 + 1, m - 1)
-          const fx = sx - x0
+          const fx = sx - xf
           const fy = sy - y0
           const a = src[y0 * m + x0]
           const bb = src[y0 * m + x1]
@@ -844,7 +953,7 @@ export class TileWorld {
     for (let y = 0; y < m; y++) {
       for (let x = 0; x < m; x++) {
         const b = y * m + x
-        const nb = (Pt[x > 0 ? b - 1 : b] + Pt[x < m - 1 ? b + 1 : b] + Pt[y > 0 ? b - m : b] + Pt[y < m - 1 ? b + m : b]) * 0.25
+        const nb = (Pt[x > 0 ? b - 1 : b + m - 1] + Pt[x < m - 1 ? b + 1 : b - (m - 1)] + Pt[y > 0 ? b - m : b] + Pt[y < m - 1 ? b + m : b]) * 0.25
         let v = Pt[b] * 0.98 + nb * 0.02
         const target = clamp(-(anomaly[b] - mean) * k, -1, 1)
         v += (target - v) * PRESSURE_RELAX * dt
@@ -894,7 +1003,7 @@ export class TileWorld {
       this.beltV[y] = wy
       for (let x = 0; x < m; x++) {
         const b = y * m + x
-        const gx = (pe[x < m - 1 ? b + 1 : b] - pe[x > 0 ? b - 1 : b]) * 0.5
+        const gx = (pe[x < m - 1 ? b + 1 : b - (m - 1)] - pe[x > 0 ? b - 1 : b + m - 1]) * 0.5
         const gy = (pe[y < m - 1 ? b + m : b] - pe[y > 0 ? b - m : b]) * 0.5
         // the systems are steered by the wind without its pull into the lows (that inflow is
         // carried off aloft; advecting with it would fill every low from inside). The turn
@@ -924,13 +1033,13 @@ export class TileWorld {
     for (let y = 0; y < m; y++) {
       for (let x = 0; x < m; x++) {
         const b = y * m + x
-        const xp = x < m - 1 ? b + 1 : b
-        const xm = x > 0 ? b - 1 : b
+        const xp = x < m - 1 ? b + 1 : b - (m - 1)
+        const xm = x > 0 ? b - 1 : b + m - 1
         const yp = y < m - 1 ? b + m : b
         const ym = y > 0 ? b - m : b
         const du = U[xp] - bu(xp) - (U[xm] - bu(xm))
         const dv = V[yp] - bv(yp) - (V[ym] - bv(ym))
-        D[b] = (du * (x > 0 && x < m - 1 ? 0.5 : 1) + dv * (y > 0 && y < m - 1 ? 0.5 : 1)) / PB
+        D[b] = (du * 0.5 + dv * (y > 0 && y < m - 1 ? 0.5 : 1)) / PB
       }
     }
     // sampled per tile (bilinear between the cell centres), for the air, the fire and the maps
@@ -943,10 +1052,11 @@ export class TileWorld {
       const r1 = Math.min(y0 + 1, m - 1) * m
       const fy = sy - y0
       for (let x = 0; x < n; x++) {
-        const sx = clamp((x + 0.5) / PB - 0.5, 0, m - 1)
-        const x0 = Math.floor(sx)
-        const x1 = Math.min(x0 + 1, m - 1)
-        const fx = sx - x0
+        const sx = (x + 0.5) / PB - 0.5
+        const xf = Math.floor(sx)
+        const x0 = wrap(xf, m)
+        const x1 = wrap(xf + 1, m)
+        const fx = sx - xf
         const a = (1 - fx) * (1 - fy)
         const b = fx * (1 - fy)
         const cc = (1 - fx) * fy
@@ -963,13 +1073,14 @@ export class TileWorld {
   /** A pressure-cell field read at a point in tiles (bilinear between the cell centres). */
   sampleCells(field: Float32Array, tx: number, ty: number): number {
     const m = this.pm
-    const sx = clamp(tx / PB - 0.5, 0, m - 1)
+    const sx = tx / PB - 0.5
     const sy = clamp(ty / PB - 0.5, 0, m - 1)
-    const x0 = Math.floor(sx)
+    const xf = Math.floor(sx)
     const y0 = Math.floor(sy)
-    const x1 = Math.min(x0 + 1, m - 1)
+    const x0 = wrap(xf, m)
+    const x1 = wrap(xf + 1, m)
     const y1 = Math.min(y0 + 1, m - 1)
-    const fx = sx - x0
+    const fx = sx - xf
     const fy = sy - y0
     return (field[y0 * m + x0] * (1 - fx) + field[y0 * m + x1] * fx) * (1 - fy) + (field[y1 * m + x0] * (1 - fx) + field[y1 * m + x1] * fx) * fy
   }
@@ -985,9 +1096,7 @@ export class TileWorld {
           let s = 0
           let k = 0
           for (let d = -r; d <= r; d++) {
-            const xx = x + d
-            if (xx < 0 || xx >= m) continue
-            s += dst[y * m + xx]
+            s += dst[y * m + wrap(x + d, m)]
             k++
           }
           t[y * m + x] = s / k
@@ -1049,15 +1158,18 @@ export class TileWorld {
         const i = y * n + x
         const sx = x - tu[i]
         const sy = y - tv[i]
-        if (sx < 0 || sy < 0 || sx > n - 1 || sy > n - 1) {
+        // (air from beyond the top or the bottom of the map comes in as humid as the setting
+        // says; east and west it comes round the world)
+        if (sy < 0 || sy > n - 1) {
           qt[i] = o.windHumidity * capacity(c[i * 4 + 3])
           continue
         }
-        const x0 = Math.floor(sx)
+        const xf = Math.floor(sx)
         const y0 = Math.floor(sy)
-        const fx = sx - x0
+        const fx = sx - xf
         const fy = sy - y0
-        const x1 = Math.min(x0 + 1, n - 1)
+        const x0 = wrap(xf, n)
+        const x1 = wrap(xf + 1, n)
         const y1 = Math.min(y0 + 1, n - 1)
         qt[i] = (q[y0 * n + x0] * (1 - fx) + q[y0 * n + x1] * fx) * (1 - fy) + (q[y1 * n + x0] * (1 - fx) + q[y1 * n + x1] * fx) * fy
       }
@@ -1072,8 +1184,8 @@ export class TileWorld {
         const calm = Math.abs(wx) < 1e-6 && Math.abs(wy) < 1e-6
         const ux = calm ? 0 : Math.abs(wx) >= Math.abs(wy) ? -Math.sign(wx) : 0
         const uy = calm ? 0 : Math.abs(wy) > Math.abs(wx) ? -Math.sign(wy) : 0
-        const xm = x > 0 ? i - 1 : i
-        const xp = x < n - 1 ? i + 1 : i
+        const xm = x > 0 ? i - 1 : i + n - 1
+        const xp = x < n - 1 ? i + 1 : i - (n - 1)
         const ym = y > 0 ? i - n : i
         const yp = y < n - 1 ? i + n : i
         let v = qt[i] * 0.88 + (qt[xm] + qt[xp] + qt[ym] + qt[yp]) * 0.03
@@ -1117,7 +1229,7 @@ export class TileWorld {
         }
         // pushed up a slope by the wind, humid air wrings out before the crest
         // (the slope over two tiles, so one bumpy tile does not switch the rule on and off)
-        const up = g[i * 4] - g[(clamp(y + 2 * uy, 0, n - 1) * n + clamp(x + 2 * ux, 0, n - 1)) * 4]
+        const up = g[i * 4] - g[(clamp(y + 2 * uy, 0, n - 1) * n + wrap(x + 2 * ux, n)) * 4]
         if (up > 0.0015 && v > 0.7 * cap) {
           const r2 = (v - 0.7 * cap) * OROGRAPHIC * Math.min(1, up * 60)
           v -= r2
@@ -1147,7 +1259,7 @@ export class TileWorld {
     for (let y = 0; y < n; y++) {
       for (let x = 0; x < n; x++) {
         const i = y * n + x
-        const rs = 0.5 * rain[i] + 0.125 * (rain[x > 0 ? i - 1 : i] + rain[x < n - 1 ? i + 1 : i] + rain[y > 0 ? i - n : i] + rain[y < n - 1 ? i + n : i])
+        const rs = 0.5 * rain[i] + 0.125 * (rain[x > 0 ? i - 1 : i + n - 1] + rain[x < n - 1 ? i + 1 : i - (n - 1)] + rain[y > 0 ? i - n : i] + rain[y < n - 1 ? i + n : i])
         c[i * 4 + 2] += (rs * 40 - c[i * 4 + 2]) * 0.004
       }
     }
@@ -1200,8 +1312,8 @@ export class TileWorld {
           gx += f * dirx
           gy += f * diry
         }
-        if (x > 0) give(i - 1, -1, 0)
-        if (x < n - 1) give(i + 1, 1, 0)
+        give(x > 0 ? i - 1 : i + n - 1, -1, 0)
+        give(x < n - 1 ? i + 1 : i - (n - 1), 1, 0)
         if (y > 0) give(i - n, 0, -1)
         if (y < n - 1) give(i + n, 0, 1)
         w[i * 4 + 1] = gx
@@ -1246,9 +1358,9 @@ export class TileWorld {
       for (let dy = -1; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++) {
           if (!dx && !dy) continue
-          const xx = x + dx
+          const xx = wrap(x + dx, n)
           const yy = y + dy
-          if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue
+          if (yy < 0 || yy >= n) continue
           const j = yy * n + xx
           const Sj = surface(j)
           if (Sj < bestS) {
@@ -1325,7 +1437,7 @@ export class TileWorld {
       // the soil water the plants see is shared with the neighbours (groundwater), which
       // keeps a forest tile from drying its own soil while the bare tile next to it soaks
       const x = i % n
-      const soil = 0.5 * e[i * 4 + 1] + 0.125 * (e[(x > 0 ? i - 1 : i) * 4 + 1] + e[(x < n - 1 ? i + 1 : i) * 4 + 1] + e[(i >= n ? i - n : i) * 4 + 1] + e[(i < n * n - n ? i + n : i) * 4 + 1])
+      const soil = 0.5 * e[i * 4 + 1] + 0.125 * (e[(x > 0 ? i - 1 : i + n - 1) * 4 + 1] + e[(x < n - 1 ? i + 1 : i - (n - 1)) * 4 + 1] + e[(i >= n ? i - n : i) * 4 + 1] + e[(i < n * n - n ? i + n : i) * 4 + 1])
       const m = clamp(soil * 1.3 + c[i * 4 + 2] * 0.25, 0, 1)
       // (plants get by on little water: steppe and savanna on a semi-arid land, forest where it is wet)
       let target = smooth(t, 2, 10) * (1 - smooth(t, 34, 42)) * smooth(Math.max(m, 0.6 * this.irrigated[i]), 0.04, 0.32)
@@ -1388,8 +1500,8 @@ export class TileWorld {
           lt[i] -= f
           lt[j] += f
         }
-        if (x > 0) give(i - 1)
-        if (x < n - 1) give(i + 1)
+        give(x > 0 ? i - 1 : i + n - 1)
+        give(x < n - 1 ? i + 1 : i - (n - 1))
         if (y > 0) give(i - n)
         if (y < n - 1) give(i + n)
       }
@@ -1414,8 +1526,10 @@ export class TileWorld {
         this.pool[i] = Math.max(this.pool[i] - d, 0)
         // the forest next to it catches fire
         const x = i % n
-        if (x > 0 && e[(i - 1) * 4] > 0.3 && Math.random() < 0.02) this.fire[i - 1] = 1
-        if (x < n - 1 && e[(i + 1) * 4] > 0.3 && Math.random() < 0.02) this.fire[i + 1] = 1
+        const west = x > 0 ? i - 1 : i + n - 1
+        const east = x < n - 1 ? i + 1 : i - (n - 1)
+        if (e[west * 4] > 0.3 && Math.random() < 0.02) this.fire[west] = 1
+        if (e[east * 4] > 0.3 && Math.random() < 0.02) this.fire[east] = 1
       }
     }
   }
@@ -1465,8 +1579,8 @@ export class TileWorld {
           const downwind = 1 + 2 * Math.max(0, dx * wx + dy * wy)
           if (Math.random() < 0.06 * e[j * 4] * (1 - 0.8 * e[j * 4 + 1]) * downwind * b) ft[j] = 1
         }
-        if (x > 0) spread(i - 1, -1, 0)
-        if (x < n - 1) spread(i + 1, 1, 0)
+        spread(x > 0 ? i - 1 : i + n - 1, -1, 0)
+        spread(x < n - 1 ? i + 1 : i - (n - 1), 1, 0)
         if (y > 0) spread(i - n, 0, -1)
         if (y < n - 1) spread(i + n, 0, 1)
       }
@@ -1491,7 +1605,7 @@ export class TileWorld {
     }
     const n = this.n
     for (const s of this.storms) {
-      s.x += this.sampleCells(this.windU, s.x, s.y) * SYSTEM_PACE
+      s.x = wrap(s.x + this.sampleCells(this.windU, s.x, s.y) * SYSTEM_PACE, n)
       s.y += this.sampleCells(this.windV, s.x, s.y) * SYSTEM_PACE
       s.age++
       if (s.age % 4 === 0) this.pushPressure(s.x, s.y, s.r, -0.02 * this.stormStrength(s))
@@ -1499,7 +1613,7 @@ export class TileWorld {
     for (const s of this.storms) {
       if (s.age >= STORM_LIFE) this.events.push({ text: 'A tempestade perde força e se desfaz.', x: s.x, y: s.y })
     }
-    this.storms = this.storms.filter((s) => s.age < STORM_LIFE && s.x > -s.r && s.y > -s.r && s.x < n + s.r && s.y < n + s.r)
+    this.storms = this.storms.filter((s) => s.age < STORM_LIFE && s.y > -s.r && s.y < n + s.r)
     this.driftHurricanes()
     this.stormCover.fill(0)
     this.stormCoverDirty = true
@@ -1527,7 +1641,7 @@ export class TileWorld {
   /** A hurricane is born here (over land it starts weak and soon dies). */
   hurricane(cx: number, cy: number) {
     const name = HURRICANE_NAMES[this.hurricaneCount++ % HURRICANE_NAMES.length]
-    const i = clamp(Math.round(cy), 0, this.n - 1) * this.n + clamp(Math.round(cx), 0, this.n - 1)
+    const i = this.tileAt(cx, cy)
     const sea = this.ground[i * 4] < this.sea
     this.hurricanes = [...this.hurricanes, { name, x: cx, y: cy, strength: sea ? 0.3 : 0.15, age: 0, overLand: !sea, peak: 0 }].slice(-4)
     this.events.push({ text: `Nasce o furacão ${name}${sea ? '' : ', mas sobre terra: vai morrer logo'}.`, x: cx, y: cy, major: true })
@@ -1548,7 +1662,7 @@ export class TileWorld {
     }
     const n = this.n
     for (const h of this.hurricanes) {
-      const i = clamp(Math.round(h.y), 0, n - 1) * n + clamp(Math.round(h.x), 0, n - 1)
+      const i = this.tileAt(h.x, h.y)
       const sea = this.ground[i * 4] < this.sea
       const t = this.climate[i * 4 + 3]
       // warm sea (25 °C and more) feeds it; cold sea starves it; land kills it (no more warm water to drink)
@@ -1557,7 +1671,7 @@ export class TileWorld {
       h.peak = Math.max(h.peak, h.strength)
       // steered by the wind around it (west with the trades), curving towards its own pole
       const pole = latitudeOf(h.y, n) >= 0 ? -1 : 1
-      h.x += this.sampleCells(this.windU, h.x, h.y) * SYSTEM_PACE - 0.03 * (1 - Math.min(1, h.age / 2000))
+      h.x = wrap(h.x + this.sampleCells(this.windU, h.x, h.y) * SYSTEM_PACE - 0.03 * (1 - Math.min(1, h.age / 2000)), n)
       h.y += this.sampleCells(this.windV, h.x, h.y) * SYSTEM_PACE + pole * (0.03 + 0.04 * Math.min(1, h.age / 1500))
       h.age++
       // its low: deep, and deeper as it strengthens
@@ -1577,9 +1691,9 @@ export class TileWorld {
       if (h.strength < 0.04) this.events.push({ text: `O furacão ${h.name} se desfaz (chegou à categoria ${TileWorld.category(h.peak) || '—'}).`, x: h.x, y: h.y })
     }
     for (const h of this.hurricanes) {
-      if (h.strength >= 0.04 && (h.x < 0 || h.y < 0 || h.x >= n || h.y >= n)) this.events.push({ text: `O furacão ${h.name} sai do mapa.` })
+      if (h.strength >= 0.04 && (h.y < 0 || h.y >= n)) this.events.push({ text: `O furacão ${h.name} se perde além do polo.` })
     }
-    this.hurricanes = this.hurricanes.filter((h) => h.strength >= 0.04 && h.x >= 0 && h.y >= 0 && h.x < n && h.y < n)
+    this.hurricanes = this.hurricanes.filter((h) => h.strength >= 0.04 && h.y >= 0 && h.y < n)
   }
 
   private stormCoverDirty = false
@@ -1587,15 +1701,16 @@ export class TileWorld {
   /** Adds a soft disc (1 at the centre, 0 at the edge) to a per-tile cover. */
   private disc(cover: Float32Array, cx: number, cy: number, r: number, strength: number) {
     const n = this.n
-    const x0 = Math.max(0, Math.floor(cx - r))
-    const x1 = Math.min(n - 1, Math.ceil(cx + r))
+    // (east–west the disc goes round the world: the columns are wrapped)
+    const x0 = Math.floor(cx - r)
+    const x1 = Math.ceil(cx + r)
     const y0 = Math.max(0, Math.floor(cy - r))
     const y1 = Math.min(n - 1, Math.ceil(cy + r))
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
         const d = Math.hypot(x - cx, y - cy) / r
         if (d >= 1) continue
-        const i = y * n + x
+        const i = y * n + wrap(x, n)
         cover[i] = Math.max(cover[i], (1 - smooth(d, 0.5, 1)) * strength)
       }
     }
@@ -1650,11 +1765,11 @@ export class TileWorld {
       this.volcanoClock = VOLCANO_TICKS * (0.5 + Math.random())
       const b = t.busySpot((b) => (b.kind === 'convergent' ? b.closing * 2 : b.kind === 'divergent' ? -b.closing : 0), 0.05)
       if (!b) return
-      const x = Math.round(b.x)
-      const y = Math.round(b.y)
+      const x = wrap(Math.round(b.x), this.n)
+      const y = clamp(Math.round(b.y), 0, this.n - 1)
       const i = y * this.n + x
       // not under the deep sea, not on another vent
-      if (this.ground[i * 4] < this.sea - 0.01 || this.vents.some((v) => Math.hypot(v.x - x, v.y - y) < 10)) return
+      if (this.ground[i * 4] < this.sea - 0.01 || this.vents.some((v) => Math.hypot(wrapDelta(v.x, x, this.n), v.y - y) < 10)) return
       this.erupt(x, y, 0.5 + 0.5 * Math.random())
       this.events.push({ text: `Um vulcão desperta onde as ${BOUNDARY_NAMES[b.kind]}.`, x, y, major: true, fx: 'eruption', size: 5 })
     }
@@ -1672,9 +1787,7 @@ export class TileWorld {
     // not lift and drop the whole map
     const slip = Math.min(0.004 * scale, MAX_SLIP)
     const g = this.ground
-    this.brush(cx, cy, r, (i, cover) => {
-      const x = (i % this.n) + 0.5 - cx
-      const y = Math.floor(i / this.n) + 0.5 - cy
+    this.brush(cx, cy, r, (i, cover, x, y) => {
       const side = x * nx + y * ny
       let dh = 0
       if (kind === 'convergent' && side < 0) dh = slip * cover
@@ -1684,7 +1797,7 @@ export class TileWorld {
         g[i * 4 + 1] = g[i * 4] - g[i * 4 + 2]
       }
       // rubble on steep ground
-      const xm = i % this.n > 0 ? i - 1 : i
+      const xm = i % this.n > 0 ? i - 1 : i + this.n - 1
       if (Math.abs(g[i * 4] - g[xm * 4]) > 0.004) g[i * 4 + 3] = Math.min(1, g[i * 4 + 3] + 0.3 * cover)
     })
     this.tectonics.refresh()
@@ -1709,14 +1822,14 @@ export class TileWorld {
     const cells = n * n
     // targets: 0 farmland, 1 cleared, 2 urban, 3 smog °C, 4 built, 5 irrigated
     const disc = (cx: number, cy: number, r: number, fn: (i: number, cover: number) => void) => {
-      const x0 = Math.max(0, Math.floor(cx - r))
-      const x1 = Math.min(n - 1, Math.ceil(cx + r))
+      const x0 = Math.floor(cx - r)
+      const x1 = Math.ceil(cx + r)
       const y0 = Math.max(0, Math.floor(cy - r))
       const y1 = Math.min(n - 1, Math.ceil(cy + r))
       for (let y = y0; y <= y1; y++) {
         for (let x = x0; x <= x1; x++) {
           const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) / Math.max(r, 0.5)
-          if (d < 1) fn(y * n + x, 1 - smooth(d, 0.6, 1))
+          if (d < 1) fn(y * n + wrap(x, n), 1 - smooth(d, 0.6, 1))
         }
       }
     }
@@ -1734,7 +1847,7 @@ export class TileWorld {
         const dy = w.size
         const crest = w.crest ?? 0
         disc(cx, cy, r + 1, (i) => {
-          const rx = (i % n) + 0.5 - cx
+          const rx = wrapDelta((i % n) + 0.5, cx, n)
           const ry = Math.floor(i / n) + 0.5 - cy
           const along = rx * dx + ry * dy
           const across = Math.abs(rx * dy - ry * dx)
@@ -1846,7 +1959,8 @@ export class TileWorld {
 
   /** Back to a snapshot of a world of the same size. */
   restore(s: WorldSnapshot) {
-    this.opts = { ...s.opts }
+    // a world saved before an option existed gets that option's default
+    this.opts = { ...DEFAULT_WORLD, ...s.opts }
     for (const [k, a] of Object.entries(this.stateArrays)) if (s.arrays[k]) a.set(s.arrays[k])
     const v = s.scalars
     this.time = v.time
@@ -1871,6 +1985,7 @@ export class TileWorld {
     this.falloutLeft = 1
     this.events = []
     this.refreshDroughts()
+    this.currents()
     this.temperatures()
     this.writeWater()
   }
@@ -1928,7 +2043,7 @@ export class TileWorld {
     const P = this.press
     for (let y = 0; y < m; y++) {
       for (let x = 0; x < m; x++) {
-        const d = Math.hypot((x + 0.5) * PB - cx, (y + 0.5) * PB - cy) / Math.max(r, PB)
+        const d = Math.hypot(wrapDelta((x + 0.5) * PB, cx, this.n), (y + 0.5) * PB - cy) / Math.max(r, PB)
         if (d >= 1) continue
         const b = y * m + x
         P[b] = clamp(P[b] + amount * (1 - smooth(d, 0.3, 1)), -1.5, 1.5)
@@ -1959,7 +2074,7 @@ export class TileWorld {
       if (this.extra[i * 4] > 0.1 && this.water[i * 4] < 0.002 && Math.random() < 0.6 * cover + 0.2) this.fire[i] = 1
     })
     // the fallout: a plume downwind of the blast
-    const i0 = clamp(Math.round(cy), 0, this.n - 1) * this.n + clamp(Math.round(cx), 0, this.n - 1)
+    const i0 = this.tileAt(cx, cy)
     const wx = this.tileU[i0]
     const wy = this.tileV[i0]
     const ws = Math.hypot(wx, wy) || 1
@@ -2073,7 +2188,7 @@ export class TileWorld {
 
   /** Opens a volcano: a vent that erupts for a while and builds a cone. */
   erupt(cx: number, cy: number, strength: number) {
-    const x = clamp(Math.round(cx), 0, this.n - 1)
+    const x = wrap(Math.round(cx), this.n)
     const y = clamp(Math.round(cy), 0, this.n - 1)
     this.vents.push({ x, y, strength, left: Math.round(600 + 1200 * strength) })
     this.raise(cx, cy, 4, 0.02 * strength)
@@ -2088,7 +2203,7 @@ export class TileWorld {
   private driftAsh() {
     if (!this.ash.length) return
     for (const a of this.ash) {
-      a.x += this.sampleCells(this.windU, a.x, a.y) * 0.6
+      a.x = wrap(a.x + this.sampleCells(this.windU, a.x, a.y) * 0.6, this.n)
       a.y += this.sampleCells(this.windV, a.x, a.y) * 0.6
       a.r += 0.004
       a.left--
@@ -2098,15 +2213,15 @@ export class TileWorld {
 
   /** Whether a point (tiles) lies over volcanic ash. */
   inAsh(x: number, y: number): boolean {
-    return this.ash.some((a) => Math.hypot(x - a.x, y - a.y) < a.r)
+    return this.ash.some((a) => Math.hypot(wrapDelta(x, a.x, this.n), y - a.y) < a.r)
   }
 
   /** Whether the sea is within `r` tiles of a point. */
   seaNear(cx: number, cy: number, r: number): boolean {
     const n = this.n
     for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(n - 1, Math.ceil(cy + r)); y++) {
-      for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(n - 1, Math.ceil(cx + r)); x++) {
-        if (this.ground[(y * n + x) * 4] < this.sea - 0.004) return true
+      for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
+        if (this.ground[(y * n + wrap(x, n)) * 4] < this.sea - 0.004) return true
       }
     }
     return false
@@ -2115,14 +2230,14 @@ export class TileWorld {
   /** Whether a town here stands on the coast a great wave reaches: below ~460 m, the sea within 6 tiles. */
   coastTown(x: number, y: number): boolean {
     const n = this.n
-    const h = this.ground[(clamp(Math.floor(y), 0, n - 1) * n + clamp(Math.floor(x), 0, n - 1)) * 4]
+    const h = this.ground[(clamp(Math.floor(y), 0, n - 1) * n + wrap(Math.floor(x), n)) * 4]
     return h < this.sea + 0.03 && this.seaNear(x, y, 6)
   }
 
   /** Whether a tile is low coast a wave can reach: land just above the sea, the sea within 3 tiles. */
   lowCoast(x: number, y: number): boolean {
     const n = this.n
-    const xx = clamp(Math.floor(x), 0, n - 1)
+    const xx = wrap(Math.floor(x), n)
     const yy = clamp(Math.floor(y), 0, n - 1)
     const h = this.ground[(yy * n + xx) * 4]
     return h >= this.sea && h < this.sea + 0.015 && this.seaNear(xx, yy, 3)
@@ -2138,10 +2253,10 @@ export class TileWorld {
     const g = this.ground
     let hit = 0
     for (let y = Math.max(0, Math.floor(cy - reach)); y <= Math.min(n - 1, Math.ceil(cy + reach)); y++) {
-      for (let x = Math.max(0, Math.floor(cx - reach)); x <= Math.min(n - 1, Math.ceil(cx + reach)); x++) {
+      for (let x = Math.floor(cx - reach); x <= Math.ceil(cx + reach); x++) {
         const d = Math.hypot(x - cx, y - cy) / reach
         if (d >= 1) continue
-        const i = y * n + x
+        const i = y * n + wrap(x, n)
         const h = g[i * 4]
         if (h < this.sea) continue
         const k = (1 - d) * power
@@ -2177,7 +2292,7 @@ export class TileWorld {
   /** A strike: a crater, lava around it, fire, dust that cools the planet. */
   strike(cx: number, cy: number, r: number) {
     // into the sea: a great wave
-    const i0 = clamp(Math.round(cy), 0, this.n - 1) * this.n + clamp(Math.round(cx), 0, this.n - 1)
+    const i0 = this.tileAt(cx, cy)
     if (this.ground[i0 * 4] < this.sea) this.tsunami(cx, cy, Math.min(90, r * 7))
     const depth = 0.05 * Math.min(r / 8, 2)
     this.brush(cx, cy, r, (i, cover) => {
@@ -2204,7 +2319,7 @@ export class TileWorld {
   /** A decreed drought: a fixed high; or lifts the one at the place (returns whether one was lifted). */
   drought(cx: number, cy: number, r: number, lift: boolean): boolean {
     if (lift) {
-      const k = this.droughts.findIndex((d) => Math.hypot(d.x - cx, d.y - cy) < d.r)
+      const k = this.droughts.findIndex((d) => Math.hypot(wrapDelta(d.x, cx, this.n), d.y - cy) < d.r)
       if (k < 0) return false
       this.droughts.splice(k, 1)
     } else {
@@ -2214,19 +2329,31 @@ export class TileWorld {
     return true
   }
 
-  private brush(cx: number, cy: number, r: number, fn: (i: number, cover: number) => void) {
+  /**
+   * Calls `fn` for every tile of a disc with how much it covers the tile (1 at the centre,
+   * 0 at the edge) and the tile's place from the centre (tiles). East–west the disc goes
+   * round the world.
+   */
+  private brush(cx: number, cy: number, r: number, fn: (i: number, cover: number, dx: number, dy: number) => void) {
     const n = this.n
-    const x0 = Math.max(0, Math.floor(cx - r))
-    const x1 = Math.min(n - 1, Math.ceil(cx + r))
+    const x0 = Math.floor(cx - r)
+    const x1 = Math.ceil(cx + r)
     const y0 = Math.max(0, Math.floor(cy - r))
     const y1 = Math.min(n - 1, Math.ceil(cy + r))
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) / Math.max(r, 0.5)
+        const dx = x + 0.5 - cx
+        const dy = y + 0.5 - cy
+        const d = Math.hypot(dx, dy) / Math.max(r, 0.5)
         if (d >= 1) continue
-        fn(y * n + x, 1 - smooth(d, 0.4, 1))
+        fn(y * n + wrap(x, n), 1 - smooth(d, 0.4, 1), dx, dy)
       }
     }
+  }
+
+  /** The tile under a point (tiles): its column wrapped round the world, its row kept on the map. */
+  private tileAt(x: number, y: number): number {
+    return clamp(Math.round(y), 0, this.n - 1) * this.n + wrap(Math.round(x), this.n)
   }
 
   /** A hash per tile, for the sprites' variety. */

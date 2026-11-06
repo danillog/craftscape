@@ -1729,3 +1729,168 @@ button.wide.active {
   height: 28px;
   flex: none;
 }
+
+/* ---- the charts (the Data tab): small multiples, one measure each ---- */
+
+.charts {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.chart {
+  margin: 0;
+}
+
+.chart figcaption {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: baseline;
+  gap: 0 8px;
+}
+
+.chart-title {
+  font-size: 0.8rem;
+  color: var(--text-soft);
+}
+
+.chart-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.chart-value small {
+  font-size: 0.72rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.chart-sub {
+  grid-column: 1 / -1;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 4px;
+  cursor: crosshair;
+  outline: none;
+  border-radius: 6px;
+}
+
+.chart svg:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-border);
+}
+
+.chart .grid {
+  stroke: rgba(255, 255, 255, 0.08);
+  stroke-width: 1;
+}
+
+.chart .line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart .dot {
+  fill: var(--accent);
+  stroke: var(--glass-solid);
+  stroke-width: 2;
+}
+
+.chart .cross {
+  stroke: rgba(255, 255, 255, 0.35);
+  stroke-width: 1;
+}
+
+.chart .axis {
+  fill: var(--muted);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-table summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  color: var(--text-soft);
+}
+
+.chart-table table {
+  width: 100%;
+  margin-top: 6px;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-table th,
+.chart-table td {
+  padding: 3px 4px;
+  text-align: right;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.chart-table th {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+/* ---- the history book ---- */
+
+.lanes {
+  margin: 0;
+}
+
+.lanes svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.lanes .lane-name {
+  fill: var(--text);
+  font-size: 8px;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 2px;
+}
+
+.lanes .axis {
+  fill: var(--muted);
+  font-size: 9px;
+}
+
+.drawer .search {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--control);
+  border: 1px solid var(--glass-border);
+}
+
+.chronicle.annals {
+  max-height: none;
+}
+
+.chronicle .annal {
+  all: unset;
+  cursor: pointer;
+}
+
+.chronicle .annal:hover {
+  text-decoration: underline;
+}
+
+.tool-group.group-povos .group-name {
+  color: #e8b4ff;
+}

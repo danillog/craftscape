@@ -74,7 +74,7 @@ struct Sim {
   quake: vec4f,     // earthquake this frame: epicentre uv, fault normal angle, radius (world units)
   quake2: vec4f,    // x: fault throw (signed height), y: rubble shaken loose, z: 1 while a quake runs
   source: vec4f,    // x: fixed air-mass brush rate (+ warm, − cold), y: 1 clears every fixed source,
-                    // z: ocean-current brush rate (+ warm, − cold)
+                    // z: ocean-current brush rate (+ warm, − cold), w: forest brush rate (+ plants, − clears)
   impact: vec4f,    // meteor strike this frame: xy centre uv, z radius (world units, 0 none),
                     // w crater depth (height units)
   storms: array<vec4f, ${MAX_STORMS}>,  // storms (the storm tool): xy centre uv, z strength (0 none), w radius (uv)
@@ -2169,6 +2169,98 @@ fn bump(d: f32, at: f32, width: f32) -> f32 { let t = (d - at) / width; return e
   lava[i] = lv;
 `)
 
+// Continental drift (experimental): the plates carry the land with them. The engine keeps
+// count of how far each plate has drifted in whole cells; when a plate is due another
+// cell, its land moves one cell that way: every cell takes the state of the cell behind
+// it on the same plate (or on a plate moving alongside). Where a plate runs into another
+// the land ahead is overrun (the crust is consumed; the uplift raises the range). At a
+// plate's trailing edge, where the cell behind belongs to a plate that is not following,
+// the land is stretched instead: the cell stays, sinks and bleeds lava (a rift, and with
+// time a new sea floor).
+// This pass writes, for every cell, the index of the cell its land comes from, with the
+// top bit set where it is a rift; the gather passes then move each buffer.
+export const MAX_PLATE_MOVES = 64
+export const driftMapShader = header + platesModel('S.geo.y', 'S.geo.z', 'S.plates') + /* wgsl */ `
+// moves[0].x: how many; then per plate that moves (its grid cell xy, its shift in cells zw)
+@group(0) @binding(1) var<storage, read> moves: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> map: array<u32>;
+
+fn shiftOf(c: vec2i) -> vec2i {
+  let count = u32(moves[0].x);
+  for (var k = 0u; k < count; k++) {
+    let m = moves[1u + k];
+    if (i32(m.x) == c.x && i32(m.y) == c.y) { return vec2i(i32(m.z), i32(m.w)); }
+  }
+  return vec2i(0);
+}
+` + gridMain(/* wgsl */ `
+  let n = i32(S.size);
+  let own = platePair(worldUV(uvOf(x, y)), S.seed).own;
+  let s = shiftOf(own);
+  var src = i;
+  var rift = 0u;
+  if (s.x != 0 || s.y != 0) {
+    let sx = x - s.x;
+    let sy = y - s.y;
+    // land that would come from outside the window stays as it is
+    if (sx >= 0 && sy >= 0 && sx < n && sy < n) {
+      let behind = platePair(worldUV(uvOf(sx, sy)), S.seed).own;
+      let bs = shiftOf(behind);
+      if ((behind.x == own.x && behind.y == own.y) || (bs.x == s.x && bs.y == s.y)) {
+        src = ix(sx, sy);
+      } else {
+        rift = 1u;
+      }
+    }
+  }
+  map[i] = src | (rift << 31u);
+`)
+
+// Moves one vec4 buffer by the drift map: reads the buffer, writes a scratch copy that is copied back.
+export const driftGatherShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> map: array<u32>;
+@group(0) @binding(2) var<storage, read> src: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> dst: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  dst[i] = src[map[i] & 0x7fffffffu];
+`)
+
+export const driftGatherScalarShader = header + /* wgsl */ `
+@group(0) @binding(1) var<storage, read> map: array<u32>;
+@group(0) @binding(2) var<storage, read> src: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+` + gridMain(/* wgsl */ `
+  dst[i] = src[map[i] & 0x7fffffffu];
+`)
+
+// The rifts of this move: the land sinks a step (down to the deep sea floor at most),
+// loses its soil and plants, and fresh lava wells up.
+export const driftRiftShader = header + /* wgsl */ `
+const RIFT_DROP = 0.004;
+const RIFT_FLOOR = -0.09;
+@group(0) @binding(1) var<storage, read> map: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ground: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> extra: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> lava: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  if ((map[i] >> 31u) == 0u) { return; }
+  var g = ground[i];
+  var e = extra[i];
+  var lv = lava[i];
+  g.y -= min(RIFT_DROP, max(g.y - RIFT_FLOOR, 0.0));
+  g.z = 0.0;
+  g.w *= 0.5;
+  e.x = 0.0;
+  e.z = 0.0;
+  e.w = 0.0;
+  lv.x += 0.0004;
+  lv.y = 1.0;
+  g.x = g.y + g.z + g.w + e.w + lv.x;
+  ground[i] = g;
+  extra[i] = e;
+  lava[i] = lv;
+`)
+
 // Earthquake: a fault slips at once along a stretch of plate boundary. Where the
 // plates collide one side jumps up (a fault scarp), where they pull apart a strip drops
 // (a graben); sideways faults only shake. The shaking breaks loose rock off steep slopes
@@ -2392,6 +2484,82 @@ export const worksShader = header + /* wgsl */ `
   if (warmed) { air[i] = ar; }
 `)
 
+// The acts of the gods and of the world that touch the land at a place (see the engine's
+// powers): each is a disc (uv, radius, kind) with four numbers of its own.
+//   1 fire: plants burn (x per frame) and the soil dries, the air over it heats (y, °C)
+//   2 tsunami: the sea is thrown up in a ring round the source and drops in the middle (x, height)
+//   3 a nuclear blast or its fallout: plants die (x, share), snow and ice melt (y, share), the air heats (z, °C)
+//   4 cataclysm: the seas boil away (x, share), everything alive burns and the ice melts (y, share),
+//     the air heats (z, °C) and the crust melts into a sheet of lava (w, height), thicker in places
+export const MAX_ACTS = 48
+export const actsShader = header + simplex + /* wgsl */ `
+@group(0) @binding(1) var<storage, read_write> ground: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> extra: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> water: array<vec4f>;
+@group(0) @binding(4) var<storage, read_write> air: array<vec4f>;
+@group(0) @binding(5) var<storage, read_write> lava: array<vec4f>;
+// acts[0].x: how many; then per act (uv, radius (uv), kind), (the four numbers of its kind)
+@group(0) @binding(6) var<storage, read> acts: array<vec4f>;
+` + gridMain(/* wgsl */ `
+  let count = u32(acts[0].x);
+  if (count == 0u) { return; }
+  let uv = uvOf(x, y);
+  var g = ground[i];
+  var e = extra[i];
+  var w = water[i];
+  var a = air[i];
+  var lv = lava[i];
+  var touched = false;
+  for (var k = 0u; k < count; k++) {
+    let act = acts[1u + k * 2u];
+    let p = acts[2u + k * 2u];
+    let d = distance(uv, act.xy) / act.z;
+    if (d >= 1.0) { continue; }
+    let kind = u32(act.w + 0.5);
+    let cover = 1.0 - smoothstep(0.5, 1.0, d);
+    touched = true;
+    if (kind == 1u) {
+      if (w.x < 0.0005 && e.z < 0.0005) {
+        e.x = max(e.x - p.x * cover, 0.0);
+        e.y = max(e.y - p.x * 0.5 * cover, 0.0);
+      }
+      a.z = min(a.z + p.y * cover, 90.0);
+    } else if (kind == 2u) {
+      if (w.x > 0.003) {
+        let ring = exp(-(d - 0.55) * (d - 0.55) / 0.03);
+        let pit = exp(-d * d / 0.06);
+        w.x = max(w.x + p.x * (ring - 0.6 * pit), 0.0005);
+      }
+    } else if (kind == 3u) {
+      e.x *= 1.0 - clamp(p.x * cover, 0.0, 1.0);
+      let melt = 1.0 - clamp(p.y * cover, 0.0, 1.0);
+      e.z *= melt;
+      e.w *= melt;
+      a.z = min(a.z + p.z * cover, 90.0);
+    } else if (kind == 4u) {
+      let boiled = w.x * clamp(p.x, 0.0, 1.0);
+      w.x -= boiled;
+      let gone = 1.0 - clamp(p.y, 0.0, 1.0);
+      e.x *= gone;
+      e.z *= gone;
+      e.w *= gone;
+      a.z = min(a.z + p.z, 90.0);
+      if (p.w > 0.0) {
+        let n = 0.5 + 0.5 * snoise(vec3f(worldUV(uv) * 2.5, S.seed * 0.37 + 11.0));
+        lv.x += p.w * n * n;
+        lv.y = 1.0;
+      }
+    }
+  }
+  if (!touched) { return; }
+  g.x = g.y + g.z + g.w + e.w + lv.x;
+  ground[i] = g;
+  extra[i] = e;
+  water[i] = w;
+  air[i] = a;
+  lava[i] = lv;
+`)
+
 // god.shader: the brush adds or removes rock, soil or sand with a noisy profile.
 // Brush water (originally in cycle.shader) is applied here too, so painting works while paused.
 // The climate brush paints a local temperature offset and a local humidity offset.
@@ -2460,6 +2628,10 @@ const AIR_MASS_BRUSH = 5.0;
   e.x *= 1.0 - clamp(s * buried * 0.05, 0.0, 1.0);
   e.z *= cleared;
   e.w *= cleared;
+  // the forest brush: plants take (or are cleared) where it paints, on land out of the water
+  if (S.source.w != 0.0 && w.x < 0.0005) {
+    e.x = clamp(e.x + s * S.source.w * 0.02, 0.0, 1.0);
+  }
   extra[i] = e;
   // leveling: pull the surface towards the stroke's target height, cutting sand,
   // then soil, then rock, and filling with soil

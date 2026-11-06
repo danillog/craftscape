@@ -27,17 +27,23 @@ import {
   climateOf,
   defaultSettings,
   emptyStats,
+  PEOPLE_MAPS,
+  PEOPLE_POWERS,
+  quakeMagnitude,
   type AreaSetting,
+  type Overlay,
+  type PeoplePower,
   type Probe,
   type Settings,
   type Stats,
   type Timeline,
   type Tool,
+  type YearRecord,
 } from './settings'
 import { scenarioById, type ScenarioId } from './scenarios'
-import { challengeById, type ChallengeId, type ChallengeState } from './challenges'
-import { CIV_COLORS, Life, TERRITORY_N, placeName, type LifeLabel } from './life'
-import { FAR_GRID, FAR_TEXELS_PER_WINDOW, MAX_DUSTS, MAX_HIGHS, MAX_STORMS } from './shaders/sim'
+import { challengeById, loadTrophies, saveTrophies, type ChallengeId, type ChallengeState, type WorldMetrics } from './challenges'
+import { CIV_COLORS, Life, TERRITORY_N, YEAR, placeName, type LifeEvent, type LifeLabel } from './life'
+import { FAR_GRID, FAR_TEXELS_PER_WINDOW, MAX_DUSTS, MAX_HIGHS, MAX_PLATE_MOVES, MAX_STORMS } from './shaders/sim'
 import {
   boundaryAt,
   plateDrift,
@@ -56,12 +62,16 @@ import {
   type Brush,
   type Climate,
   type Impact,
+  type PlateMove,
   type PlateOverride,
   type Quake,
   type SimState,
   type Vent,
 } from './simulation'
-import { skyAt } from './sky'
+import { dayHours, declinationAt, latitudeOfWorld, skyAt } from './sky'
+import { Powers, type PowerCell } from './powers'
+import { CALM, CATEGORICAL, ERA_RAMP, FAMINE_COLOR, HUMAN_MARKS, PEACE_COLOR, PLAGUE_COLOR, WAR_COLOR, mixRgb, type Rgb } from './palettes'
+import { Sound, type SoundKind } from '../tiles/sound'
 import { TILES, WorldStore } from './world'
 
 const STEP = 1 / 60 // the original simulated one step per frame at 60 fps
@@ -104,6 +114,9 @@ const UNDO_BUDGET_BYTES = 256 * 1024 * 1024
 const REWIND_BUDGET_BYTES = 128 * 1024 * 1024
 const REWIND_SPAN = 120
 const MAX_REWIND = 24
+/** Years of record kept for the charts, and great moments kept for the history book. */
+const RECORD_YEARS = 600
+const MAX_ANNALS = 300
 /** A storm lives this many simulated seconds: it deepens, holds, then fills in. */
 const STORM_LIFE = 100
 /** How deep a storm's low is held at this age (0–1). */
@@ -225,6 +238,12 @@ export class Engine {
   private plateOverrides: PlateOverride[] = []
   /** Plate time: how far a plate of unit speed has drifted since the terrain was made (world units). */
   private plateTime = 0
+  /**
+   * Continental drift: how many whole cells each plate (by its grid cell) has carried its
+   * land so far, and the resolution and area that count is for.
+   */
+  private readonly carried = new Map<string, [number, number]>()
+  private carriedFor = ''
   /** The plate being dragged: its cell, where the drag started (world units), whether it turned. */
   private plateDrag: {
     cell: [number, number]
@@ -256,9 +275,39 @@ export class Engine {
   private dust = 0
   /** The challenge being played (see challenges.ts). */
   private challenge: ChallengeState | null = null
+  private trophies = loadTrophies()
+  /** The world year by year (the charts), each people's eras and the great moments (the history book). */
+  private record: YearRecord[] = []
+  private eraLog: Record<number, [number, number][]> = {}
+  private annals: LifeEvent[] = []
+  private lastAnnal = -Infinity
+  /** The life's year when the peace in course began (peoples alive and no war), or null. */
+  private peaceSince: number | null = null
   /** The state as last read back for the analysis: climate, water, extra and lava per cell. */
   private field: Field | null = null
   private readonly life = new Life()
+  /** Wildfire, hurricanes, the earthquake power, nuclear blasts and the cataclysm (see powers.ts). */
+  private readonly powers = new Powers({
+    cell: (pos) => this.powerCell(pos),
+    wind: () => ({ angle: this.windAngle, speed: ((this.settings.autoClimate ? 0.8 : this.settings.windSpeed) / 512) * 60 }),
+    fault: (pos) => {
+      const b = boundaryAt(pos, this.plates())
+      return b.pair.dist < 0.15 ? { normal: Math.atan2(b.normal[1], b.normal[0]), kind: b.kind } : null
+    },
+    toast: (text) => this.toast(text),
+    chronicle: (text, major, pos) => this.life.chronicle(text, major, pos),
+    dust: (pos, cooling, radius, planet) => {
+      if (cooling > 0) this.dusts = [...this.dusts, { uv: this.uvAt(pos), cooling, radius: radius / this.extent }].slice(-MAX_DUSTS)
+      this.dust = Math.min(this.dust + planet, 8)
+    },
+    sound: (kind) => this.playSound(kind),
+    life: () => (this.settings.life ? this.life : null),
+  })
+  private readonly audio = new Sound()
+  /** The territories as a map of the peoples paints them (see territoryFor), and when it was last painted. */
+  private readonly paintedMap = new Uint32Array(TERRITORY_N * TERRITORY_N)
+  private paintedAt = -Infinity
+  private paintedFor: Overlay = 'none'
   /** Snapshots taken every few simulated seconds, oldest first, for rewinding (see rewind). */
   private rewindRing: { snap: GPUBuffer; simTime: number; timeOfDay: number }[] = []
   private lastRewindSnap = -Infinity
@@ -481,6 +530,7 @@ export class Engine {
   }
 
   private start() {
+    this.stats = { ...this.stats, trophies: this.trophies }
     this.lastTime = performance.now()
     this.statStart = this.lastTime
     this.nextFrame = this.lastTime
@@ -616,7 +666,9 @@ export class Engine {
       windArrows: s.windArrows,
       clouds: s.clouds,
       cameraMode: s.cameraMode,
-      area: s.area,
+      // the area the player chose stays; one a scenario set (Pangaea) goes back to the default
+      area: scenarioById(s.scenario).settings.area ? defaultSettings.area : s.area,
+      sound: s.sound,
     }
     this.settings = { ...defaultSettings, ...keep, timeOfDay: s.timeOfDay }
     this.set({ ...scenario.settings, scenario: id, terrainShape: scenario.shape, seed })
@@ -1357,6 +1409,49 @@ export class Engine {
     this.sim.platesDirty = true
   }
 
+  /**
+   * Continental drift (experimental): every plate due another whole cell of drift carries
+   * its land a cell that way, with the water, the plants and the peoples' towns on it.
+   */
+  private driftLand(enc: GPUCommandEncoder) {
+    const cell = this.extent / this.sim.size
+    const key = `${this.sim.size}:${this.extent}`
+    if (key !== this.carriedFor) {
+      this.carried.clear()
+      this.carriedFor = key
+    }
+    const f = this.plates()
+    const [x0, y0] = this.worldAt([0, 0])
+    const [x1, y1] = this.worldAt([1, 1])
+    const moves: PlateMove[] = []
+    // the plates over the window: a plate's site may lie well outside the land it covers
+    for (const { cell: c } of platesIn(x0 - 1.2, y0 - 1.2, x1 + 1.2, y1 + 1.2, f)) {
+      const d = plateDrift(c, f)
+      const target: [number, number] = [Math.round(d[0] / cell), Math.round(d[1] / cell)]
+      const k = `${c[0]},${c[1]}`
+      const done = this.carried.get(k)
+      // a plate first seen starts from where it is: its land is not caught up
+      if (!done) {
+        this.carried.set(k, target)
+        continue
+      }
+      const shift: [number, number] = [clamp(target[0] - done[0], -1, 1), clamp(target[1] - done[1], -1, 1)]
+      if ((!shift[0] && !shift[1]) || moves.length >= MAX_PLATE_MOVES) continue
+      this.carried.set(k, [done[0] + shift[0], done[1] + shift[1]])
+      moves.push({ cell: c, shift })
+    }
+    if (!moves.length) return
+    this.sim.encodeDrift(enc, moves)
+    if (this.settings.life) {
+      const shifts = new Map(moves.map((m) => [`${m.cell[0]},${m.cell[1]}`, m.shift]))
+      this.life.drift((pos) => {
+        const own = platePair(pos, f).own
+        const s = shifts.get(`${own[0]},${own[1]}`)
+        return s ? [s[0] * cell, s[1] * cell] : null
+      })
+    }
+  }
+
   /** Every so often (more often in geological time) a fault slips somewhere along a boundary in view. */
   private scheduleQuake(steps: number) {
     const s = this.settings
@@ -1391,7 +1486,13 @@ export class Engine {
       rubble: 0.0008 * scale,
     }
     this.toast(`Terremoto de magnitude ${magnitude.toFixed(1).replace('.', ',')}: ${BOUNDARY_NAMES[b.kind]}`)
+    this.playSound('rumble')
     if (magnitude >= 6.5) this.life.chronicle(`Um terremoto de magnitude ${magnitude.toFixed(1).replace('.', ',')} sacode a terra.`, magnitude >= 7, b.point)
+    // the big ones bring houses down, and under the sea raise a tsunami
+    if (magnitude >= 6.5) {
+      if (this.settings.life) this.life.shake(b.point, Math.min(0.06 * scale, 0.9) * 0.8, clamp((magnitude - 5) / 4, 0, 1))
+      this.powers.tsunami(b.point, magnitude, true)
+    }
   }
 
   /**
@@ -1466,6 +1567,7 @@ export class Engine {
     this.dust = Math.min(this.dust + 0.3 + v.strength, 6)
     const again = v.eruptions > 1 ? ' de novo' : ''
     this.toast(`O ${v.name} entrou em erupção${again}: lava por uns minutos, e cinzas que esfriam a região ${cooling.toFixed(0)} °C`)
+    this.playSound('rumble')
     this.life.chronicle(`O ${v.name} entra em erupção${again}; a cinza escurece o céu.`, true, this.worldAt(v.uv))
     this.stats = { ...this.stats, volcanoes: this.volcanoReports() }
   }
@@ -1494,6 +1596,31 @@ export class Engine {
     const s = this.settings
     const warming = (s.autoClimate ? 0 : s.temperature) + this.civWarming + this.godWarming
     return climateOf({ temperature: 0, seaLevel: s.seaLevel }).seaLevel + warming * SEA_RISE_PER_DEGREE + this.tide
+  }
+
+  /** A sound for something that happened, when the sounds are on. */
+  private playSound(kind: SoundKind) {
+    if (this.settings.sound) this.audio.play(kind)
+  }
+
+  /** What the powers read of the land at a place (world units), from the last read-back. */
+  private powerCell(pos: [number, number]): PowerCell | null {
+    const f = this.field
+    if (!f) return null
+    const n = f.size
+    const u = pos[0] / this.extent - f.origin[0] / n
+    const v = pos[1] / this.extent - f.origin[1] / n
+    if (u < 0 || v < 0 || u >= 1 || v >= 1) return null
+    const i = (Math.floor(v * n) * n + Math.floor(u * n)) * 4
+    return {
+      water: f.water[i],
+      vegetation: f.extra[i],
+      moisture: f.extra[i + 1],
+      snow: f.extra[i + 2],
+      temperature: f.climate[i + 3],
+      humidity: f.climate[i + 1],
+      lava: f.lava[i],
+    }
   }
 
   /** A notice that goes away by itself. */
@@ -1658,6 +1785,7 @@ export class Engine {
       airSource: s.tool === 'airmass' && s.airMassFixed ? amount : 0,
       clearAirSources: clearing,
       current: s.tool === 'current' ? amount : 0,
+      forest: s.tool === 'forest' ? amount : 0,
     }
   }
 
@@ -1695,6 +1823,26 @@ export class Engine {
       const radius = clamp(s.brushSize * 2, 0.06, 0.35) / this.extent
       this.storms = [...this.storms, { uv, age: 0, radius }].slice(-MAX_STORMS)
       this.toast('Tempestade a caminho: uma baixa profunda que o vento vai levar embora')
+      this.playSound('thunder')
+    } else if (s.tool === 'fire') {
+      if (s.mode === 'add') {
+        if (this.powers.ignite(this.worldAt(uv), s.brushSize)) this.playSound('whoosh')
+        else this.toast('Nada pega fogo aqui: o fogo precisa de mato, fora da água e da neve')
+      }
+    } else if (s.tool === 'hurricane') {
+      this.powers.hurricane(this.worldAt(uv))
+    } else if (s.tool === 'quake') {
+      this.powers.quake(this.worldAt(uv), quakeMagnitude(s.brushSize, s.area))
+    } else if (s.tool === 'nuke') {
+      this.powers.nuke(this.worldAt(uv))
+    } else if (s.tool === 'people') {
+      const born = this.life.seedCiv(this.worldAt(uv), this.extent)
+      this.toast(born ? 'Um povo novo nasce aqui' : 'Aqui não: um povo precisa de terra firme, sem gelo nem lava, longe de outras cidades')
+      if (born) this.playSound('chime')
+    } else if ((PEOPLE_POWERS as readonly Tool[]).includes(s.tool)) {
+      const told = this.life.godPower(s.tool as PeoplePower, this.worldAt(uv))
+      this.toast(told ?? 'Nenhuma cidade aqui: clique numa cidade')
+      if (told) this.playSound(s.tool === 'plague' ? 'plague' : s.tool === 'discord' ? 'war' : 'chime')
     } else if (s.tool === 'meteor') {
       const radius = clamp(s.brushSize, 0.015, 0.2)
       const depth = radius * 0.3
@@ -1711,6 +1859,7 @@ export class Engine {
         `Impacto! Bola de fogo, onda de choque e tempestade; a poeira esfria a região ${cooling.toFixed(0)} °C e o planeta ${this.dust.toFixed(1).replace('.', ',')} °C até baixar`,
       )
       this.life.chronicle('Uma estrela cai do céu: bola de fogo, terremoto e dias de poeira.', true, this.worldAt(uv))
+      this.playSound('boom')
     }
   }
 
@@ -1767,7 +1916,7 @@ export class Engine {
   private get anomaly() {
     const s = this.settings
     const base = s.autoClimate ? seasonOf(this.simTime / (s.dayLength * 60 * DAYS_PER_YEAR)).anomaly : s.temperature
-    return base - this.dust + this.civWarming + this.godWarming
+    return base - this.dust + this.civWarming + this.godWarming + this.powers.heat
   }
 
   private climate(): Climate {
@@ -1861,13 +2010,41 @@ export class Engine {
     this.emit()
   }
 
+  /** The peoples' measures for the challenges about them. */
+  private worldMetrics(): WorldMetrics {
+    const life = this.settings.life ? this.life.stats() : null
+    const civs = life?.civs ?? []
+    const year = life?.year ?? 0
+    if (life && civs.length && !life.wars.length) this.peaceSince ??= year
+    else this.peaceSince = null
+    return {
+      civs: civs.length,
+      people: life?.people ?? 0,
+      maxTech: Math.max(0, ...civs.map((c) => c.tech)),
+      modernCivs: civs.filter((c) => c.eraIndex >= 6).length,
+      peaceYears: this.peaceSince === null ? 0 : Math.max(0, year - this.peaceSince),
+      voyages: this.life.voyagesTotal,
+      nuclearWars: this.life.nuclearCount,
+      civWarming: this.civWarming,
+    }
+  }
+
   private updateChallenge(report: ClimateReport) {
+    const world = this.worldMetrics()
     const c = this.challenge
     if (!c) return
     const start = c.start ?? report
-    const progress = clamp(challengeById(c.id).progress(report, start), 0, 1)
+    const progress = clamp(challengeById(c.id).progress(report, start, world), 0, 1)
     const done = c.done || progress >= 1
-    if (done && !c.done) this.toast(`Desafio concluído: ${challengeById(c.id).name}!`)
+    if (done && !c.done) {
+      this.toast(`Desafio concluído: ${challengeById(c.id).name}!`)
+      this.playSound('fanfare')
+      if (!this.trophies.includes(c.id)) {
+        this.trophies = [...this.trophies, c.id]
+        saveTrophies(this.trophies)
+        this.stats = { ...this.stats, trophies: this.trophies }
+      }
+    }
     this.challenge = { ...c, start, progress, done }
   }
 
@@ -1880,6 +2057,68 @@ export class Engine {
     if (s.tool === 'airmass') return 'airmass'
     if (s.tool === 'current') return 'current'
     return s.tool === 'heat' ? 'temperature' : s.tool === 'humidity' ? 'humidity' : 'none'
+  }
+
+  /**
+   * The territories as the map in view paints them: by people (the political map), or
+   * each people's land in the colour of its era, faith, tongue's family, plague, hunger or
+   * war; the human-impact map paints what the peoples made of the land instead.
+   */
+  private territoryFor(overlay: Overlay): Uint32Array<ArrayBuffer> | null {
+    const base = this.life.territory(this.origin, this.sim.size, this.extent)
+    if (overlay !== 'human' && (overlay === 'civilization' || !PEOPLE_MAPS.includes(overlay))) return base
+    const out = this.paintedMap
+    // repainted twice a second (the peoples change slowly), or when the map changes
+    if (overlay === this.paintedFor && this.time - this.paintedAt < 0.5) return out
+    this.paintedFor = overlay
+    this.paintedAt = this.time
+    out.fill(0)
+    // a colour of its own for a cell: bit 19 and 4 bits each of red, green and blue above it
+    const own = (c: Rgb) => ((1 << 19) | ((c[0] >> 4) << 28) | ((c[1] >> 4) << 24) | ((c[2] >> 4) << 20)) >>> 0
+    if (overlay === 'human') {
+      const T = TERRITORY_N
+      const paint = (uv: [number, number], radius: number, mark: number) => {
+        const value = ((mark + 1) | own(HUMAN_MARKS[mark].color)) >>> 0
+        const r = radius * T
+        const cx = uv[0] * T
+        const cy = uv[1] * T
+        for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(T - 1, Math.ceil(cy + r)); y++) {
+          for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(T - 1, Math.ceil(cx + r)); x++) {
+            if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 > r * r) continue
+            const i = y * T + x
+            // the heavier mark wins
+            if ((out[i] & 15) <= mark + 1) out[i] = value
+          }
+        }
+      }
+      for (const w of this.life.works(this.origin, this.sim.size, this.extent)) {
+        if (w.kind === 8) continue
+        if (w.kind & 1) paint(w.uv, w.radius, 0)
+        if (w.kind & 2) paint(w.uv, w.radius * 0.8, 1)
+        if (w.kind & 16) paint(w.uv, w.radius * 0.6, 2)
+        if (w.kind & 32) paint(w.uv, w.radius * 0.35, 3)
+        if (w.kind & 4) paint(w.uv, w.radius * 0.45, 4)
+      }
+      return out
+    }
+    if (!base) return null
+    const colors: number[] = []
+    for (const c of this.stats.life?.civs ?? []) {
+      let col: Rgb
+      if (overlay === 'eras') col = ERA_RAMP[Math.min(c.eraIndex, ERA_RAMP.length - 1)]
+      else if (overlay === 'faith') col = CATEGORICAL[c.faithIndex % CATEGORICAL.length]
+      else if (overlay === 'language') col = CATEGORICAL[c.family % CATEGORICAL.length]
+      else if (overlay === 'plague') col = mixRgb(CALM, PLAGUE_COLOR, Math.min(1, c.plague * 1.5))
+      else if (overlay === 'famine') col = mixRgb(CALM, FAMINE_COLOR, Math.min(1, c.famine * 1.5))
+      else col = c.atWar ? WAR_COLOR : PEACE_COLOR
+      colors[c.color] = own(col)
+    }
+    for (let i = 0; i < base.length; i++) {
+      const v = base[i]
+      const c = v ? colors[(v & 15) - 1] : 0
+      out[i] = c ? (v | c) >>> 0 : v
+    }
+    return out
   }
 
   private resizeCanvas() {
@@ -1945,9 +2184,10 @@ export class Engine {
     const pressing = (this.input.painting || pressed) && this.hit !== null && !this.busy && !inspecting
     const painting = pressing && s.tool !== 'plates'
     this.dragPlate(pressing && s.tool === 'plates')
-    const quake = this.pendingQuake
+    const toUv = (p: [number, number]) => this.uvAt(p)
+    const quake = this.pendingQuake ?? this.powers.nextQuake(toUv)
     this.pendingQuake = null
-    const vent = this.pendingVent
+    const vent = this.pendingVent ?? this.powers.nextVent(toUv, e)
     this.pendingVent = null
     const clearing = this.pendingClear && !this.busy
     if (!this.busy) this.pendingClear = false
@@ -1962,11 +2202,18 @@ export class Engine {
       }
     }
     this.wasPainting = painting
+    // the fire power lights (or puts out) whatever the stroke passes over
+    if (painting && s.tool === 'fire' && this.hit) {
+      const at = this.worldAt(this.hit)
+      if (s.mode === 'add') this.powers.ignite(at, s.brushSize)
+      else this.powers.extinguish(at, s.brushSize)
+    }
     if (clearing && !painting) this.pushUndo(enc)
-    const impact = this.pendingImpact
+    const impact = this.pendingImpact ?? this.powers.nextImpact(toUv)
     this.pendingImpact = null
 
-    const sky = skyAt(s.timeOfDay)
+    // in the automatic climate the sun follows the latitude in view and the season
+    const sky = s.autoClimate ? skyAt(s.timeOfDay, this.latitude, declinationAt(this.yearPhase)) : skyAt(s.timeOfDay)
     this.sim.writeParams(
       {
         rain: s.rain,
@@ -1984,7 +2231,11 @@ export class Engine {
         plateTime: this.plateTime,
         plates: this.plateOverrides,
         impact,
-        storms: this.storms.map((st) => ({ uv: st.uv, strength: stormStrength(st.age), radius: st.radius })),
+        // the hurricanes first: they are never the ones dropped when there are too many storms
+        storms: [
+          ...this.powers.storms(toUv, e),
+          ...this.storms.map((st) => ({ uv: st.uv, strength: stormStrength(st.age), radius: st.radius })),
+        ].slice(0, MAX_STORMS),
         dusts: this.dusts,
         highs: this.highs.map((h) => ({ uv: h.uv, strength: 1, radius: h.radius })),
         quake,
@@ -2004,9 +2255,16 @@ export class Engine {
       this.sim.encodeGenerate(enc)
       this.plateOverrides = []
       this.plateTime = 0
+      this.carried.clear()
       full = true
       this.clearRewind()
       this.life.reset()
+      this.powers.reset()
+      this.peaceSince = null
+      this.record = []
+      this.eraLog = {}
+      this.annals = []
+      this.lastAnnal = -Infinity
       this.selectedTown = null
       this.lastFollowed = -1
       this.storms = []
@@ -2061,6 +2319,11 @@ export class Engine {
     }
     if (quake) this.sim.encodeQuake(enc)
     if (vent) this.sim.encodeVent(enc)
+    if (s.continentalDrift && steps > 0 && !this.busy) this.driftLand(enc)
+    else if (!s.continentalDrift) this.carried.clear()
+    // fire, tsunamis, blasts, fallout and the cataclysm
+    const acts = this.busy ? [] : this.powers.acts(toUv, e, steps > 0)
+    if (acts.length) this.sim.encodeActs(enc, acts)
     this.sim.encodeDerived(enc, full)
 
     const readPick = ray ? this.sim.encodePick(enc) : null
@@ -2080,6 +2343,9 @@ export class Engine {
     }
 
     const clean = s.photoMode || this.shot !== null
+    // the maps of the peoples (and of what they made of the land) are all drawn as the atlas
+    const shown = this.overlay()
+    const peopleMap = PEOPLE_MAPS.includes(shown) || shown === 'human'
     this.renderer.render(
       view,
       {
@@ -2089,15 +2355,13 @@ export class Engine {
       },
       this.time,
       {
-        overlay: this.overlay(),
+        overlay: peopleMap ? 'civilization' : shown,
         arrows: s.windArrows && !clean,
         plateArrows: this.overlay() === 'plates' && !clean ? this.plateArrows() : [],
-        life: s.life ? this.life.markers(this.origin, this.sim.size, e) : [],
+        life: [...(s.life ? this.life.markers(this.origin, this.sim.size, e) : []), ...this.powers.markers(toUv)],
         roads: s.life && !clean ? this.life.roads(this.origin, this.sim.size, e) : [],
         territory:
-          s.life && (s.politicalMap || s.overlay === 'civilization') && !clean
-            ? this.life.territory(this.origin, this.sim.size, e)
-            : null,
+          s.life && (s.politicalMap || peopleMap) && !clean ? this.territoryFor(shown) : null,
         clouds: s.clouds,
         sky,
         cloudDrift: this.cloudDrift,
@@ -2116,8 +2380,10 @@ export class Engine {
         },
       },
     )
-    const atlas = this.overlay() === 'civilization'
-    this.drawLabels(view.viewProj, s.life && !clean ? this.life.labels(this.origin, this.sim.size, e, this.selectedTown, atlas) : [], atlas)
+    const atlas = peopleMap
+    const labels = s.life && !clean ? this.life.labels(this.origin, this.sim.size, e, this.selectedTown, atlas) : []
+    const stormLabels = clean ? [] : this.powers.labels(toUv, (uv) => this.life.surfaceAt(this.worldAt(uv), e))
+    this.drawLabels(view.viewProj, [...labels, ...stormLabels], atlas)
     if (this.shot) {
       // the canvas still holds this frame until the task ends; the next frame resizes it back
       const { done } = this.shot
@@ -2126,6 +2392,7 @@ export class Engine {
     }
     this.advanceTime(steps * STEP)
     this.driftStorms(steps * STEP)
+    this.powers.update(steps * STEP)
     if (s.life) {
       this.life.update(steps * STEP, this.field, e)
       this.industrialWarming(steps * STEP)
@@ -2272,17 +2539,35 @@ export class Engine {
     if (changed) this.emit()
   }
 
-  /** Continuous warming, in simulated time; stops at the top of the scale. */
+  /** The point of the year (0 = start of spring … 1), from the simulated days gone by. */
+  private get yearPhase() {
+    return (this.simTime / (this.settings.dayLength * 60 * DAYS_PER_YEAR)) % 1
+  }
+
+  /** Degrees of latitude (north) at the centre of the window. */
+  private get latitude() {
+    return latitudeOfWorld(this.worldAt([0.5, 0.5])[1])
+  }
+
+  /** The season in the automatic climate, with the latitude in view and its hours of daylight. */
   private updateSeason() {
     const s = this.settings
     if (!s.autoClimate) {
       if (this.stats.season) this.stats = { ...this.stats, season: null }
       return
     }
-    const { anomaly, season } = seasonOf(this.simTime / (s.dayLength * 60 * DAYS_PER_YEAR))
+    const { anomaly, season } = seasonOf(this.yearPhase)
+    const latitude = this.latitude
+    const hours = dayHours(latitude, declinationAt(this.yearPhase))
     const prev = this.stats.season
-    if (!prev || prev.name !== season || Math.round(prev.anomaly * 10) !== Math.round(anomaly * 10)) {
-      this.stats = { ...this.stats, season: { name: season, anomaly } }
+    if (
+      !prev ||
+      prev.name !== season ||
+      Math.round(prev.anomaly * 10) !== Math.round(anomaly * 10) ||
+      Math.round(prev.latitude) !== Math.round(latitude) ||
+      Math.round(prev.dayHours * 2) !== Math.round(hours * 2)
+    ) {
+      this.stats = { ...this.stats, season: { name: season, anomaly, latitude, dayHours: hours } }
     }
   }
 
@@ -2302,19 +2587,68 @@ export class Engine {
     return { ...this.life.stats(), selected: this.life.reportOf(this.selectedTown) }
   }
 
+  /** CO₂ in the air (ppm): it doubles for every 3 °C the peoples' industry warmed the planet. */
+  private get co2() {
+    return 280 * 2 ** (this.civWarming / 3)
+  }
+
+  /**
+   * Keeps the world's record for the charts (a line per simulated year), each people's
+   * eras and the great moments of the chronicle for the history book.
+   */
+  private keepRecord(life: Stats['life']) {
+    const s = this.settings
+    const year = Math.floor(this.simTime / YEAR)
+    const last = this.record[this.record.length - 1]
+    if (!last || last.year !== year) {
+      // a rewind takes the years after it back
+      const kept = this.record.filter((r) => r.year < year)
+      const sea = s.ocean ? (this.seaLevel - this.tide - climateOf({ temperature: 0, seaLevel: s.seaLevel }).seaLevel) * METERS_PER_HEIGHT : 0
+      this.record = [
+        ...kept,
+        {
+          year,
+          temperature: this.stats.climate?.meanTemp ?? BASE_TEMPERATURE + this.anomaly,
+          co2: this.co2,
+          sea,
+          population: life?.people ?? 0,
+        },
+      ].slice(-RECORD_YEARS)
+    }
+    if (!life) return
+    let eraLog = this.eraLog
+    for (const c of life.civs) {
+      const log = eraLog[c.id] ?? []
+      if (!log.length || log[log.length - 1][1] !== c.eraIndex) eraLog = { ...eraLog, [c.id]: [...log, [life.year, c.eraIndex]] }
+    }
+    this.eraLog = eraLog
+    const fresh = this.life.chronicleEvents.filter((e) => e.major && e.time > this.lastAnnal)
+    if (fresh.length) {
+      this.lastAnnal = Math.max(...fresh.map((e) => e.time))
+      this.annals = [...fresh.reverse(), ...this.annals].slice(0, MAX_ANNALS)
+    }
+  }
+
   private updateStats(now: number) {
     const elapsed = now - this.statStart
     if (elapsed < 500) return
     this.updateSeason()
     const frameMs = elapsed / this.statFrames
+    const life = this.lifeStats()
+    this.keepRecord(life)
     this.stats = {
       ...this.stats,
+      record: this.record,
+      co2: this.co2,
+      eraLog: this.eraLog,
+      annals: this.annals,
       fps: (this.statFrames * 1000) / elapsed,
       frameMs,
       simStepsPerSec: (this.statSteps * 1000) / elapsed,
       resolution: this.sim.size,
       dust: this.dust,
-      life: this.lifeStats(),
+      life,
+      powers: this.powers.report(),
       rewindSeconds: this.rewindReach(),
       tide: this.tide,
       timeline: this.timeline(),

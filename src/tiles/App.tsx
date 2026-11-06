@@ -4,8 +4,11 @@ import { BIOMES } from '../ui/constants'
 import { Icon } from '../ui/icons'
 import { Charts } from './Charts'
 import { ChallengeCard, HelpOverlay, HistoryPanel, Welcome } from './Extras'
-import { seenWelcome } from './goals'
-import { Game, type News, type Tool2d } from './game'
+import { seenTour, seenWelcome } from './goals'
+import { Tour } from './Tour'
+import type { News, Tool2d } from './game'
+import type { GameApi } from './host'
+import { startGame } from './start'
 import { CATEGORICAL, ERA_RAMP, COOLWARM, HPA_MEAN, HPA_PER_UNIT, MM_PER_RAIN, OVERLAYS_2D, PUOR, RAIN_SCALE, VIRIDIS, YLGNBU, cssRamp, formatLat, formatLon, latAt, lonAt, zoneOf, type Overlay2d } from './render'
 import { METERS_PER_HEIGHT, SEASON_SIM } from './world'
 import './tiles.css'
@@ -33,8 +36,8 @@ const seasonName = (season: number, time: number) => {
   return rising ? 'primavera no norte, outono no sul' : 'outono no norte, primavera no sul'
 }
 const pressureLabel = (v: number) => (v < -0.5 ? 'baixa forte' : v < -0.12 ? 'baixa' : v > 0.5 ? 'alta forte' : v > 0.12 ? 'alta' : 'normal')
-const useSettings = (game: Game) => useSyncExternalStore(game.subscribe, game.getSettings)
-const useStats = (game: Game) => useSyncExternalStore(game.subscribe, game.getStats)
+const useSettings = (game: GameApi) => useSyncExternalStore(game.subscribe, game.getSettings)
+const useStats = (game: GameApi) => useSyncExternalStore(game.subscribe, game.getStats)
 
 type Group = 'terra' | 'bencao' | 'praga' | 'povos'
 const GROUP_NAMES: Record<Group, string> = { terra: 'Terra', bencao: 'Bênçãos', praga: 'Pragas', povos: 'Povos' }
@@ -80,15 +83,16 @@ const NO_MODE: Tool2d[] = ['inspect', 'people', 'storm', 'fire', 'volcano', 'met
 const NO_BRUSH: Tool2d[] = ['inspect', 'sun', 'people', 'volcano', 'plates', 'hurricane', ...POWERS]
 
 export default function App() {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [game, setGame] = useState<Game | null>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
+  const [game, setGame] = useState<GameApi | null>(null)
   useEffect(() => {
-    const g = new Game(canvasRef.current!)
-    g.start()
-    setGame(g)
-    // sent here by the 3D page because this browser has no usable WebGPU
-    const reason = new URLSearchParams(window.location.search).get('sem-webgpu')
-    if (reason) {
+    // the game makes its canvases in the stage and runs in a worker where it can (see start.ts)
+    return startGame(stageRef.current!, ({ game: g, thread }) => {
+      setGame(g)
+      Object.assign(window, { craftscape2d: g, craftscape2dThread: thread })
+      // sent here by the 3D page because this browser has no usable WebGPU
+      const reason = new URLSearchParams(window.location.search).get('sem-webgpu')
+      if (!reason) return
       g.notice(
         reason === 'software'
           ? 'Sem GPU de verdade (só WebGPU por software, que travaria o computador): abrimos a versão 2D.'
@@ -96,24 +100,24 @@ export default function App() {
             ? 'A GPU não respondeu: abrimos a versão 2D. Veja chrome://gpu ou reinicie o navegador para tentar o 3D.'
             : 'Este navegador não tem WebGPU: abrimos a versão 2D, que roda em qualquer computador.',
       )
-    }
-    Object.assign(window, { craftscape2d: g })
-    return () => g.dispose()
+    })
   }, [])
   return (
     <div className="app2d">
-      <canvas ref={canvasRef} className="map" />
+      <div ref={stageRef} className="stage" />
       {game && <Interface game={game} />}
     </div>
   )
 }
 
-function Interface({ game }: { game: Game }) {
+function Interface({ game }: { game: GameApi }) {
   const s = useSettings(game)
   const stats = useStats(game)
   const [tab, setTab] = useState<'life' | 'map' | 'world' | 'data' | 'history' | null>('life')
   const [welcome, setWelcome] = useState(() => !seenWelcome())
   const [help, setHelp] = useState(false)
+  // the first steps show once, after the first world is picked (and again from the shortcuts sheet)
+  const [tour, setTour] = useState(() => !seenTour())
   const fileRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -133,7 +137,7 @@ function Interface({ game }: { game: Game }) {
       <header className="topbar glass">
         <strong>Craftscape 2D</strong>
         <span className="muted">
-          ano {year} · {seasonName(game.world.season, game.world.time)}
+          ano {year} · {seasonName(stats.season, stats.simTime)}
           {stats.life && ` · ${stats.life.people} pessoas · ${stats.life.villages} cidades · ${stats.life.civs.length} povos`}
         </span>
         <span className="spacer" />
@@ -171,6 +175,15 @@ function Interface({ game }: { game: Game }) {
             <Icon.map size={16} /> Ilustrado
           </button>
         </div>
+        <button
+          type="button"
+          className={s.globe ? 'active' : ''}
+          aria-pressed={s.globe}
+          onClick={() => game.set({ globe: !s.globe })}
+          data-tip="O planeta como um globo: arraste com o Olhar (ou com o botão direito) para girar, a roda aproxima, e os poderes funcionam nele"
+        >
+          <Icon.orbit size={16} /> Globo
+        </button>
         <button type="button" onClick={() => void game.save()} data-tip="Salvar este mundo num arquivo">
           <Icon.save size={16} />
         </button>
@@ -281,7 +294,16 @@ function Interface({ game }: { game: Game }) {
 
       <ChallengeCard game={game} onChange={() => setWelcome(true)} />
       {welcome && <Welcome game={game} onClose={() => setWelcome(false)} />}
-      {help && <HelpOverlay onClose={() => setHelp(false)} />}
+      {help && (
+        <HelpOverlay
+          onClose={() => setHelp(false)}
+          onTour={() => {
+            setHelp(false)
+            setTour(true)
+          }}
+        />
+      )}
+      {tour && !welcome && !help && <Tour game={game} onClose={() => setTour(false)} />}
       <EventCards game={game} />
       {stats.tile && <TileCard game={game} />}
       {stats.message && (
@@ -296,7 +318,7 @@ function Interface({ game }: { game: Game }) {
   )
 }
 
-function LifePanel({ game }: { game: Game }) {
+function LifePanel({ game }: { game: GameApi }) {
   const s = useSettings(game)
   const stats = useStats(game)
   const life = stats.life
@@ -436,12 +458,13 @@ const RAMPS: Partial<Record<Overlay2d, [string, string, string]>> = {
   rain: [cssRamp(YLGNBU), '0 mm/ano', `${Math.round((2.5 * MM_PER_RAIN) / 50) * 50} mm/ano`],
   humidity: [cssRamp(VIRIDIS), '0 %', '100 %'],
   pressure: [cssRamp(PUOR), `${HPA_MEAN - HPA_PER_UNIT / 2} hPa (baixa)`, `${HPA_MEAN + HPA_PER_UNIT / 2} hPa (alta)`],
+  current: [cssRamp(COOLWARM), 'corrente fria −6 °C', 'corrente quente +6 °C'],
   relief: ['linear-gradient(90deg, rgb(10 30 90), rgb(120 180 220) 25%, rgb(70 130 60) 26%, rgb(150 170 80), rgb(190 160 90), rgb(140 95 60), rgb(160 160 160), rgb(245 245 250))', 'mar fundo', 'pico'],
   rivers: ['linear-gradient(90deg, rgb(158 219 255), rgb(0 46 191))', 'riacho', 'rio grande'],
   change: ['linear-gradient(90deg, rgb(242 107 51), rgb(209 209 209), rgb(64 140 255))', 'desgastado', 'depositado'],
 }
 
-function MapPanel({ game }: { game: Game }) {
+function MapPanel({ game }: { game: GameApi }) {
   const s = useSettings(game)
   const stats = useStats(game)
   const ramp = RAMPS[s.overlay]
@@ -484,6 +507,13 @@ function MapPanel({ game }: { game: Game }) {
             </li>
           ))}
         </ul>
+      )}
+      {s.overlay === 'current' && (
+        <p className="hint">
+          Cada oceano gira com os ventos: nos subtrópicos uma corrente quente sobe pela costa leste dos continentes e uma fria
+          desce pela costa oeste (onde ficam os desertos de neblina); perto dos polos é o contrário. O mar quente dá mais vapor
+          ao ar, o frio menos, e a chuva das costas acompanha. Liga e desliga na aba Mundo.
+        </p>
       )}
       {s.overlay === 'plates' && (
         <ul className="legend single">
@@ -587,7 +617,7 @@ function MapPanel({ game }: { game: Game }) {
 }
 
 /** The world's record over the years, as charts. */
-function DataPanel({ game }: { game: Game }) {
+function DataPanel({ game }: { game: GameApi }) {
   const stats = useStats(game)
   return (
     <div className="panel-body">
@@ -602,7 +632,7 @@ function DataPanel({ game }: { game: Game }) {
 }
 
 /** How much the peoples have changed the land, and the warming they caused. */
-function HumanSummary({ game }: { game: Game }) {
+function HumanSummary({ game }: { game: GameApi }) {
   const stats = useStats(game)
   const h = stats.human
   const pct = (v: number) => `${Math.round(v * 100)}%`
@@ -615,7 +645,7 @@ function HumanSummary({ game }: { game: Game }) {
   )
 }
 
-function WorldPanel({ game }: { game: Game }) {
+function WorldPanel({ game }: { game: GameApi }) {
   const s = useSettings(game)
   const stats = useStats(game)
   const w = s.world
@@ -672,6 +702,10 @@ function WorldPanel({ game }: { game: Game }) {
         <input type="checkbox" checked={w.seaRise} onChange={(e) => game.set({ world: { ...w, seaRise: e.target.checked } })} /> O mar sobe com o aquecimento
       </label>
       <p className="hint">Com o mar ligado, cada grau de aquecimento (temperatura base, Sol e indústria dos povos) sobe o mar e alaga as costas baixas; o frio o faz recuar.</p>
+      <label className="toggle">
+        <input type="checkbox" checked={w.currents} onChange={(e) => game.set({ world: { ...w, currents: e.target.checked } })} /> Correntes marinhas
+      </label>
+      <p className="hint">Correntes quentes e frias ao longo das costas mudam a temperatura do mar e a chuva em terra. Veja no mapa Correntes.</p>
       <h2>Placas tectônicas</h2>
       <Slider label="Velocidade das placas" value={w.plateDrift} min={0} max={5} step={0.25} unit="×" onChange={(plateDrift) => game.set({ world: { ...w, plateDrift } })} />
       <label className="toggle">
@@ -726,7 +760,7 @@ function Bar({ value, label }: { value: number; label?: string }) {
   )
 }
 
-function TileCard({ game }: { game: Game }) {
+function TileCard({ game }: { game: GameApi }) {
   const stats = useStats(game)
   const t = stats.tile
   if (!t) return null
@@ -734,7 +768,7 @@ function TileCard({ game }: { game: Game }) {
     <div className="tile-card glass">
       <strong>{t.biome}</strong>
       <span className="muted">
-         {formatLat(latAt(t.y + 0.5, game.world.n), 1)} {formatLon(lonAt(t.x + 0.5, game.world.n), 1)} ({zoneOf(latAt(t.y + 0.5, game.world.n))}) · {t.airTemperature.toFixed(0)} °C agora (média do dia {t.temperature.toFixed(0)} °C) · umidade {Math.round(Math.min(t.humidity, 1) * 100)} % ·{' '}
+         {formatLat(latAt(t.y + 0.5, stats.n), 1)} {formatLon(lonAt(t.x + 0.5, stats.n), 1)} ({zoneOf(latAt(t.y + 0.5, stats.n))}) · {t.airTemperature.toFixed(0)} °C agora (média do dia {t.temperature.toFixed(0)} °C) · umidade {Math.round(Math.min(t.humidity, 1) * 100)} % ·{' '}
         {Math.round((t.rain * RAIN_SCALE * MM_PER_RAIN) / 10) * 10} mm/ano · {meters(t.height - stats.sea)}
         {t.water > 0.002 && t.height >= stats.sea ? ` · lago de ${Math.round(t.water * METERS_PER_HEIGHT)} m` : t.river > 0 ? ' · rio' : ''}
         {t.vegetation > 0.05 && ` · vegetação ${Math.round(t.vegetation * 100)}%`}
@@ -764,7 +798,7 @@ const MAX_CARDS = 4
  * what the world does by itself (storms, fires, volcanoes, highs and lows), each with a
  * button that flies the view to where it happened. Shown with the peoples on or off.
  */
-function EventCards({ game }: { game: Game }) {
+function EventCards({ game }: { game: GameApi }) {
   const stats = useStats(game)
   const s = useSettings(game)
   const [cards, setCards] = useState<{ news: News; born: number }[]>([])

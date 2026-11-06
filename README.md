@@ -25,6 +25,7 @@ npm install
 npm run dev      # http://localhost:5173 (3D) and http://localhost:5173/2d.html (2D)
 npm run build    # builds dist/ (a static site, both pages)
 npm run lint
+npm test         # runs the simulations headless (the 2D world, the peoples, the 3D powers)
 ```
 
 The 3D version needs a browser with WebGPU. On **Chrome for Linux** it is off by default:
@@ -48,7 +49,9 @@ whatever else is in the target.
 
 The code is in `src/tiles/`. The map is the **whole planet** in an equirectangular projection:
 the north pole along the top, the equator across the middle, the south pole along the bottom,
-360° of longitude from edge to edge. Sizes go from 128² to 384² tiles; above 256² it gets heavy.
+360° of longitude from edge to edge. East to west it is round: the land, the wind, the
+plates, the storms and the peoples cross the map's edge, and the map repeats sideways as you
+drag it. Sizes go from 128² to 384² tiles; above 256² it gets heavy.
 
 **Climate.** Temperature comes from latitude (about 27 °C at the equator and −23 °C at the
 poles) and altitude (−6.5 °C per km). Heat from lava, fire and towns, the seasons and the
@@ -102,8 +105,14 @@ away, everything cools again with new continents and life starts over.
   a data tab (temperature, CO₂, sea level, population) and notifications of everything that
   happens.
 - **View:** Satellite (true colours, towns as lights at night, a latitude/longitude grid) or
-  Illustrated (trees, mountains, houses).
-- **Maps:** biomes, temperature, rain, humidity, pressure, relief, rivers, terrain change,
+  Illustrated (trees, mountains, houses); and **Globe**, the same map wrapped on a sphere
+  (plain WebGL): drag to turn it, the wheel zooms, and every power works on it.
+- **First steps:** a short guided card for who has just arrived (again from the shortcuts sheet).
+- **Ocean currents:** every ocean turns with the wind belts, so a warm current runs up the
+  east coast of a continent and a cold one down its west coast (the other way round near the
+  poles); the warmer sea gives the air more vapour, the colder one less, and the rain on the
+  coasts follows.
+- **Maps:** biomes, temperature, rain, humidity, pressure, ocean currents, relief, rivers, terrain change,
   plates, human impact, peoples, eras, religion, languages, plague, famine and wars, with
   scientific colour maps (coolwarm, YlGnBu, viridis, PuOr) and real units (°C, mm/year, hPa,
   m, km).
@@ -144,10 +153,19 @@ way of the game, it gives way, and the trade-offs are noted in the code:
   measuring forest, bare land, snow and temperature by latitude. The resulting planet has a
   mean of ~14 °C and ~20–30% bare land.
 - **The map is square.** The projection is squashed: each tile covers twice as many degrees
-  east–west as north–south. The world does not wrap at the edges, so continents stop before
-  them.
-- **The 3D version is something else.** The peoples are the same code in both versions, but
-  the 2D one has physics of its own (CPU, tiles) and does not try to reproduce the 3D one.
+  east–west as north–south. The world goes round east to west, but not over the poles: the
+  top and the bottom of the map are open sea, and the tiles there stand for far less ground
+  than they are drawn with (on the globe they pinch together).
+- **The currents are read off the map, not simulated.** They come from the shape of the seas
+  and the latitude, worked out again as the coasts move; the water itself does not flow.
+- **It runs in a worker where it can.** The whole game (the simulation and the drawing, on an
+  OffscreenCanvas) runs off the page's thread, so the interface stays smooth; a browser
+  without OffscreenCanvas, or `?sem-worker` in the address, runs it on the page as before.
+  Either way the simulation takes at most 40 ms of a frame: a big map at 8× goes a little
+  slower than asked instead of freezing the picture.
+- **The 3D version is something else.** The peoples are the same code in both versions, and
+  the 3D one has the same god powers, maps and goals (see below), but the 2D one has physics
+  of its own (CPU, tiles) and does not try to reproduce the 3D one.
 
 ## Craftscape 3D
 
@@ -161,6 +179,7 @@ way of the game, it gives way, and the trade-offs are noted in the code:
 | Zoom | mouse wheel | pinch |
 | Brush size | Shift + wheel, **[** and **]** | slider |
 | Tool | **1** rock, **2** soil, **3** sand, **4** water | panel |
+| Powers | **V** fire, **Y** hurricane, **G** earthquake, **L** people; the others on the bar | bar |
 | Undo | **Ctrl + Z** | Desfazer button |
 | Pause · orbit/fly camera | **P** · **C** | panel |
 
@@ -182,6 +201,25 @@ way of the game, it gives way, and the trade-offs are noted in the code:
   already visited.
 - **Peoples and plates**: civilizations (`life.ts`) and tectonic plates (`plates.ts`),
   challenges and ready-made scenarios.
+- **The 2D game's god powers** (`powers.ts`): a forest brush; fire that runs with the wind
+  and the rain puts out; hurricanes born over warm sea, with a name and a category; the
+  earthquake power (the brush gives the magnitude, with aftershocks, a tsunami under the sea,
+  a rift from 8.5 and a cataclysm after three of 9 or more in a row); nuclear war (crater,
+  burnt land, fallout, soot that cools the planet); a new people where you click; and the
+  six powers over a town: blessing, inspiration, plague, prophet, discord and peace.
+- **More to read the world by**: maps of relief, human impact, eras, faiths, tongues, plague,
+  hunger and war; a Data tab (temperature, CO₂, sea level, population); a history book (each
+  people's life and eras, and the great moments); sounds; planes and steam and cargo ships
+  once the peoples get there.
+- **More to play for**: the Pangaea and Young Earth scenarios, seven goals about the peoples
+  (from stone to the plane, world peace, overseas colonies and more) and trophies for the
+  goals completed.
+- **The sun by latitude and season** (automatic climate): long high days in summer, short low
+  ones in winter, the midnight sun and the polar night far north.
+- **Continental drift (experimental, off by default)**: the plates carry the land with them a
+  cell at a time, with its rivers, forests and towns; rifts sink and bleed lava behind a plate
+  that moves away. Only the simulated window moves: the horizon and the regions already
+  visited stay where they were.
 - **Save/load** the terrain (`.craftscape`, gzip), **import a heightmap** (PNG/JPG) and
   **undo**.
 - **Performance**: a chunked mesh with distance LOD, frustum culling and seams between levels;
@@ -199,6 +237,8 @@ src/engine/
   renderer.ts     terrain, water and sky; chunked LOD
   life.ts         peoples and civilizations (used by both 3D and 2D)
   plates.ts       the 3D tectonic plates
+  powers.ts       the 3D god powers: fire, hurricanes, earthquakes, nuclear blasts, cataclysm
+  palettes.ts     colours of the peoples' maps (used by both 3D and 2D)
   camera.ts, input.ts, io.ts, settings.ts, ...
   shaders/sim.ts     simulation WGSL (water, erosion, sand, vegetation, climate, shadows, picking)
   shaders/render.ts  rendering WGSL
@@ -206,12 +246,16 @@ src/ui/           3D interface in React (fallback.ts: the switch to 2D)
 src/tiles/        Craftscape 2D
   world.ts        the simulation: climate, seasons, pressure, water, rivers, vegetation, disasters
   tectonics.ts    drifting plates, collisions, rifts, cracks
-  game.ts         loop, input, powers, undo/rewind, challenges
+  game.ts         loop, powers, undo/rewind, challenges (it touches nothing of the page: see host.ts)
+  host.ts, dom.ts, start.ts, worker.ts   the game on the page or in a worker, and the page's side of it
   render.ts       2D canvas: satellite/illustrated views, maps, the Earth's shadow, effects
+  globe.ts        the map wrapped on a sphere (WebGL)
+  wrap.ts         the sums of a world that is round east to west
   goals.ts        scenarios and challenges
   save.ts         saved worlds (gzipped JSON)
   sound.ts        sounds made with Web Audio
-  App.tsx, Extras.tsx, Charts.tsx   interface
+  App.tsx, Extras.tsx, Charts.tsx, Tour.tsx   interface
+tests/            headless tests (vitest): the 2D world, the wrap, the currents, the peoples, the globe, the 3D powers
 ```
 
 In the 3D version the simulation state is `N×N` buffers of `vec4f`:

@@ -17,6 +17,17 @@
   touch-action: none;
 }
 
+/* the game's canvases live here (the game makes them: see start.ts) */
+.app2d .stage {
+  position: absolute;
+  inset: 0;
+}
+
+/* the globe is drawn over the map and lets the pointer through to it */
+.app2d .map.globe {
+  pointer-events: none;
+}
+
 .app2d .glass {
   background: var(--glass);
   border: 1px solid var(--glass-border);
@@ -821,6 +832,87 @@
 }
 
 /* ---- the goal being played for ---- */
+
+/* ---- the first steps: a guided card at the bottom of the map ---- */
+
+.app2d .tour {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 30;
+  width: min(460px, calc(100% - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  font-size: 0.85rem;
+}
+
+.app2d .tour header,
+.app2d .tour footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.app2d .tour .eyebrow {
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.app2d .tour strong {
+  font-size: 1rem;
+}
+
+.app2d .tour p {
+  margin: 0;
+  color: var(--text-soft);
+  line-height: 1.4;
+}
+
+.app2d .tour .skip {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.app2d .tour .dots {
+  display: flex;
+  gap: 5px;
+}
+
+.app2d .tour .dots span {
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--control);
+}
+
+.app2d .tour .dots span.done {
+  background: var(--accent-soft);
+}
+
+.app2d .tour .dots span.on {
+  background: var(--accent);
+}
+
+.app2d .tour footer button {
+  padding: 5px 12px;
+  border-radius: 9px;
+}
+
+.app2d .tour footer button.primary {
+  background: var(--accent);
+  border-color: var(--accent-border);
+  color: #fff;
+}
 
 .app2d .challenge-card {
   position: absolute;

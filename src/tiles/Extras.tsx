@@ -4,17 +4,17 @@
 import { useMemo, useState, useSyncExternalStore } from 'react'
 import { CIV_COLORS, ERAS } from '../engine/life'
 import { Icon } from '../ui/icons'
-import type { Game } from './game'
+import type { GameApi } from './host'
 import { ERA_RAMP } from './render'
 import { CHALLENGES, SCENARIOS, challengeById, rememberWelcome } from './goals'
 import { DEFAULT_WORLD } from './world'
 
 const civCss = (k: number) => `rgb(${CIV_COLORS[k].map((v) => Math.round(v * 255)).join(', ')})`
-const useStats = (game: Game) => useSyncExternalStore(game.subscribe, game.getStats)
-const useSettings = (game: Game) => useSyncExternalStore(game.subscribe, game.getSettings)
+const useStats = (game: GameApi) => useSyncExternalStore(game.subscribe, game.getStats)
+const useSettings = (game: GameApi) => useSyncExternalStore(game.subscribe, game.getSettings)
 
 /** Pick a world to start from and a goal to play for. */
-export function Welcome({ game, onClose }: { game: Game; onClose: () => void }) {
+export function Welcome({ game, onClose }: { game: GameApi; onClose: () => void }) {
   const stats = useStats(game)
   const [scenario, setScenario] = useState(SCENARIOS[0].id)
   const picked = SCENARIOS.find((s) => s.id === scenario)!
@@ -84,7 +84,7 @@ export function Welcome({ game, onClose }: { game: Game; onClose: () => void }) 
 }
 
 /** The goal being played for: its progress, the hint, and a way to change it. */
-export function ChallengeCard({ game, onChange }: { game: Game; onChange: () => void }) {
+export function ChallengeCard({ game, onChange }: { game: GameApi; onChange: () => void }) {
   const stats = useStats(game)
   const st = stats.challenge
   const c = challengeById(st?.id ?? null)
@@ -113,7 +113,7 @@ export function ChallengeCard({ game, onChange }: { game: Game; onChange: () => 
  * The history book: every people's life as a lane across the years (its population drawn
  * as the lane's thickness), and the big moments, newest first, each with a way to see where.
  */
-export function HistoryPanel({ game }: { game: Game }) {
+export function HistoryPanel({ game }: { game: GameApi }) {
   const stats = useStats(game)
   const s = useSettings(game)
   const life = stats.life
@@ -235,7 +235,7 @@ const KEYS: [string, string][] = [
   ['?', 'esta ajuda'],
 ]
 
-export function HelpOverlay({ onClose }: { onClose: () => void }) {
+export function HelpOverlay({ onClose, onTour }: { onClose: () => void; onTour: () => void }) {
   return (
     <div className="welcome-backdrop" role="dialog" aria-modal="true" aria-label="Atalhos" onClick={onClose}>
       <div className="help glass" onClick={(e) => e.stopPropagation()}>
@@ -255,6 +255,9 @@ export function HelpOverlay({ onClose }: { onClose: () => void }) {
           Baseado no <a href="https://github.com/pyalot/craftscape" target="_blank" rel="noreferrer">Craftscape original</a> de Florian Boesch.{' '}
           <a href="https://github.com/danillog/craftscape" target="_blank" rel="noreferrer">Código-fonte (AGPL)</a>.
         </p>
+        <button type="button" onClick={onTour}>
+          Rever os primeiros passos
+        </button>
         <button type="button" className="primary" onClick={onClose}>
           Fechar
         </button>

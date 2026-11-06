@@ -27,7 +27,7 @@ import { loadTexture } from './textures'
 
 const CHUNK_CELLS = 64
 /** Marker kinds in the order the life shader numbers them. */
-const LIFE_KINDS: LifeMarker['kind'][] = ['herd', 'village', 'battle', 'ruin', 'boat', 'party', 'dam']
+const LIFE_KINDS: LifeMarker['kind'][] = ['herd', 'village', 'battle', 'ruin', 'boat', 'party', 'dam', 'plane', 'fire', 'blast', 'cyclone']
 const LOD_LEVELS = 4 // vertex strides 1, 2, 4, 8
 const OVERLAYS: Overlay[] = [
   'none',
@@ -43,6 +43,7 @@ const OVERLAYS: Overlay[] = [
   'airmass',
   'civilization',
   'current',
+  'relief',
 ]
 
 export interface View {

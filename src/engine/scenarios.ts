@@ -1,6 +1,7 @@
 import type { Settings, TerrainShape } from './settings'
 
-export type ScenarioId = 'classic' | 'archipelago' | 'glacial' | 'desert' | 'rivers' | 'rainforest' | 'warming' | 'living'
+export type ScenarioId =
+  | 'classic' | 'archipelago' | 'glacial' | 'desert' | 'rivers' | 'rainforest' | 'warming' | 'living' | 'pangaea' | 'young'
 
 export interface Scenario {
   id: ScenarioId
@@ -94,6 +95,27 @@ export const SCENARIOS: Scenario[] = [
     colors: ['#7bd88f', '#25407a'],
     shape: { continents: 0.08, continentScale: 0.55, offset: -0.015, relief: 1 },
     settings: { autoClimate: true, infiniteWorld: true, ocean: true, seaLevel: 0 },
+  },
+  {
+    id: 'pangaea',
+    name: 'Pangeia',
+    tagline: 'Um supercontinente só',
+    description:
+      'Uma única massa de terra cercada de mar, numa área grande. Os povos disputam o mesmo chão e as placas trabalham por baixo.',
+    colors: ['#c9a66b', '#1f4f6b'],
+    shape: { continents: 0.14, continentScale: 0.3, offset: 0.005, relief: 1 },
+    settings: { ocean: true, seaLevel: 0, area: 2, plateDrift: 2, windHumidity: 0.8 },
+  },
+  {
+    id: 'young',
+    name: 'Terra jovem',
+    tagline: 'Um mundo que não para quieto',
+    description:
+      'Placas rápidas, tempo geológico acelerado, terremotos a toda hora e vulcões já acesos: montanhas nascem enquanto você olha.',
+    colors: ['#d9532b', '#3b2a2a'],
+    shape: { continents: 0.04, continentScale: 0.55, offset: 0, relief: 1.25 },
+    settings: { plateDrift: 3, geologicTime: 10, earthquakes: true, volcanoes: true, temperature: 2 },
+    vents: 4,
   },
 ]
 

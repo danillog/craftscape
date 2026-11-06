@@ -1,5 +1,6 @@
 import type { ChallengeState } from './challenges'
-import type { LifeStats, TownReport } from './life'
+import type { LifeEvent, LifeStats, TownReport } from './life'
+import type { PowersReport } from './powers'
 import type { BoundaryKind } from './plates'
 import type { ScenarioId } from './scenarios'
 
@@ -19,6 +20,11 @@ export interface TerrainShape {
 export type Tool =
   | 'inspect' | 'rock' | 'soil' | 'sand' | 'water' | 'level' | 'heat' | 'humidity' | 'volcano' | 'pressure' | 'airmass'
   | 'plates' | 'current' | 'storm' | 'meteor' | 'sun' | 'drought'
+  | 'forest' | 'fire' | 'hurricane' | 'quake' | 'nuke'
+  | 'people' | 'bless' | 'inspire' | 'plague' | 'prophet' | 'discord' | 'peace'
+/** The powers over the peoples: a click on a town (see Life.godPower). */
+export const PEOPLE_POWERS = ['bless', 'inspire', 'plague', 'prophet', 'discord', 'peace'] as const
+export type PeoplePower = (typeof PEOPLE_POWERS)[number]
 export type BrushMode = 'add' | 'remove'
 export type CameraMode = 'orbit' | 'fly'
 export type ResolutionSetting = 'auto' | 256 | 512 | 1024 | 2048
@@ -41,6 +47,16 @@ export type Overlay =
   | 'airmass'
   | 'civilization'
   | 'current'
+  | 'relief'
+  | 'human'
+  | 'eras'
+  | 'faith'
+  | 'language'
+  | 'plague'
+  | 'famine'
+  | 'war'
+/** The maps of the peoples: their lands painted by people, era, faith, tongue, plague, hunger and war. */
+export const PEOPLE_MAPS: Overlay[] = ['civilization', 'eras', 'faith', 'language', 'plague', 'famine', 'war']
 
 export interface Settings {
   tool: Tool
@@ -142,6 +158,10 @@ export interface Settings {
   cinematic: boolean
   /** Cinematic orbit speed, in degrees per second. */
   cinematicSpeed: number
+  /** Sounds for what happens in the world (quakes, eruptions, storms, bombs). */
+  sound: boolean
+  /** Experimental: the plates carry the land with them as they drift (continental drift). */
+  continentalDrift: boolean
 }
 
 export const defaultSettings: Settings = {
@@ -198,6 +218,8 @@ export const defaultSettings: Settings = {
   photoMode: false,
   cinematic: false,
   cinematicSpeed: 4,
+  sound: true,
+  continentalDrift: false,
 }
 
 export interface QualityProfile {
@@ -324,6 +346,11 @@ export const BRUSH_MIN = 0.01
 export const BRUSH_MAX = 0.15
 /** The biggest brush grows with the simulated area, so it covers the same share of the map. */
 export const brushMax = (area: number) => BRUSH_MAX * Math.max(area, 1)
+/** The earthquake power: the brush size gives the magnitude, 5 for the smallest brush to 9.5 for the biggest. */
+export function quakeMagnitude(brushSize: number, area: number) {
+  const t = (Math.log(brushSize) - Math.log(BRUSH_MIN)) / (Math.log(brushMax(area)) - Math.log(BRUSH_MIN))
+  return 5 + 4.5 * Math.max(0, Math.min(1, t))
+}
 
 /** What the climate analysis found in the simulated window (see Engine.analyzeClimate). */
 export interface ClimateReport {
@@ -360,6 +387,16 @@ export function seasonOf(yearPhase: number) {
   return { anomaly: 5 * Math.sin(phase * 2 * Math.PI), season: SEASONS[Math.floor(phase * 4)] }
 }
 
+/** The world at the end of a year, for the charts. */
+export interface YearRecord {
+  year: number
+  /** Mean temperature (°C), CO₂ (ppm), the sea over where it began (m), people. */
+  temperature: number
+  co2: number
+  sea: number
+  population: number
+}
+
 export interface Stats {
   fps: number
   frameMs: number
@@ -373,8 +410,8 @@ export interface Stats {
   region: [number, number]
   storedRegions: number
   climate: ClimateReport | null
-  /** Automatic climate: the season and its temperature anomaly. */
-  season: { name: string; anomaly: number } | null
+  /** Automatic climate: the season, its temperature anomaly, the latitude in view (degrees north) and its hours of daylight. */
+  season: { name: string; anomaly: number; latitude: number; dayHours: number } | null
   /** Dust from meteor strikes still in the air, in °C of cooling. */
   dust: number
   /** Warming from the peoples' industry, in °C. */
@@ -385,8 +422,20 @@ export interface Stats {
   droughts: number
   /** The challenge being played, if any. */
   challenge: ChallengeState | null
+  /** The challenges ever completed in this browser. */
+  trophies: string[]
+  /** The world year by year, for the charts (the Data tab). */
+  record: YearRecord[]
+  /** CO₂ in the air right now (ppm): 280 before the peoples' industry. */
+  co2: number
+  /** Each people's eras: (year it began, index into ERAS), for the history book. */
+  eraLog: Record<number, [number, number][]>
+  /** The great moments of the chronicle, newest first, for the history book. */
+  annals: LifeEvent[]
   /** Herds, villages and people alive (null with the life off). */
   life: LifeStats | null
+  /** Fires burning, hurricanes alive, radioactive places and a cataclysm under way. */
+  powers: PowersReport
   /** How far back the rewind reaches, in simulated seconds. */
   rewindSeconds: number
   /** The volcanoes born on the plate boundaries, erupting or dormant. */
@@ -423,7 +472,13 @@ export const emptyStats: Stats = {
   godWarming: 0,
   droughts: 0,
   challenge: null,
+  trophies: [],
+  record: [],
+  co2: 280,
+  eraLog: {},
+  annals: [],
   life: null,
+  powers: { fires: 0, hurricanes: [], fallout: 0, cataclysm: 0 },
   rewindSeconds: 0,
   volcanoes: [],
   tide: 0,

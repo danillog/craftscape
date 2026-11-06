@@ -1,5 +1,5 @@
 import type { Engine } from '../engine/engine'
-import { BRUSH_MIN, brushMax, type Tool } from '../engine/settings'
+import { BRUSH_MIN, brushMax, quakeMagnitude, type Tool } from '../engine/settings'
 import { FIXED_AIR_LABELS, MODE_LABELS } from './constants'
 import { Icon, TOOL_ICONS } from './icons'
 import { useSettings, useStats } from './useEngine'
@@ -54,8 +54,9 @@ function TimeStrip({ engine }: { engine: Engine }) {
 }
 
 /** The powers, in their groups: shaping the land, blessings, plagues, and the advanced (climate machinery) ones. */
-type Group = 'terra' | 'bencao' | 'praga' | 'avancado'
-const GROUP_NAMES: Record<Group, string> = { terra: 'Terra', bencao: 'Bênçãos', praga: 'Pragas', avancado: 'Avançado' }
+type Group = 'terra' | 'bencao' | 'praga' | 'povos' | 'avancado'
+const GROUP_NAMES: Record<Group, string> = { terra: 'Terra', bencao: 'Bênçãos', praga: 'Pragas', povos: 'Povos', avancado: 'Avançado' }
+/** key: the shortcut, or '' for a power that is only picked on the bar. */
 const TOOLS: { id: Tool; label: string; key: string; hint: string; group: Group }[] = [
   { id: 'inspect', label: 'Inspecionar', key: '0', hint: 'O cursor mostra o que há em cada lugar (Esc volta para cá)', group: 'terra' },
   { id: 'rock', label: 'Rocha', key: '1', hint: 'Levanta ou cava montanhas', group: 'terra' },
@@ -63,6 +64,7 @@ const TOOLS: { id: Tool; label: string; key: string; hint: string; group: Group 
   { id: 'sand', label: 'Areia', key: '3', hint: 'Desliza em encostas e anda com o vento', group: 'terra' },
   { id: 'water', label: 'Água', key: '4', hint: 'Cria lagos e rios', group: 'terra' },
   { id: 'level', label: 'Nivelar', key: '5', hint: 'Aplaina na altura onde a pincelada começou', group: 'terra' },
+  { id: 'forest', label: 'Floresta', key: '', hint: 'Segure: planta mato e floresta onde há solo (−: desmata)', group: 'terra' },
   { id: 'humidity', label: 'Chuva', key: '7', hint: 'Ar úmido: nuvens e chuva onde você pintar (−: seca o ar)', group: 'bencao' },
   { id: 'heat', label: 'Calor', key: '6', hint: 'Esquenta a região (−: esfria)', group: 'bencao' },
   { id: 'sun', label: 'Sol', key: 'J', hint: 'Clique: o planeta inteiro esquenta 1 °C (−: esfria 1 °C). Vale em qualquer clima', group: 'bencao' },
@@ -70,13 +72,24 @@ const TOOLS: { id: Tool; label: string; key: string; hint: string; group: Group 
   { id: 'storm', label: 'Tempestade', key: 'T', hint: 'Clique: nasce um ciclone que o vento leva, com chuva e vento forte (o tamanho do pincel dá o tamanho dele)', group: 'praga' },
   { id: 'volcano', label: 'Vulcão', key: '8', hint: 'Abre uma cratera que entra em erupção', group: 'praga' },
   { id: 'meteor', label: 'Meteoro', key: 'I', hint: 'Clique: cratera, lava, terremoto e poeira que esfria o planeta (o tamanho do pincel dá o tamanho da cratera)', group: 'praga' },
+  { id: 'fire', label: 'Fogo', key: 'V', hint: 'Clique ou arraste: acende o mato; o fogo corre com o vento e a chuva apaga (−: apaga o fogo)', group: 'praga' },
+  { id: 'hurricane', label: 'Furacão', key: 'Y', hint: 'Clique no mar: nasce um furacão com nome. Cresce sobre mar quente até a categoria 5, anda com o vento e morre em terra ou em mar frio', group: 'praga' },
+  { id: 'quake', label: 'Terremoto', key: 'G', hint: 'Clique: um terremoto e suas réplicas. O pincel dá a magnitude (5 a 9,5). De 8,5 para cima a terra racha; no mar, tsunami. Três de 9 ou mais em seguida: cataclismo', group: 'praga' },
+  { id: 'nuke', label: 'Guerra nuclear', key: '', hint: 'Clique numa cidade: o povo dela lança ogivas contra o inimigo (os deuses dão a bomba a quem não a tem). Fora das cidades: uma bomba cai ali. Terra queimada, radiação por anos e céu escuro', group: 'praga' },
+  { id: 'people', label: 'Povo', key: 'L', hint: 'Clique em terra boa: um povo novo nasce aqui', group: 'povos' },
+  { id: 'bless', label: 'Bênção', key: '', hint: 'Clique numa cidade: celeiros cheios, gente saudável, a cidade cresce', group: 'povos' },
+  { id: 'inspire', label: 'Inspiração', key: '', hint: 'Clique numa cidade: uma ideia brilhante, o povo avança no saber (rumo à próxima era)', group: 'povos' },
+  { id: 'plague', label: 'Peste', key: '', hint: 'Clique numa cidade: uma peste irrompe e se espalha', group: 'povos' },
+  { id: 'prophet', label: 'Profeta', key: '', hint: 'Clique numa cidade: um profeta converte o povo a outra fé', group: 'povos' },
+  { id: 'discord', label: 'Discórdia', key: '', hint: 'Clique numa cidade: o povo entra em guerra com o vizinho mais próximo', group: 'povos' },
+  { id: 'peace', label: 'Paz', key: '', hint: 'Clique numa cidade: todas as guerras desse povo terminam numa trégua', group: 'povos' },
   { id: 'pressure', label: 'Pressão', key: '9', hint: 'Altas (tempo firme) ou baixas (nuvens e chuva) que o tempo dissolve', group: 'avancado' },
   { id: 'airmass', label: 'Massa de ar', key: 'M', hint: 'Ar quente ou frio que o vento leva embora, formando frentes', group: 'avancado' },
   { id: 'current', label: 'Corrente', key: 'O', hint: 'Corrente marinha quente ou fria: pinte no mar e o ar que passa por cima muda', group: 'avancado' },
   { id: 'plates', label: 'Placas', key: 'U', hint: 'Arraste sobre uma placa para mudar a direção em que ela se move', group: 'avancado' },
 ]
-const GROUPS: Group[] = ['terra', 'bencao', 'praga', 'avancado']
-const ONE_SHOT: Tool[] = ['storm', 'meteor']
+const GROUPS: Group[] = ['terra', 'bencao', 'praga', 'povos', 'avancado']
+const ONE_SHOT: Tool[] = ['storm', 'meteor', 'hurricane', 'quake', 'nuke', 'people', 'bless', 'inspire', 'plague', 'prophet', 'discord', 'peace']
 
 const SPEEDS = [0.5, 1, 2, 4]
 
@@ -98,11 +111,14 @@ export function Toolbar({ engine }: { engine: Engine }) {
     rewindTimer.current = window.setInterval(() => engine.rewind(), 350)
   }
   useEffect(() => stopRewind, []) // eslint-disable-line react-hooks/exhaustive-deps
-  const tools = TOOLS.filter((t) => !(s.autoClimate && (t.id === 'heat' || t.id === 'humidity')))
+  const tools = TOOLS.filter((t) => !(s.autoClimate && (t.id === 'heat' || t.id === 'humidity')) && !(t.group === 'povos' && !s.life))
   const current = TOOLS.find((t) => t.id === s.tool)!
   // the advanced powers stay folded until asked for (or while one of them is in hand)
   const [advanced, setAdvanced] = useState(false)
   const showAdvanced = advanced || current.group === 'avancado'
+  // so do the powers over the peoples
+  const [peoples, setPeoples] = useState(false)
+  const showPeoples = s.life && (peoples || current.group === 'povos')
   const [addLabel, removeLabel] =
     s.tool === 'airmass' && s.airMassFixed ? FIXED_AIR_LABELS : (MODE_LABELS[s.tool] ?? ['Adicionar', 'Remover'])
   // the size slider is logarithmic: the biggest brush on a 4× map is 60× the smallest
@@ -115,6 +131,7 @@ export function Toolbar({ engine }: { engine: Engine }) {
     <div className="toolbar glass" role="toolbar" aria-label="Ferramentas">
       {GROUPS.map((group) => {
         if (group === 'avancado' && !showAdvanced) return null
+        if (group === 'povos' && !showPeoples) return null
         const members = tools.filter((t) => t.group === group)
         if (!members.length) return null
         return (
@@ -133,13 +150,24 @@ export function Toolbar({ engine }: { engine: Engine }) {
                   data-tip={`${t.label} · ${t.hint}`}
                 >
                   <ToolIcon size={22} />
-                  <kbd>{t.key}</kbd>
+                  {t.key && <kbd>{t.key}</kbd>}
                 </button>
               )
             })}
           </div>
         )
       })}
+      {s.life && (
+        <button
+          type="button"
+          className={`more ${showPeoples ? 'active' : ''}`}
+          onClick={() => setPeoples(!showPeoples)}
+          data-tip={showPeoples ? 'Esconde os poderes sobre os povos' : 'Poderes sobre os povos: novo povo, bênção, inspiração, peste, profeta, discórdia, paz'}
+          aria-pressed={showPeoples}
+        >
+          {showPeoples ? '‹' : <Icon.life size={16} />}
+        </button>
+      )}
       <button
         type="button"
         className={`more ${showAdvanced ? 'active' : ''}`}
@@ -189,13 +217,22 @@ export function Toolbar({ engine }: { engine: Engine }) {
           </p>
         ) : s.tool === 'plates' ? (
           <p className="tool-hint">Arraste de uma placa para onde ela deve ir. Quanto mais longe, mais rápido.</p>
+        ) : current.group === 'povos' && s.tool !== 'people' ? (
+          <p className="tool-hint">Clique numa cidade. O poder vale para a cidade ou para o povo dela.</p>
+        ) : s.tool === 'people' ? (
+          <p className="tool-hint">Clique em terra firme, com mato e longe de outras cidades.</p>
+        ) : s.tool === 'nuke' ? (
+          <p className="tool-hint">Clique numa cidade (o povo dela ataca) ou em qualquer lugar (uma bomba cai ali).</p>
         ) : (
           <div className="brush-controls">
             <div className="brush-preview" aria-hidden="true">
               <span style={{ width: brushPx, height: brushPx, opacity: 0.35 + 0.15 * s.brushStrength }} />
             </div>
-            <label className="mini-slider" data-tip="Tamanho do pincel ( [ ] ou Shift + roda )">
-              <span>Tamanho</span>
+            <label
+              className="mini-slider"
+              data-tip={s.tool === 'quake' ? 'Magnitude do terremoto ( [ ] ou Shift + roda )' : 'Tamanho do pincel ( [ ] ou Shift + roda )'}
+            >
+              <span>{s.tool === 'quake' ? `Magnitude ${quakeMagnitude(s.brushSize, s.area).toFixed(1).replace('.', ',')}` : 'Tamanho'}</span>
               <input
                 type="range"
                 min={logMin}

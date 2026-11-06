@@ -5,6 +5,7 @@
 // clouds and the names.
 
 import { CIV_COLORS, TERRITORY_N, type LifeLabel, type LifeMarker, type RoadSegment } from '../engine/life'
+import { context2d, makeCanvas, type Canvas, type Ctx } from './canvas'
 import { fbm } from './noise'
 import { LAPSE, TileWorld, type Hurricane } from './world'
 
@@ -20,7 +21,7 @@ const VARIANTS = 4
 
 /** The map modes: the plain world, or a layer of data painted over it (as in the 3D game). */
 export type Overlay2d =
-  | 'none' | 'biome' | 'temperature' | 'rain' | 'humidity' | 'pressure' | 'relief' | 'rivers' | 'change' | 'plates' | 'human'
+  | 'none' | 'biome' | 'temperature' | 'rain' | 'humidity' | 'pressure' | 'relief' | 'rivers' | 'change' | 'plates' | 'human' | 'current'
   | 'civilization' | 'eras' | 'faith' | 'language' | 'plague' | 'famine' | 'war'
 /** The maps of the peoples: the atlas, and their lands painted by era, faith, tongue, plague, hunger, war. */
 export const PEOPLE_MAPS: Overlay2d[] = ['civilization', 'eras', 'faith', 'language', 'plague', 'famine', 'war']
@@ -31,6 +32,7 @@ export const OVERLAYS_2D: { id: Overlay2d; label: string }[] = [
   { id: 'rain', label: 'Chuva' },
   { id: 'humidity', label: 'Ar' },
   { id: 'pressure', label: 'Pressão' },
+  { id: 'current', label: 'Correntes' },
   { id: 'relief', label: 'Relevo' },
   { id: 'rivers', label: 'Rios' },
   { id: 'change', label: 'Mudança' },
@@ -70,14 +72,8 @@ function sample(stops: Stops, t: number, out: Float32Array) {
 }
 type TerritoryStyle = 'soft' | 'strong' | 'lines' | 'category'
 
-/** Eight categorical hues in a fixed order (validated for colour-blind vision; the dataviz reference palette, dark mode). */
-export const CATEGORICAL: [number, number, number][] = [
-  [57, 135, 229], [217, 89, 38], [25, 158, 112], [201, 133, 0], [213, 81, 129], [0, 131, 0], [144, 133, 233], [230, 103, 103],
-]
-/** The eras, an ordered ramp from light (Stone Age) to dark (Modern). */
-export const ERA_RAMP: [number, number, number][] = [
-  [134, 182, 239], [109, 167, 236], [57, 135, 229], [42, 120, 214], [28, 92, 171], [24, 79, 149], [13, 54, 107],
-]
+// the categorical hues and the eras' ramp, shared with the 3D game's maps of the peoples
+export { CATEGORICAL, ERA_RAMP } from '../engine/palettes'
 
 /** The biome colours, the same as the 3D game's (and BIOMES in the interface's constants). */
 const BIOME_COLORS: [number, number, number][] = [
@@ -114,6 +110,8 @@ export interface View {
 }
 
 export interface Scene {
+  /** The map is being drawn to be wrapped on the globe: nothing that belongs to the screen (the scale bar) goes on it. */
+  globe?: boolean
   markers: LifeMarker[]
   roads: RoadSegment[]
   territory: Uint32Array | null
@@ -150,23 +148,23 @@ const mix = (a: number, b: number, t: number) => a + (b - a) * t
 
 export class Renderer2D {
   private readonly world: TileWorld
-  private readonly pixels: HTMLCanvasElement
-  private readonly pixelCtx: CanvasRenderingContext2D
+  private readonly pixels: Canvas
+  private readonly pixelCtx: Ctx
   private readonly image: ImageData
-  private readonly features: HTMLCanvasElement
-  private readonly featureCtx: CanvasRenderingContext2D
+  private readonly features: Canvas
+  private readonly featureCtx: Ctx
   private readonly look: Uint8Array
-  private readonly atlas: HTMLCanvasElement
-  private readonly territory: HTMLCanvasElement
-  private readonly territoryCtx: CanvasRenderingContext2D
+  private readonly atlas: Canvas
+  private readonly territory: Canvas
+  private readonly territoryCtx: Ctx
   private readonly territoryImage: ImageData
   /** The cloud layer, one pixel per CLOUD_PX tiles, drawn smoothed over the map. */
-  private readonly clouds: HTMLCanvasElement
-  private readonly cloudCtx: CanvasRenderingContext2D
+  private readonly clouds: Canvas
+  private readonly cloudCtx: Ctx
   private readonly cloudImage: ImageData
   /** The night (the Earth's shadow), a small image smoothed over the map. */
-  private readonly night: HTMLCanvasElement
-  private readonly nightCtx: CanvasRenderingContext2D
+  private readonly night: Canvas
+  private readonly nightCtx: Ctx
   private readonly nightImage: ImageData
   private lastTerritory: Uint32Array | null = null
   private lastTerritoryStyle: TerritoryStyle = 'soft'
@@ -179,32 +177,32 @@ export class Renderer2D {
   constructor(world: TileWorld) {
     this.world = world
     const n = world.n
-    this.pixels = document.createElement('canvas')
+    this.pixels = makeCanvas()
     this.pixels.width = n
     this.pixels.height = n
-    this.pixelCtx = this.pixels.getContext('2d')!
+    this.pixelCtx = context2d(this.pixels)
     this.image = this.pixelCtx.createImageData(n, n)
-    this.features = document.createElement('canvas')
+    this.features = makeCanvas()
     this.features.width = n * SPR
     this.features.height = n * SPR
-    this.featureCtx = this.features.getContext('2d')!
+    this.featureCtx = context2d(this.features)
     this.look = new Uint8Array(n * n).fill(255)
     this.atlas = buildAtlas()
-    this.territory = document.createElement('canvas')
+    this.territory = makeCanvas()
     this.territory.width = TERRITORY_N
     this.territory.height = TERRITORY_N
-    this.territoryCtx = this.territory.getContext('2d')!
+    this.territoryCtx = context2d(this.territory)
     this.territoryImage = this.territoryCtx.createImageData(TERRITORY_N, TERRITORY_N)
     const cn = Math.ceil(n / CLOUD_PX)
-    this.clouds = document.createElement('canvas')
+    this.clouds = makeCanvas()
     this.clouds.width = cn
     this.clouds.height = cn
-    this.cloudCtx = this.clouds.getContext('2d')!
+    this.cloudCtx = context2d(this.clouds)
     this.cloudImage = this.cloudCtx.createImageData(cn, cn)
-    this.night = document.createElement('canvas')
+    this.night = makeCanvas()
     this.night.width = 128
     this.night.height = 128
-    this.nightCtx = this.night.getContext('2d')!
+    this.nightCtx = context2d(this.night)
     this.nightImage = this.nightCtx.createImageData(128, 128)
     this.refresh()
   }
@@ -487,6 +485,14 @@ export class Renderer2D {
         sample(COOLWARM, now < 0 ? 0.5 + (now / 20) * 0.5 : 0.5 + (now / 35) * 0.5, o)
         return set(o[0], o[1], o[2], 0.85)
       }
+      case 'current': {
+        // the ocean currents: the sea warmer (red) or colder (blue) than its latitude's by up
+        // to 6 °C; the land dim, with the share of it that reaches the coast
+        const cur = w.current[i]
+        if (!water && cur === 0) return set(128, 128, 120, 0.6)
+        sample(COOLWARM, clamp(0.5 + cur / 12, 0, 1), o)
+        return set(o[0], o[1], o[2], water ? 0.92 : 0.7)
+      }
       case 'rain':
         // YlGnBu, 0 … 2250 mm a year
         sample(YLGNBU, (c[i4 + 2] * RAIN_SCALE) / 2.5, o)
@@ -645,15 +651,47 @@ export class Renderer2D {
   }
 
   /** Draws the world as seen by the view onto the screen canvas. */
-  draw(ctx: CanvasRenderingContext2D, width: number, height: number, view: View, scene: Scene) {
+  /**
+   * Draws the world. East to west it is round, so the map repeats sideways: once for
+   * every copy of it the view shows (one when zoomed in; more when the whole planet fits
+   * with room to spare, or the view lies across the map's edge).
+   */
+  draw(ctx: Ctx, width: number, height: number, view: View, scene: Scene) {
+    const n = this.world.n
+    const z = view.zoom
+    const left = view.cx - width / 2 / z
+    const top = view.cy - height / 2 / z
+    ctx.fillStyle = '#0b1a2a'
+    ctx.fillRect(0, 0, width, height)
+    this.refreshTerritory(scene.territory, this.territoryStyle(), scene.categories)
+    const first = Math.floor(left / n)
+    const last = Math.ceil((left + width / z) / n) - 1
+    for (let k = first; k <= last; k++) this.drawCopy(ctx, width, height, { ...view, cx: view.cx - k * n }, scene, k === first)
+    // what follows the pointer is drawn once, where the pointer is
+    const toScreen = (tx: number, ty: number): [number, number] => [(tx - left) * z, (ty - top) * z]
+    if (scene.plateDrag) {
+      const [ax, ay] = toScreen(scene.plateDrag[0], scene.plateDrag[1])
+      const [bx, by] = toScreen(scene.plateDrag[2], scene.plateDrag[3])
+      arrow(ctx, ax, ay, bx, by, 'rgba(255, 220, 120, 0.95)', 3)
+    }
+    if (scene.brush) {
+      const [px, py] = toScreen(scene.brush.x, scene.brush.y)
+      ctx.beginPath()
+      ctx.arc(px, py, Math.max(scene.brush.r * z, 4), 0, Math.PI * 2)
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+    }
+  }
+
+  /** One copy of the map, where `view` puts it (`once`: the copy that also draws what belongs to the screen, as the scale bar). */
+  private drawCopy(ctx: Ctx, width: number, height: number, view: View, scene: Scene, once: boolean) {
     const n = this.world.n
     const z = view.zoom
     const left = view.cx - width / 2 / z
     const top = view.cy - height / 2 / z
     const toScreen = (tx: number, ty: number): [number, number] => [(tx - left) * z, (ty - top) * z]
     ctx.save()
-    ctx.fillStyle = '#0b1a2a'
-    ctx.fillRect(0, 0, width, height)
     ctx.imageSmoothingEnabled = false
     const [ox, oy] = toScreen(0, 0)
     // the ground colours
@@ -676,7 +714,6 @@ export class Renderer2D {
       ctx.imageSmoothingEnabled = false
     }
     // the peoples' lands
-    this.refreshTerritory(scene.territory, this.territoryStyle(), scene.categories)
     if (scene.territory) {
       ctx.imageSmoothingEnabled = true
       ctx.drawImage(this.territory, ox, oy, n * z, n * z)
@@ -788,14 +825,9 @@ export class Renderer2D {
       else drawMarker(ctx, m, px, py, z, scene.time)
     }
     for (const fx of scene.effects) drawEffect(ctx, fx, toScreen, z, scene.time, width, height)
-    if (satellite) drawGrid(ctx, width, height, view, n)
+    if (satellite) drawGrid(ctx, width, height, view, n, once && !scene.globe)
     if (scene.windArrows) this.drawWind(ctx, width, height, view)
     if (scene.plateArrows) this.drawPlates(ctx, toScreen, z)
-    if (scene.plateDrag) {
-      const [ax, ay] = toScreen(scene.plateDrag[0], scene.plateDrag[1])
-      const [bx, by] = toScreen(scene.plateDrag[2], scene.plateDrag[3])
-      arrow(ctx, ax, ay, bx, by, 'rgba(255, 220, 120, 0.95)', 3)
-    }
     // names
     ctx.textAlign = 'center'
     ctx.textBaseline = 'bottom'
@@ -824,20 +856,11 @@ export class Renderer2D {
       ctx.stroke()
       ctx.setLineDash([])
     }
-    // the brush
-    if (scene.brush) {
-      const [px, py] = toScreen(scene.brush.x, scene.brush.y)
-      ctx.beginPath()
-      ctx.arc(px, py, Math.max(scene.brush.r * z, 4), 0, Math.PI * 2)
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'
-      ctx.lineWidth = 1.5
-      ctx.stroke()
-    }
     ctx.restore()
   }
 
   /** An arrow at each plate's centre showing where it drifts and how fast. */
-  private drawPlates(ctx: CanvasRenderingContext2D, toScreen: (x: number, y: number) => [number, number], z: number) {
+  private drawPlates(ctx: Ctx, toScreen: (x: number, y: number) => [number, number], z: number) {
     const t = this.world.tectonics
     const n = this.world.n
     for (const s of t.sites) {
@@ -857,7 +880,7 @@ export class Renderer2D {
    * Wind arrows on a grid: the local wind, the prevailing one bent round the highs and lows
    * (clockwise round a low, drawing air in, as in the southern hemisphere; anticlockwise out of a high).
    */
-  private drawWind(ctx: CanvasRenderingContext2D, width: number, height: number, view: View) {
+  private drawWind(ctx: Ctx, width: number, height: number, view: View) {
     const w = this.world
     const n = w.n
     const z = view.zoom
@@ -904,7 +927,7 @@ export class Renderer2D {
  * A plane and its contrail (behind it along its heading; `size` is how far it is from either
  * end, so the trail is no longer than the way flown). Seen from orbit only a speck and a white line.
  */
-function drawPlane(ctx: CanvasRenderingContext2D, m: LifeMarker, px: number, py: number, u: number, satellite: boolean) {
+function drawPlane(ctx: Ctx, m: LifeMarker, px: number, py: number, u: number, satellite: boolean) {
   const dx = Math.cos(m.health)
   const dy = Math.sin(m.health)
   const trail = Math.min(u * 6, 40, m.size * 400 * (u / 3))
@@ -1019,7 +1042,7 @@ function satelliteColor(o: Float32Array, above: number, depth: number, t: number
 }
 
 /** A hurricane seen from above: the dense overcast, the spiral bands, the eye, its name and category. */
-function drawHurricane(ctx: CanvasRenderingContext2D, h: Hurricane, toScreen: (x: number, y: number) => [number, number], z: number, time: number, radius: number) {
+function drawHurricane(ctx: Ctx, h: Hurricane, toScreen: (x: number, y: number) => [number, number], z: number, time: number, radius: number) {
   const [px, py] = toScreen(h.x, h.y)
   const R = Math.max(radius * z, 18)
   const a = 0.35 + 0.6 * h.strength
@@ -1078,7 +1101,7 @@ export const kmPerTile = (n: number) => EQUATOR_KM / n
  * white, its people's colour faint around it); boats a white speck with a wake; battles a
  * flash; herds, travellers on foot and ruins are too small to see.
  */
-function drawLight(ctx: CanvasRenderingContext2D, m: LifeMarker, px: number, py: number, z: number, time: number, night = 0) {
+function drawLight(ctx: Ctx, m: LifeMarker, px: number, py: number, z: number, time: number, night = 0) {
   switch (m.kind) {
     case 'village': {
       // by day a faint glint, by night the full glow of the streets (more with technology)
@@ -1163,7 +1186,7 @@ function nightAt(world: TileWorld) {
 }
 
 /** A grid of latitude and longitude every few degrees with labels, and a scale bar in the corner: the map read as a map. */
-function drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number, view: View, n: number) {
+function drawGrid(ctx: Ctx, width: number, height: number, view: View, n: number, bar: boolean) {
   const z = view.zoom
   const left = view.cx - width / 2 / z
   const top = view.cy - height / 2 / z
@@ -1204,6 +1227,11 @@ function drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number, 
     ctx.textBaseline = 'bottom'
     ctx.fillText(formatLon(lon), x + 3, y1 - 4)
   }
+  // (the scale bar belongs to the screen: once, however many copies of the map show)
+  if (!bar) {
+    ctx.restore()
+    return
+  }
   const steps = [100, 200, 250, 500, 1000, 2000, 5000]
   // the scale bar (bottom right)
   const barKm = steps.find((s) => s * pxPerKm >= 90) ?? 2000
@@ -1230,7 +1258,7 @@ function drawGrid(ctx: CanvasRenderingContext2D, width: number, height: number, 
 }
 
 /** One effect at its moment (see Effect): drawn over the map, fading as it ends. */
-function drawEffect(ctx: CanvasRenderingContext2D, fx: Effect, toScreen: (x: number, y: number) => [number, number], z: number, time: number, width: number, height: number) {
+function drawEffect(ctx: Ctx, fx: Effect, toScreen: (x: number, y: number) => [number, number], z: number, time: number, width: number, height: number) {
   const t = (time - fx.t0) / fx.dur
   if (t < 0 || t > 1) return
   const [px, py] = toScreen(fx.x, fx.y)
@@ -1483,7 +1511,7 @@ function plateHue(c: [number, number]): [number, number, number] {
 }
 
 /** An arrow from (ax, ay) to (bx, by), outlined in black. */
-function arrow(ctx: CanvasRenderingContext2D, ax: number, ay: number, bx: number, by: number, color: string, width: number) {
+function arrow(ctx: Ctx, ax: number, ay: number, bx: number, by: number, color: string, width: number) {
   const len = Math.hypot(bx - ax, by - ay)
   if (len < 1) return
   const ux = (bx - ax) / len
@@ -1507,11 +1535,11 @@ function arrow(ctx: CanvasRenderingContext2D, ax: number, ay: number, bx: number
 
 // ---- the sprites --------------------------------------------------------------------
 
-function buildAtlas(): HTMLCanvasElement {
-  const atlas = document.createElement('canvas')
+function buildAtlas(): Canvas {
+  const atlas = makeCanvas()
   atlas.width = KINDS.length * VARIANTS * SPR
   atlas.height = SPR
-  const ctx = atlas.getContext('2d')!
+  const ctx = context2d(atlas)
   ctx.lineCap = 'round'
   ctx.lineJoin = 'round'
   KINDS.forEach((kind, k) => {
@@ -1526,7 +1554,7 @@ function buildAtlas(): HTMLCanvasElement {
   return atlas
 }
 
-function drawSprite(ctx: CanvasRenderingContext2D, kind: Kind, j: number) {
+function drawSprite(ctx: Ctx, kind: Kind, j: number) {
   const ox = (j - 0.5) * 5
   const s = 0.8 + j * 0.4
   switch (kind) {
@@ -1712,7 +1740,7 @@ function drawSprite(ctx: CanvasRenderingContext2D, kind: Kind, j: number) {
 }
 
 /** A town, a party, a herd, a ruin, a boat, a battle or a dam, at a screen point. */
-function drawMarker(ctx: CanvasRenderingContext2D, m: LifeMarker, px: number, py: number, z: number, time: number) {
+function drawMarker(ctx: Ctx, m: LifeMarker, px: number, py: number, z: number, time: number) {
   const u = Math.max(z, 3)
   switch (m.kind) {
     case 'village': {

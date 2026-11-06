@@ -135,6 +135,23 @@ export const CHALLENGES: Challenge[] = [
 
 export const challengeById = (id: string | null) => CHALLENGES.find((c) => c.id === id) ?? null
 
+const TOUR_KEY = 'craftscape2d.tour'
+/** Whether the first steps (see Tour) were already taken or skipped in this browser. */
+export const seenTour = () => {
+  try {
+    return localStorage.getItem(TOUR_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+export const rememberTour = () => {
+  try {
+    localStorage.setItem(TOUR_KEY, '1')
+  } catch {
+    // storage unavailable: the first steps just show again next time
+  }
+}
+
 const WELCOMED_KEY = 'craftscape2d.welcomed'
 export const seenWelcome = () => {
   try {
