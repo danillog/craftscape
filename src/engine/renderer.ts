@@ -654,7 +654,8 @@ export class Renderer {
       pass.setBindGroup(0, this.roadBindGroup)
       pass.draw(ROAD_VERTICES, roads.length)
     }
-    const life = scene.life.slice(0, MAX_LIFE)
+    // kinds this renderer does not draw (the 2D game's planes) are left out
+    const life = scene.life.filter((m) => LIFE_KINDS.includes(m.kind)).slice(0, MAX_LIFE)
     if (life.length && this.lifeBindGroup) {
       life.forEach((m, k) =>
         this.lifeData.set(

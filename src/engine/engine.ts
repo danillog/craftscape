@@ -110,7 +110,8 @@ const STORM_LIFE = 100
 const stormStrength = (age: number) => (age < 5 ? age / 5 : age < 70 ? 1 : Math.max((STORM_LIFE - age) / 30, 0))
 const MAX_UNDO = 30
 
-export type WebGPUFailure = 'no-api' | 'no-adapter' | 'timeout'
+/** software: only the browser's CPU emulation of WebGPU, which is too slow to run the game. */
+export type WebGPUFailure = 'no-api' | 'no-adapter' | 'timeout' | 'software'
 
 export class WebGPUUnavailableError extends Error {
   readonly reason: WebGPUFailure
@@ -120,7 +121,9 @@ export class WebGPUUnavailableError extends Error {
         ? 'Este navegador não expõe WebGPU.'
         : reason === 'no-adapter'
           ? 'Nenhum adaptador WebGPU disponível.'
-          : 'O navegador não respondeu ao pedido de GPU.',
+          : reason === 'software'
+            ? 'Só há WebGPU por software (sem GPU de verdade).'
+            : 'O navegador não respondeu ao pedido de GPU.',
     )
     this.reason = reason
   }
@@ -286,18 +289,25 @@ export class Engine {
   /** Dynamic resolution: the render scale in effect, between the profile's minimum and its scale. */
   private renderScale = 1
 
-  static async create(canvas: HTMLCanvasElement, signal: AbortSignal): Promise<Engine> {
+  /**
+   * Starts the engine on the GPU. Without a real GPU it fails with WebGPUUnavailableError
+   * (the page then opens the 2D game) unless `allowSoftware`, which runs on the browser's
+   * software adapter: it works, but slowly enough to freeze a weak computer.
+   */
+  static async create(canvas: HTMLCanvasElement, signal: AbortSignal, allowSoftware = false): Promise<Engine> {
     if (!navigator.gpu) throw new WebGPUUnavailableError('no-api')
     let adapter: GPUAdapter | null = null
     let hardwareFailure: WebGPUFailure = 'no-adapter'
     try {
-      adapter = await withTimeout(navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }), 8000)
+      adapter = await withTimeout(navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }), 6000)
     } catch (err) {
       if (!(err instanceof WebGPUUnavailableError)) throw err
       hardwareFailure = err.reason
     }
-    // No usable GPU: fall back to the browser's software adapter (slow, but it runs).
-    adapter ??= await withTimeout(navigator.gpu.requestAdapter({ forceFallbackAdapter: true }), 8000).catch(() => null)
+    if (adapter?.info.isFallbackAdapter && !allowSoftware) throw new WebGPUUnavailableError('software')
+    if (!adapter && allowSoftware) {
+      adapter = await withTimeout(navigator.gpu.requestAdapter({ forceFallbackAdapter: true }), 6000).catch(() => null)
+    }
     if (!adapter) throw new WebGPUUnavailableError(hardwareFailure)
     // 2048² needs bigger buffers than the defaults (undo snapshots and read-backs hold all
     // the state in one buffer, ~470 MB); ask for what the adapter allows, up to 1 GiB

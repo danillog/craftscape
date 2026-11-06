@@ -21,7 +21,7 @@ export function TopBar({ engine, onNewWorld }: { engine: Engine; onNewWorld: () 
           <Icon.sparkles size={18} />
           <span>Novo mundo</span>
         </button>
-        <a className="pill" href="2d.html" data-tip="A versão 2D, de tiles, que roda sem GPU">
+        <a className="pill" href={`${import.meta.env.BASE_URL}2d.html`} data-tip="A versão 2D, de tiles, que roda sem GPU">
           <Icon.map size={18} />
           <span>2D</span>
         </a>

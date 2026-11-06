@@ -310,6 +310,69 @@ export const Icon = {
       <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
     </Svg>
   ),
+  bulb: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M9 18h6M10 21h4" />
+      <path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1 2V16h5.2v-.2c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z" />
+    </Svg>
+  ),
+  skull: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M12 3c-4.4 0-8 3.2-8 7.4 0 2.5 1.3 4.4 3 5.6V19h10v-3c1.7-1.2 3-3.1 3-5.6C20 6.2 16.4 3 12 3Z" />
+      <circle cx="9" cy="11" r="1.6" />
+      <circle cx="15" cy="11" r="1.6" />
+      <path d="M10.5 19v2M13.5 19v2" />
+    </Svg>
+  ),
+  star: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="m12 3 2.6 5.6 6.1.7-4.5 4.2 1.2 6L12 16.6 6.6 19.5l1.2-6-4.5-4.2 6.1-.7Z" />
+    </Svg>
+  ),
+  swords: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M4 4l10 10M20 4 10 14" />
+      <path d="m12.5 15.5 3 3M8.5 18.5l3-3M15 21l1.5-1.5M9 21l-1.5-1.5" />
+      <path d="M4 4h3v3M20 4h-3v3" />
+    </Svg>
+  ),
+  dove: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M3 15c3 0 5-1 7-3 0 3-1 5-3 7 5 0 9-3 10-8l4-2-4-1c-1-2-4-2-5 0L9 11C7 9 6 6 6 3c-2 2-3 5-2 8" />
+    </Svg>
+  ),
+  save: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M5 3h11l3 3v15H5Z" />
+      <path d="M8 3v5h7V3M8 21v-6h8v6" />
+    </Svg>
+  ),
+  book: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2Z" />
+      <path d="M4 21a2 2 0 0 1 2-2h13v2H6" />
+      <path d="M8 7h7M8 11h5" />
+    </Svg>
+  ),
+  seismic: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M2 12h4l2-6 3 13 3-16 2 12 2-3h4" />
+    </Svg>
+  ),
+  radiation: (p: IconProps) => (
+    <Svg {...p}>
+      <circle cx="12" cy="12" r="1.8" />
+      <path d="M12 3a9 9 0 0 1 7.8 4.5L14.5 10.6A3 3 0 0 0 12 9.2Z" />
+      <path d="M19.8 16.5A9 9 0 0 1 12 21v-6.2a3 3 0 0 0 2.5-1.4Z" />
+      <path d="M4.2 16.5A9 9 0 0 1 4.2 7.5l5.3 3.1A3 3 0 0 0 9.5 13.4Z" />
+    </Svg>
+  ),
+  trophy: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M8 4h8v5a4 4 0 0 1-8 0Z" />
+      <path d="M8 6H4a3 3 0 0 0 4 4M16 6h4a3 3 0 0 1-4 4M12 13v4M8 21h8M9 21l1-4h4l1 4" />
+    </Svg>
+  ),
 }
 
 export const TOOL_ICONS: Record<Tool, (p: IconProps) => ReactNode> = {

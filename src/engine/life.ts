@@ -10,11 +10,11 @@
 
 import type { Field } from './engine'
 
-export type LifeKind = 'herd' | 'village' | 'battle' | 'ruin' | 'boat' | 'party' | 'dam'
+export type LifeKind = 'herd' | 'village' | 'battle' | 'ruin' | 'boat' | 'party' | 'dam' | 'plane'
 
 /** What a party on the road is: traders, soldiers, people fleeing, people going to found a town. */
-export type PartyKind = 'caravan' | 'army' | 'migrants' | 'settlers'
-const PARTY_KINDS: PartyKind[] = ['caravan', 'army', 'migrants', 'settlers']
+export type PartyKind = 'caravan' | 'army' | 'migrants' | 'settlers' | 'ship'
+const PARTY_KINDS: PartyKind[] = ['caravan', 'army', 'migrants', 'settlers', 'ship']
 
 /** A party walking from one place to another (world units), drawn as a file of figures. */
 export interface Party {
@@ -101,7 +101,7 @@ export interface Route {
   /** Town ids, so a route may be told apart. */
   from: number
   to: number
-  /** Civ colour of the boats on a sea route. */
+  /** Civ colour of the boats on a sea route (kind 4: an air route of the Modern era). */
   color: number
 }
 
@@ -156,6 +156,14 @@ export interface Civ {
   monuments: number
   /** Simulated seconds until another plague in this people is worth telling. */
   plagueLog: number
+  /** Colonies founded across the sea. */
+  voyages?: number
+  /** Its language family (the id of the people whose tongue it grew from; its own at first). */
+  family?: number
+  /** Words borrowed from each neighbour's tongue (civ id → how much; 1 is a lot). */
+  loans?: Map<number, number>
+  /** Knowledge learned from each neighbour since it was last told (civ id → tech). */
+  learned?: Map<number, number>
 }
 
 export interface War {
@@ -336,7 +344,7 @@ export interface LifeMarker {
   health: number
   color: number
   tech: number
-  /** A herd: its species; a town or ruin: its monument (index into MONUMENTS); a party: its kind (index into PARTY_KINDS); a boat or dam: 0. */
+  /** A herd: its species; a town or ruin: its monument (index into MONUMENTS); a party: its kind (index into PARTY_KINDS); a boat: 0 sail, 1 steamship, 2 cargo ship; a dam or plane: 0. */
   flag: number
 }
 
@@ -374,6 +382,15 @@ export interface CivReport {
   /** Civs it trades with (at peace and in contact). */
   trade: number
   faith: string
+  /** Index into FAITHS. */
+  faithIndex: number
+  /** Index into ERAS. */
+  eraIndex: number
+  /** Its tongue's family: the id and the name of the people it grew from. */
+  family: number
+  familyName: string
+  /** The peoples whose words it borrowed most. */
+  loansFrom: string[]
   monuments: number
   /** Share of its towns with the plague, 0–1. */
   plague: number
@@ -411,6 +428,23 @@ export interface LifeEvent {
   /** Where it happened (world units), when it happened somewhere. */
   pos?: [number, number]
 }
+
+/** A warhead: launched from, aimed at (world units), and the town it hits. */
+export interface NuclearStrike {
+  from: [number, number]
+  to: [number, number]
+  town: string
+}
+
+/** Simulated seconds two Modern peoples must be at war before it may turn nuclear, and the chance per simulated second after. */
+const NUCLEAR_AFTER = 300
+/** Knowledge a people must learn from one neighbour before the chronicle tells of it. */
+const LEARNED_TOLD = 0.05
+/** Words borrowed per simulated second of full contact; when a tongue is full of another's words, and when it joins its family. */
+const LOAN_RATE = 0.0025
+const LOANS_NOTED = 0.5
+const LOANS_MERGE = 1.5
+const NUCLEAR_CHANCE = 0.0004
 
 /** People per civ at the end of a year, for the timeline. */
 export interface HistoryPoint {
@@ -520,11 +554,16 @@ const TOWN_SPACING = 0.035
 const CONTACT = 0.09
 /** How far settlers walk, at no tech and at full tech (world units). */
 const REACH_MIN = 0.05
-const REACH_MAX = 0.14
+const REACH_MAX = 0.18
+/** Sailors found colonies this many times farther than settlers walk, across the sea. */
+const VOYAGE_REACH = 4
+/** World units per simulated second an expedition's ship sails, and a plane flies. */
+const SHIP_SPEED = 0.03
+const PLANE_SPEED = 0.12
 /** Population growth per simulated second, at full food. */
 const GROWTH = 0.02
 /** Technology per simulated second per unit of (saturating) population, ×(1 + 2·demand). */
-const TECH_RATE = 0.00025
+const TECH_RATE = 0.0003
 /** Adaptation per simulated second per unit of population living with a hard climate. */
 const ADAPT_RATE = 0.0008
 /** Towns a civ can hold together: a few, and more with technology. */
@@ -651,6 +690,11 @@ export class Life {
   private ending: string | null = null
   /** Years in a row in which no new people could find a place to live. */
   private barrenYears = 0
+  /** Colonies founded across the sea, by all peoples, ever. */
+  private voyagesCount = 0
+  /** Nuclear warheads launched and not yet shown (the 2D game takes them), and exchanges ever. */
+  private strikes: NuclearStrike[] = []
+  private nuclearWars = 0
   /** The political map last drawn, and when and for which window. */
   private territoryMap = new Uint32Array(new ArrayBuffer(TERRITORY_N * TERRITORY_N * 4))
   private territoryTime = -1
@@ -688,6 +732,9 @@ export class Life {
     this.lastCatastrophe = -1000
     this.ending = null
     this.barrenYears = 0
+    this.voyagesCount = 0
+    this.strikes = []
+    this.nuclearWars = 0
     this.territoryTime = -1
     this.territoryKey = ''
   }
@@ -1056,6 +1103,22 @@ export class Life {
       if (!civ || town.pop < 0.5 || town.settle > 0 || this.towns.length >= MAX_TOWNS) continue
       if ((count.get(civ.id) ?? 0) >= this.townCap(civ)) continue
       town.settle = 40 + Math.random() * 40
+      // sailors from a coastal town now and then cross the sea to a new land
+      if (civ.tech >= TECH_SAILING && Math.random() < 0.35 && this.coastal(town.pos, at)) {
+        const far = this.voyageSpot(town.pos, this.reach(civ) * VOYAGE_REACH, civ, at)
+        if (far) {
+          town.pop -= 0.15
+          this.towns.push(this.newTown(far, civ.id, 0.12, 60))
+          this.send('ship', town.pos, far, civ.color, 0.5)
+          count.set(civ.id, (count.get(civ.id) ?? 0) + 1)
+          civ.founded++
+          civ.voyages = (civ.voyages ?? 0) + 1
+          this.voyagesCount++
+          if (civ.voyages === 1) this.log(`Os ${civ.name} cruzam o mar e chegam a uma nova terra.`, civ.color, true, far)
+          else if (civ.voyages % 4 === 0) this.log(`${civ.name} já fundou ${civ.voyages} colônias além-mar.`, civ.color, false, far)
+          continue
+        }
+      }
       const spot = this.settleSpot(town.pos, this.reach(civ), civ, at)
       if (!spot) continue
       town.pop -= 0.15
@@ -1096,8 +1159,19 @@ export class Life {
       const gap = a.tech - b.tech
       const close = a.allies.has(b.id) ? 2 : this.warBetween(a.id, b.id) ? 0.5 : 1
       const flow = DIFFUSION * dt * Math.min(1, pressure) * close
-      if (gap > 0) b.tech = Math.min(a.tech, b.tech + gap * flow)
-      else a.tech = Math.min(b.tech, a.tech + -gap * flow)
+      const [teacher, learner] = gap > 0 ? [a, b] : [b, a]
+      const gain = Math.min(teacher.tech, learner.tech + Math.abs(gap) * flow) - learner.tech
+      learner.tech += gain
+      // the learning is told once it adds up (the knowledge that travels with trade)
+      learner.learned ??= new Map()
+      const sum = (learner.learned.get(teacher.id) ?? 0) + gain
+      if (sum >= LEARNED_TOLD) {
+        learner.learned.delete(teacher.id)
+        this.log(`Os sábios de ${teacher.name} ensinam ${learner.name}: o saber viaja com o comércio.`, learner.color, false, this.capitalPos(learner))
+      } else learner.learned.set(teacher.id, sum)
+      // tongues meet: each borrows words from the other (more from the greater, more in
+      // peace and between allies); tongues that borrow a great deal grow into one family
+      if (!this.warBetween(a.id, b.id)) this.borrowWords(a, b, dt * Math.min(1, pressure) * close)
       // faith spreads from the greater people to the smaller one it touches (faster in peace)
       if (a.faith !== b.faith) {
         const pa = this.power(a)
@@ -1127,6 +1201,13 @@ export class Life {
         const victim = aggressor === a ? b : a
         this.declareWar(aggressor, victim, cause)
       }
+    }
+    // a long war between peoples with the bomb may turn nuclear
+    for (const war of [...this.wars]) {
+      if (war.age < NUCLEAR_AFTER || Math.random() > NUCLEAR_CHANCE * dt) continue
+      const a = civById.get(war.a)
+      const b = civById.get(war.b)
+      if (a && b && a.tech >= ERAS[6].tech && b.tech >= ERAS[6].tech) this.nuclearExchange(a, b)
     }
     // wars end in truces
     for (let k = this.wars.length - 1; k >= 0; k--) {
@@ -1164,7 +1245,7 @@ export class Life {
   /** Sends a party walking from one place to another; too many on the roads and the oldest gives way. */
   private send(kind: PartyKind, from: [number, number], to: [number, number], color: number, size = 0.5) {
     if (dist(from, to) < 1e-6) return
-    this.parties.push({ kind, from: [from[0], from[1]], to: [to[0], to[1]], t: 0, speed: kind === 'army' ? MARCH_SPEED : WALK_SPEED, color, size })
+    this.parties.push({ kind, from: [from[0], from[1]], to: [to[0], to[1]], t: 0, speed: kind === 'army' ? MARCH_SPEED : kind === 'ship' ? SHIP_SPEED : WALK_SPEED, color, size })
     if (this.parties.length > MAX_PARTIES) this.parties.shift()
   }
 
@@ -1356,7 +1437,7 @@ export class Life {
 
   private declareWar(aggressor: Civ, victim: Civ, cause: string) {
     this.wars.push({ a: aggressor.id, b: victim.id, left: WAR_LENGTH * (0.5 + Math.random()), age: 0, battles: 0, taken: [0, 0], cause })
-    const why = { fome: 'por fome', vingança: 'por vingança', conquista: 'de conquista', terra: 'por terra', fé: 'em nome da fé' }[cause] ?? ''
+    const why = { fome: 'por fome', vingança: 'por vingança', conquista: 'de conquista', terra: 'por terra', fé: 'em nome da fé', discórdia: 'semeada pelos deuses' }[cause] ?? ''
     this.log(`${aggressor.name} declara guerra a ${victim.name} ${why}!`, aggressor.color, true, this.capitalPos(victim))
     // the victim's allies come to its side; the aggressor's too
     for (const [allyId] of victim.allies) {
@@ -1614,6 +1695,48 @@ export class Life {
       const moist = waterNear ? 1 : Math.max(0, Math.min(1, (cell.humidity - 0.25) / 0.35))
       const hardship = Math.max(0, climateDemand(cell.temperature) - tolerance(civ, cell.temperature))
       const s = (cell.vegetation * 1.6 + (waterNear ? 0.25 : 0)) * moist + 0.3 * adaptMean - hardship * 3
+      if (s > bestScore) {
+        bestScore = s
+        best = pos
+      }
+    }
+    return best
+  }
+
+  /** Whether the sea (deep water) is close to a town: its sailors can put out. */
+  private coastal(pos: [number, number], at: (p: [number, number]) => Cell | null): boolean {
+    for (let k = 0; k < 12; k++) {
+      const a = (k / 12) * Math.PI * 2
+      const cell = at([pos[0] + Math.cos(a) * 0.03, pos[1] + Math.sin(a) * 0.03])
+      if (cell && cell.water > 0.01) return true
+    }
+    return false
+  }
+
+  /**
+   * A place to found a colony across the sea: good land up to `reach` away, with open
+   * water on the way (an island or another shore, not a walk along the coast).
+   */
+  private voyageSpot(from: [number, number], reach: number, civ: Civ, at: (p: [number, number]) => Cell | null): [number, number] | null {
+    let best: [number, number] | null = null
+    let bestScore = 0.2 - 0.1 * civ.tech
+    for (let k = 0; k < 24; k++) {
+      const a = Math.random() * Math.PI * 2
+      const r = reach * (0.3 + 0.7 * Math.random())
+      const pos: [number, number] = [from[0] + Math.cos(a) * r, from[1] + Math.sin(a) * r]
+      const cell = at(pos)
+      if (!cell || cell.lava > 0 || cell.water > 0.0005 || cell.ice > 0.0005) continue
+      if (this.towns.some((t) => dist(t.pos, pos) < TOWN_SPACING * 1.5)) continue
+      let wet = 0
+      for (let j = 1; j < 12; j++) {
+        const c = at([from[0] + (pos[0] - from[0]) * (j / 12), from[1] + (pos[1] - from[1]) * (j / 12)])
+        if (c && c.water > 0.01) wet++
+      }
+      if (wet < 3) continue
+      const hardship = Math.max(0, climateDemand(cell.temperature) - tolerance(civ, cell.temperature))
+      // empty land is worth more: nobody's towns near
+      const empty = this.towns.some((t) => dist(t.pos, pos) < CONTACT) ? 0 : 0.3
+      const s = cell.vegetation * 1.4 + Math.max(0, Math.min(1, (cell.humidity - 0.25) / 0.35)) * 0.4 + empty - hardship * 3
       if (s > bestScore) {
         bestScore = s
         best = pos
@@ -1890,7 +2013,15 @@ export class Life {
       const uv = this.inWindow(pos, origin, n, extent)
       if (!uv) continue
       const heading = Math.atan2(p.to[1] - p.from[1], p.to[0] - p.from[0])
-      out.push({ uv, kind: 'party', size: p.size, health: heading, color: p.color, tech: 0, flag: PARTY_KINDS.indexOf(p.kind) })
+      // an expedition at sea is a ship (on land, the colonists walk to the shore and from it)
+      if (p.kind === 'ship') {
+        const cell = this.field ? this.cellAt(this.field, pos, extent) : null
+        if (cell && cell.water > 0.003) {
+          out.push({ uv, kind: 'boat', size: 1, health: heading, color: p.color, tech: 0, flag: 0 })
+          continue
+        }
+      }
+      out.push({ uv, kind: 'party', size: p.size, health: heading, color: p.color, tech: 0, flag: PARTY_KINDS.indexOf(p.kind === 'ship' ? 'settlers' : p.kind) })
     }
     for (const c of this.creatures) {
       if (c.dead > 0) continue
@@ -1905,21 +2036,68 @@ export class Life {
       const uv = this.inWindow(b.pos, origin, n, extent)
       if (uv) out.push({ uv, kind: 'battle', size: 1 - b.age / BATTLE_FADE, health: 1, color: 0, tech: 0, flag: 0 })
     }
-    // boats sail the sea routes back and forth
+    // boats sail the sea routes back and forth: sailing ships, then steamships (Industrial
+    // era), then cargo ships (Modern era), more of them as the trade grows
+    const townCiv = new Map(this.towns.map((t) => [t.id, civById.get(t.civ)]))
     for (const r of this.routes()) {
       if (r.kind !== 3) continue
       const len = dist(r.a, r.b)
       if (len < 1e-6) continue
-      const phase = ((this.time * BOAT_SPEED) / len + (r.from * 7 + r.to * 13) * 0.137) % 2
+      const tech = townCiv.get(r.from)?.tech ?? 0
+      const ship = tech >= ERAS[6].tech ? 2 : tech >= ERAS[5].tech ? 1 : 0
+      const fleet = 1 + ship
+      for (let f = 0; f < fleet; f++) {
+        const phase = ((this.time * BOAT_SPEED * (1 + ship * 0.5)) / len + (r.from * 7 + r.to * 13) * 0.137 + f / fleet * 2) % 2
+        const t = phase < 1 ? phase : 2 - phase
+        const pos: [number, number] = [r.a[0] + (r.b[0] - r.a[0]) * t, r.a[1] + (r.b[1] - r.a[1]) * t]
+        const cell = this.field ? this.cellAt(this.field, pos, extent) : null
+        if (!cell || cell.water < 0.003) continue
+        const uv = this.inWindow(pos, origin, n, extent)
+        const heading = Math.atan2((r.b[1] - r.a[1]) * (phase < 1 ? 1 : -1), (r.b[0] - r.a[0]) * (phase < 1 ? 1 : -1))
+        if (uv) out.push({ uv, kind: 'boat', size: 1, health: heading, color: r.color, tech, flag: ship })
+      }
+    }
+    // planes fly the air routes of the Modern era back and forth (size: how far along, for the contrail)
+    for (const r of this.airRoutes()) {
+      const len = dist(r.a, r.b)
+      if (len < 1e-6) continue
+      const phase = ((this.time * PLANE_SPEED) / len + (r.from * 11 + r.to * 5) * 0.173) % 2
       const t = phase < 1 ? phase : 2 - phase
       const pos: [number, number] = [r.a[0] + (r.b[0] - r.a[0]) * t, r.a[1] + (r.b[1] - r.a[1]) * t]
-      const cell = this.field ? this.cellAt(this.field, pos, extent) : null
-      if (!cell || cell.water < 0.003) continue
       const uv = this.inWindow(pos, origin, n, extent)
       const heading = Math.atan2((r.b[1] - r.a[1]) * (phase < 1 ? 1 : -1), (r.b[0] - r.a[0]) * (phase < 1 ? 1 : -1))
-      if (uv) out.push({ uv, kind: 'boat', size: 1, health: heading, color: r.color, tech: 0, flag: 0 })
+      if (uv) out.push({ uv, kind: 'plane', size: Math.min(t, 1 - t) * len, health: heading, color: r.color, tech: 1, flag: 0 })
     }
     return out
+  }
+
+  /**
+   * The air routes of the Modern era: from each modern people's capital to its farthest
+   * towns, and between the capitals of modern peoples at peace.
+   */
+  airRoutes(): Route[] {
+    const out: Route[] = []
+    const modern = this.civs.filter((c) => c.tech >= ERAS[6].tech)
+    const capitals = new Map<number, Town>()
+    for (const c of modern) {
+      const cap = this.towns.find((t) => t.id === c.capital && t.civ === c.id)
+      if (!cap) continue
+      capitals.set(c.id, cap)
+      const far = this.towns
+        .filter((t) => t.civ === c.id && t.id !== cap.id && dist(t.pos, cap.pos) > 0.15)
+        .sort((a, b) => dist(b.pos, cap.pos) - dist(a.pos, cap.pos))
+        .slice(0, 3)
+      for (const t of far) out.push({ a: cap.pos, b: t.pos, kind: 4, from: cap.id, to: t.id, color: c.color })
+    }
+    for (let i = 0; i < modern.length; i++) {
+      for (let j = i + 1; j < modern.length; j++) {
+        const a = capitals.get(modern[i].id)
+        const b = capitals.get(modern[j].id)
+        if (!a || !b || this.warBetween(modern[i].id, modern[j].id)) continue
+        out.push({ a: a.pos, b: b.pos, kind: 4, from: a.id, to: b.id, color: modern[i].color })
+      }
+    }
+    return out.slice(0, 24)
   }
 
   /**
@@ -2245,6 +2423,358 @@ export class Life {
     }
   }
 
+  /**
+   * Carries everything on the land along with a drifting plate (the 2D game's continental
+   * drift): `move` gives how far a point moves (world units), or null where it stays.
+   */
+  drift(move: (pos: [number, number]) => [number, number] | null) {
+    const shift = (p: [number, number]) => {
+      const d = move(p)
+      if (d) {
+        p[0] += d[0]
+        p[1] += d[1]
+      }
+    }
+    for (const t of this.towns) {
+      const d = move(t.pos)
+      if (!d) continue
+      t.pos[0] += d[0]
+      t.pos[1] += d[1]
+      if (t.dam) {
+        t.dam[0] += d[0]
+        t.dam[1] += d[1]
+      }
+    }
+    for (const c of this.creatures) shift(c.pos)
+    for (const r of this.ruins) shift(r.pos)
+    for (const b of this.battles) shift(b.pos)
+    for (const p of this.parties) {
+      shift(p.from)
+      shift(p.to)
+    }
+    // the roads and the lands are worked out again where the towns are now
+    this.routesTime = -Infinity
+    this.territoryTime = -1
+  }
+
+  /**
+   * The god powers over the peoples (the 2D game): on the town nearest `pos` (world units,
+   * within `within`), returns the line told, or null when no town is there.
+   * - bless: full granaries, a healthy town that grows;
+   * - inspire: a leap in the people's knowledge;
+   * - plague: a plague breaks out;
+   * - prophet: the people turns to another faith;
+   * - discord: war with the nearest other people;
+   * - peace: every war of this people ends in a truce.
+   */
+  godPower(kind: 'bless' | 'inspire' | 'plague' | 'prophet' | 'discord' | 'peace', pos: [number, number], within = 0.03): string | null {
+    let town: Town | null = null
+    let best = within
+    for (const t of this.towns) {
+      const d = dist(t.pos, pos)
+      if (d < best) [best, town] = [d, t]
+    }
+    if (!town) return null
+    const civ = this.civById(town.civ)
+    if (!civ) return null
+    let text: string
+    switch (kind) {
+      case 'bless':
+        town.granary = 1
+        town.pop = Math.min(1, town.pop + 0.15)
+        town.plague = 0
+        town.strain = 0
+        text = `Os deuses abençoam ${town.name}: celeiros cheios e gente saudável.`
+        break
+      case 'inspire': {
+        const before = eraOf(civ.tech)
+        civ.tech = Math.min(1, civ.tech + 0.06)
+        text = `Uma ideia brilhante nasce em ${town.name}: ${civ.name} avança no saber.`
+        if (eraOf(civ.tech) > before) text += ` Chegam à ${ERAS[eraOf(civ.tech)].name}.`
+        break
+      }
+      case 'plague':
+        town.plague = PLAGUE_LENGTH * (0.8 + 0.6 * Math.random())
+        town.immune = PLAGUE_IMMUNITY
+        text = `Uma peste é lançada sobre ${town.name}, de ${civ.name}.`
+        break
+      case 'prophet': {
+        const faith = (civ.faith + 1 + Math.floor(Math.random() * (FAITHS.length - 1))) % FAITHS.length
+        civ.faith = faith
+        text = `Um profeta surge em ${town.name}: ${civ.name} passa a seguir o ${FAITHS[faith]}.`
+        break
+      }
+      case 'discord': {
+        // the nearest town of another people at peace
+        let rival: Civ | null = null
+        let near = Infinity
+        for (const t of this.towns) {
+          if (t.civ === civ.id || this.warBetween(civ.id, t.civ)) continue
+          const d = dist(t.pos, town.pos)
+          const c = this.civById(t.civ)
+          if (c && d < near) [near, rival] = [d, c]
+        }
+        if (!rival) return `${civ.name} não tem vizinhos com quem brigar.`
+        civ.truces.delete(rival.id)
+        rival.truces.delete(civ.id)
+        civ.allies.delete(rival.id)
+        rival.allies.delete(civ.id)
+        this.declareWar(civ, rival, 'discórdia')
+        return `A discórdia é semeada: ${civ.name} e ${rival.name} entram em guerra.`
+      }
+      case 'peace': {
+        const mine = this.wars.filter((w) => w.a === civ.id || w.b === civ.id)
+        if (!mine.length) return `${civ.name} já vive em paz.`
+        for (const w of mine) {
+          const other = this.civById(w.a === civ.id ? w.b : w.a)
+          if (!other) continue
+          const truce = TRUCE_LENGTH * 2
+          civ.truces.set(other.id, truce)
+          other.truces.set(civ.id, truce)
+        }
+        this.wars = this.wars.filter((w) => w.a !== civ.id && w.b !== civ.id)
+        text = `Os deuses impõem a paz: ${civ.name} depõe as armas.`
+        break
+      }
+    }
+    this.log(text, civ.color, true, town.pos)
+    return text
+  }
+
+  /**
+   * A nuclear exchange: each side that has the bomb (the Modern era) fires at the other's
+   * biggest towns, more warheads the more advanced it is. The towns hit lose most of their
+   * people; both peoples lose some of their knowledge; the war ends in a long truce (neither
+   * is left able to fight). The warheads wait in `strikes` for the 2D game to show them and
+   * to burn the land, spread the fallout and darken the sky.
+   */
+  private nuclearExchange(a: Civ, b: Civ, granted = false): NuclearStrike[] {
+    const out: NuclearStrike[] = []
+    for (const [att, def] of [[a, b], [b, a]] as [Civ, Civ][]) {
+      // only a Modern people has the bomb (unless the gods hand it to the attacker)
+      if (att.tech < ERAS[6].tech && !(granted && att === a)) continue
+      const from = this.capitalPos(att) ?? this.towns.find((t) => t.civ === att.id)?.pos
+      if (!from) continue
+      const targets = this.towns
+        .filter((t) => t.civ === def.id)
+        .sort((x, y) => y.pop - x.pop)
+        .slice(0, 1 + Math.round(att.tech * 3))
+      for (const t of targets) {
+        out.push({ from: [from[0], from[1]], to: [t.pos[0], t.pos[1]], town: t.name })
+        t.pop *= 0.12
+        t.granary = 0
+        t.strain = 1
+      }
+    }
+    if (!out.length) return out
+    this.wars = this.wars.filter((w) => !((w.a === a.id && w.b === b.id) || (w.a === b.id && w.b === a.id)))
+    const truce = TRUCE_LENGTH * 4
+    a.truces.set(b.id, truce)
+    b.truces.set(a.id, truce)
+    a.tech *= 0.92
+    b.tech *= 0.92
+    this.nuclearWars++
+    this.strikes.push(...out)
+    this.log(
+      `☢ Guerra nuclear entre ${a.name} e ${b.name}: ${out.length} ogivas caem sobre ${out.map((s) => s.town).join(', ')}. Cidades em chamas, o céu escurece.`,
+      a.color,
+      true,
+      out[0].to,
+    )
+    return out
+  }
+
+  /**
+   * The god power: the people of the town nearest `pos` launches its arsenal at its enemy
+   * (or its nearest neighbour). Only a Modern people has the bomb. The line told, or null
+   * when no town is there.
+   */
+  godNuke(pos: [number, number], within = 0.045): string | null {
+    let town: Town | null = null
+    let best = within
+    for (const t of this.towns) {
+      const d = dist(t.pos, pos)
+      if (d < best) [best, town] = [d, t]
+    }
+    if (!town) return null
+    const civ = this.civById(town.civ)
+    if (!civ) return null
+    const granted = civ.tech < ERAS[6].tech
+    const enemy = this.wars.find((w) => w.a === civ.id || w.b === civ.id)
+    let rival = enemy ? this.civById(enemy.a === civ.id ? enemy.b : enemy.a) : undefined
+    if (!rival) {
+      let near = Infinity
+      for (const t of this.towns) {
+        if (t.civ === civ.id) continue
+        const d = dist(t.pos, town.pos)
+        if (d < near) [near, rival] = [d, this.civById(t.civ)]
+      }
+    }
+    if (!rival) return null
+    const strikes = this.nuclearExchange(civ, rival, granted)
+    if (!strikes.length) return null
+    return granted
+      ? `☢ Os deuses entregam a bomba a ${civ.name}, que lança ${strikes.length} ogivas contra ${rival.name}.`
+      : `☢ ${civ.name} lança ${strikes.length} ogivas contra ${rival.name}: a guerra nuclear começa.`
+  }
+
+  /**
+   * A tsunami: the towns on the low coast (`coastal` says which places are) within
+   * `radius` of the source (world units) are struck, harder nearer. Returns how many.
+   */
+  flood(pos: [number, number], radius: number, coastal: (p: [number, number]) => boolean): number {
+    const hit: Town[] = []
+    for (const t of this.towns) {
+      const d = dist(t.pos, pos)
+      if (d > radius || !coastal(t.pos)) continue
+      const k = 1 - d / radius
+      t.pop *= 1 - 0.6 * k
+      t.granary *= 1 - 0.7 * k
+      t.strain = Math.max(t.strain, k)
+      hit.push(t)
+    }
+    if (hit.length) {
+      const civ = this.civById(hit[0].civ)
+      this.log(`O tsunami atinge ${hit.map((t) => t.name).join(', ')}: casas e lavouras levadas pelo mar.`, civ?.color ?? 0, true, hit[0].pos)
+    }
+    return hit.length
+  }
+
+  /**
+   * An earthquake shakes the towns within `radius` (world units): houses fall, people die,
+   * harder nearer and the stronger it is (`severity` 0–1). Returns the towns hit.
+   */
+  shake(pos: [number, number], radius: number, severity: number): number {
+    const hit: Town[] = []
+    for (const t of this.towns) {
+      const d = dist(t.pos, pos)
+      if (d > radius) continue
+      const k = (1 - d / radius) * severity
+      if (k < 0.1) continue
+      t.pop *= 1 - 0.3 * k
+      t.granary *= 1 - 0.3 * k
+      t.strain = Math.max(t.strain, k)
+      hit.push(t)
+    }
+    if (hit.length && severity > 0.2) {
+      const civ = this.civById(hit[0].civ)
+      this.log(`O terremoto derruba casas em ${hit.map((t) => t.name).join(', ')}.`, civ?.color ?? 0, severity > 0.6, hit[0].pos)
+    }
+    return hit.length
+  }
+
+  /**
+   * A hurricane's wind and rain over the towns within `radius` (world units), by its
+   * strength (0–1): roofs torn off, fields drowned. Told when `tell` (its first landfall on
+   * towns). Returns the towns hit.
+   */
+  windstorm(pos: [number, number], radius: number, strength: number, name: string, tell: boolean): number {
+    const hit: Town[] = []
+    for (const t of this.towns) {
+      const d = dist(t.pos, pos)
+      if (d > radius) continue
+      const k = (1 - d / radius) * strength
+      t.pop *= 1 - 0.2 * k
+      t.granary *= 1 - 0.4 * k
+      t.strain = Math.max(t.strain, k)
+      hit.push(t)
+    }
+    if (hit.length && tell) {
+      const civ = this.civById(hit[0].civ)
+      this.log(`O furacão ${name} arrasa ${hit.map((t) => t.name).join(', ')}: telhados arrancados, lavouras afogadas.`, civ?.color ?? 0, strength > 0.5, hit[0].pos)
+    }
+    return hit.length
+  }
+
+  /** A cataclysm melts the world's crust: every town, every herd, every people is gone. Life starts over when the land can bear it again. */
+  cataclysm(): number {
+    for (const t of this.towns) {
+      t.pop = 0.01
+      t.granary = 0
+      t.strain = 1
+    }
+    for (const c of this.creatures) c.dead = 1
+    this.wars = []
+    this.parties = []
+    this.log('Toda a vida se acaba no fogo. Ninguém sobrevive.', 0, true)
+    return 0
+  }
+
+  /** A blast at a place (world units): the towns within `radius` lose most of their people. */
+  blast(pos: [number, number], radius = 0.04): string[] {
+    const hit: string[] = []
+    for (const t of this.towns) {
+      if (dist(t.pos, pos) > radius) continue
+      t.pop *= 0.12
+      t.granary = 0
+      t.strain = 1
+      hit.push(t.name)
+    }
+    this.log(hit.length ? `☢ Uma bomba cai sobre ${hit.join(', ')}.` : '☢ Uma bomba atômica explode em terra vazia.', 0, true, pos)
+    return hit
+  }
+
+  /** The warheads launched since the last call (for the 2D game to show and to burn the land). */
+  takeStrikes(): NuclearStrike[] {
+    const out = this.strikes
+    this.strikes = []
+    return out
+  }
+
+  /** Nuclear exchanges ever. */
+  get nuclearCount(): number {
+    return this.nuclearWars
+  }
+
+  /**
+   * Two peoples in contact borrow words from each other: the smaller from the greater
+   * more. A tongue full of another's words is told; once it has borrowed most of its
+   * words the two tongues are counted one family (the smaller joins the greater's).
+   */
+  private borrowWords(a: Civ, b: Civ, amount: number) {
+    const pa = this.power(a)
+    const pb = this.power(b)
+    const share = pa / Math.max(pa + pb, 1)
+    for (const [taker, giver, k] of [[a, b, 1 - share], [b, a, share]] as [Civ, Civ, number][]) {
+      taker.loans ??= new Map()
+      const before = taker.loans.get(giver.id) ?? 0
+      const after = before + amount * LOAN_RATE * k * 2
+      taker.loans.set(giver.id, after)
+      if (before < LOANS_NOTED && after >= LOANS_NOTED) {
+        this.log(`A língua de ${taker.name} se enche de palavras de ${giver.name}.`, taker.color, false, this.capitalPos(taker))
+      }
+      const fam = taker.family ?? taker.id
+      const theirs = giver.family ?? giver.id
+      if (before < LOANS_MERGE && after >= LOANS_MERGE && fam !== theirs && pa !== pb && (taker === a ? pa < pb : pb < pa)) {
+        // the whole family of the smaller tongue joins the greater's
+        for (const c of this.civs) if ((c.family ?? c.id) === fam) c.family = theirs
+        const name = this.lineage.find((l) => l.id === theirs)?.name ?? giver.name
+        this.log(`A língua de ${taker.name} já é parente da de ${giver.name}: entra na família ${name}.`, taker.color, true, this.capitalPos(taker))
+      }
+    }
+  }
+
+  /** Colonies founded across the sea, by all peoples, ever. */
+  get voyagesTotal(): number {
+    return this.voyagesCount
+  }
+
+  /** Everything the life is, as plain data (for the 2D game's undo, rewind and saved worlds). */
+  snapshot(): unknown {
+    const copy: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(this)) if (k !== 'field') copy[k] = v
+    return structuredClone(copy)
+  }
+
+  /** Back to a snapshot (see snapshot). */
+  restore(snap: unknown) {
+    Object.assign(this, structuredClone(snap as Record<string, unknown>))
+    this.field = null
+    this.routesTime = -Infinity
+    this.territoryTime = -1
+    this.territoryKey = ''
+  }
+
   /** A line for the chronicle from outside the life (the engine's eruptions, strikes and quakes). */
   chronicle(text: string, major = false, pos?: [number, number]) {
     this.log(text, 0, major, pos)
@@ -2277,6 +2807,16 @@ export class Life {
           famine: towns.length ? towns.filter((t) => t.needs.famine).length / towns.length : 0,
           trade: trade.get(c.id) ?? 0,
           faith: FAITHS[c.faith],
+          faithIndex: c.faith,
+          eraIndex: c.era,
+          family: c.family ?? c.id,
+          familyName: this.lineage.find((l) => l.id === (c.family ?? c.id))?.name ?? c.name,
+          loansFrom: [...(c.loans ?? new Map<number, number>()).entries()]
+            .filter(([, v]) => v >= LOANS_NOTED)
+            .sort((x, y) => y[1] - x[1])
+            .slice(0, 3)
+            .map(([id]) => this.lineage.find((l) => l.id === id)?.name ?? '')
+            .filter(Boolean),
           monuments: towns.filter((t) => t.monument > 0).length,
           plague: towns.length ? towns.filter((t) => t.plague > 0).length / towns.length : 0,
         }

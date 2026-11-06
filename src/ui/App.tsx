@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Engine, WebGPUUnavailableError, type WebGPUFailure } from '../engine/engine'
 import { Compass } from './Compass'
+import { FORCE_3D, page2d } from './fallback'
 import { EventCards } from './EventCards'
 import { PhotoBar } from './PhotoBar'
 import { ProbeCard } from './ProbeCard'
@@ -113,7 +114,12 @@ function FailureScreen({ failure }: { failure: Failure }) {
           ? 'Este navegador não oferece WebGPU.'
           : failure.reason === 'no-adapter'
             ? 'O navegador tem WebGPU, mas não encontrou um adaptador de GPU utilizável.'
-            : 'O navegador tem WebGPU, mas o pedido de GPU não respondeu em 10 segundos — o processo de GPU do navegador provavelmente travou. Veja o status em chrome://gpu e reinicie o navegador.'}
+            : failure.reason === 'software'
+              ? 'O navegador só oferece WebGPU por software (sem GPU de verdade), lento demais para o 3D.'
+              : 'O navegador tem WebGPU, mas o pedido de GPU não respondeu — o processo de GPU do navegador provavelmente travou. Veja o status em chrome://gpu e reinicie o navegador.'}
+      </p>
+      <p>
+        <a href={page2d()}>Jogar a versão 2D</a>, que roda em qualquer computador.
       </p>
       <h2>Como ativar</h2>
       <ul>
@@ -144,7 +150,7 @@ function App() {
   useEffect(() => {
     const controller = new AbortController()
     let created: Engine | null = null
-    Engine.create(canvasRef.current!, controller.signal)
+    Engine.create(canvasRef.current!, controller.signal, FORCE_3D)
       .then((e) => {
         created = e
         setEngine(e)
@@ -153,7 +159,14 @@ function App() {
       })
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === 'AbortError') return
-        if (err instanceof WebGPUUnavailableError) setFailure({ kind: 'webgpu', reason: err.reason })
+        if (err instanceof WebGPUUnavailableError) {
+          // no real GPU: the 2D game instead of a frozen page (`?3d` insists on the 3D)
+          if (!FORCE_3D) {
+            window.location.replace(page2d(err.reason))
+            return
+          }
+          setFailure({ kind: 'webgpu', reason: err.reason })
+        }
         else setFailure({ kind: 'error', message: err instanceof Error ? err.message : String(err) })
       })
     return () => {
@@ -167,7 +180,7 @@ function App() {
     <div className="app">
       <canvas ref={canvasRef} className="viewport" />
       {engine && <Interface engine={engine} />}
-      {!engine && !failure && <div className="loading">Iniciando WebGPU…</div>}
+      {!engine && !failure && <div className="loading">Procurando a GPU…</div>}
       {failure && <FailureScreen failure={failure} />}
     </div>
   )
