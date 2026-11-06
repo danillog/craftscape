@@ -652,9 +652,10 @@ export class Renderer2D {
 
   /** Draws the world as seen by the view onto the screen canvas. */
   /**
-   * Draws the world. East to west it is round, so the map repeats sideways: once for
-   * every copy of it the view shows (one when zoomed in; more when the whole planet fits
-   * with room to spare, or the view lies across the map's edge).
+   * Draws the world. East to west it is round, so the map goes on sideways: the view may
+   * lie across the map's edge, and then the two copies of the map that meet there are
+   * drawn. A view wider than the world still shows it only once (one sun, one night, every
+   * town in one place): the world's width round the middle of the view, the rest left dark.
    */
   draw(ctx: Ctx, width: number, height: number, view: View, scene: Scene) {
     const n = this.world.n
@@ -666,7 +667,15 @@ export class Renderer2D {
     this.refreshTerritory(scene.territory, this.territoryStyle(), scene.categories)
     const first = Math.floor(left / n)
     const last = Math.ceil((left + width / z) / n) - 1
+    const wider = width / z > n
+    if (wider) {
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(width / 2 - (n * z) / 2, 0, n * z, height)
+      ctx.clip()
+    }
     for (let k = first; k <= last; k++) this.drawCopy(ctx, width, height, { ...view, cx: view.cx - k * n }, scene, k === first)
+    if (wider) ctx.restore()
     // what follows the pointer is drawn once, where the pointer is
     const toScreen = (tx: number, ty: number): [number, number] => [(tx - left) * z, (ty - top) * z]
     if (scene.plateDrag) {
